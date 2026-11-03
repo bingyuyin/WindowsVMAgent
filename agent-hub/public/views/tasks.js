@@ -43,6 +43,7 @@ export function pipelineMini(task) {
         stage.rounds.length === 0
           ? h("span", { class: "pm-dot pm-pending", title: "Not started" })
           : stage.rounds.map((round) => {
+              if (round.byUser) return h("span", { class: "pm-dot pm-user", title: `Round ${round.n}: your change request` }, "✎");
               const live = task.currentStage === stage.kind && task.currentRound === round.n && ["running", "needs-input"].includes(task.status);
               const cls = round.verdict === "approve" ? "pm-approved" : round.verdict === "request_changes" ? "pm-changes" : live ? "pm-live" : "pm-pending";
               const noun = stage.kind === "testing" ? "failure" : "comment";

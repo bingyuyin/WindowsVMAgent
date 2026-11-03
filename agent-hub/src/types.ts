@@ -122,6 +122,8 @@ export interface ReviewSubmission {
   /** Testing stage only: the executor's run (commands, counts); failures are the comments. */
   testRun?: TestRunInfo;
   fallback?: boolean;
+  /** "user": changes the user requested after the task finished (a round of its own, without an author turn). */
+  by?: "user";
   at: string;
 }
 
@@ -153,8 +155,26 @@ export interface Stage {
   docPath?: string;
   docFormat?: DocFormat;
   nextCommentNumber: number;
+  /** Testing stage: run the automation again before fixing (an earlier stage changed for a change request). */
+  rerun?: boolean;
   startedAt?: string;
   finishedAt?: string;
+}
+
+/** Further changes the user asked for after the task finished (approved or not). */
+export interface ChangeRequest {
+  /** Comment ID the agents respond to and reviewers verify, e.g. "U1". */
+  id: string;
+  text: string;
+  /** Stage whose agents make the change; later stages then bring their work in line with it. */
+  stage: StageKind;
+  /** Round of that stage that holds the request. */
+  round: number;
+  /** Task attempt that works on the request. */
+  attempt: number;
+  /** Review rounds (or test runs) allowed per stage. */
+  rounds: number;
+  requestedAt: string;
 }
 
 export interface PendingInput {
@@ -324,6 +344,8 @@ export interface Task {
   /** Pushing the task branch to the remote (after completion, or on request). */
   push?: PushInfo;
   pullRequest?: PullRequestInfo;
+  /** Changes the user requested after the task finished, oldest first. */
+  changeRequests?: ChangeRequest[];
   usage: Usage;
   attempt: number;
   /** Review rounds allowed for the current attempt (set on continue/retry). */
@@ -333,6 +355,8 @@ export interface Task {
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
+  /** When the latest attempt started (retries and change requests start new attempts). */
+  attemptStartedAt?: string;
   finishedAt?: string;
   lastSeq: number;
 }

@@ -97,6 +97,12 @@ export interface SystemPromptOptions {
   docFormat?: DocFormat;
 }
 
+/** Rules for change requests the user makes after a task finished (comment IDs U1, U2, ...). */
+const USER_REQUESTS_AUTHOR =
+  "- Change requests from the user (IDs U1, U2, ...) take priority over earlier review preferences: carry them out as asked, declining only when a request is impossible or harmful (explain why).";
+const USER_REQUESTS_REVIEWER =
+  "- Change requests the user made after the task finished (IDs U1, U2, ...) must be carried out as asked: verify each one, and accept a decline only when the request is impossible or harmful and the author explains why.";
+
 export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: string[] = [], options: SystemPromptOptions = {}): string {
   const intro =
     "You are an autonomous sub-agent inside Copilot Agent Hub, an automated author <-> reviewer workflow. " +
@@ -113,6 +119,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         ...docAuthoringRules(options.docFormat),
         ...skillsLine(skills),
         "- When you receive review comments, address every comment ID: update the document (preferred) or decline with a concrete technical justification.",
+        USER_REQUESTS_AUTHOR,
         "- Finish EVERY round by calling the `submit_work` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
     case "design-reviewer":
@@ -125,6 +132,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- Each comment must be specific and actionable and point to the section (and file/symbol when relevant). Severities: blocker (wrong, unsafe or infeasible), major (significant gap), minor (worthwhile improvement), nit (polish).",
         "- Approve when no blocker or major issues remain. Do not withhold approval for nits or matters of taste.",
         "- On re-review, check each previous comment against the author's response, accept reasonable declines, and raise new issues only if they are significant. Do not repeat resolved comments.",
+        USER_REQUESTS_REVIEWER,
         "- Finish EVERY review by calling the `submit_review` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
     case "writer":
@@ -138,6 +146,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         ...docAuthoringRules(options.docFormat),
         ...skillsLine(skills),
         "- When you receive review comments, address every comment ID: update the document (preferred) or decline with a concrete justification.",
+        USER_REQUESTS_AUTHOR,
         "- Finish EVERY round by calling the `submit_work` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
     case "doc-reviewer":
@@ -150,6 +159,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- Each comment must be specific and actionable and point to the section. Severities: blocker (wrong or misleading), major (significant gap or inaccuracy), minor (worthwhile improvement), nit (polish).",
         "- Approve when no blocker or major issues remain. Do not withhold approval for nits or matters of taste.",
         "- On re-review, check each previous comment against the author's response, accept reasonable declines, and raise new issues only if they are significant. Do not repeat resolved comments.",
+        USER_REQUESTS_REVIEWER,
         "- Finish EVERY review by calling the `submit_review` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
     case "coder":
@@ -167,11 +177,12 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
     case "resolver":
       return [
         ...header(
-          "ROLE: COMMENT-RESOLUTION AGENT. Another agent implemented the change; a reviewer requested changes. Resolve every open review comment in the code.",
+          "ROLE: COMMENT-RESOLUTION AGENT. Another agent implemented the change; a reviewer (or the user, after the task finished) requested changes. Resolve every open comment in the code.",
         ),
         "- Start by understanding the change so far: read the diff against the base commit and the files the comments refer to.",
         ...skillsLine(skills),
         "- Address every comment ID: fix the code at the root cause (preferred) or decline with a concrete technical justification. Keep fixes focused; do not rewrite unrelated code.",
+        USER_REQUESTS_AUTHOR,
         "- Add or adjust tests for behavioral fixes, then re-run the relevant build and tests and report the results.",
         "- Finish every round by calling the `submit_work` tool exactly once, with a response for every open comment ID. Never end your turn without calling it.",
       ].join("\n");
@@ -185,6 +196,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- Each comment: file and line when applicable, a clear description of the problem and the expected fix. Severities: blocker, major, minor, nit.",
         "- Approve when no blocker or major issues remain.",
         "- On re-review, verify each previous comment was addressed by inspecting the new changes, accept reasonable declines, and raise new issues only if they are significant.",
+        USER_REQUESTS_REVIEWER,
         "- Finish EVERY review by calling the `submit_review` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
     case "executor":
@@ -199,6 +211,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- For every failure record the full test name, file/line, the key error (assertion with expected vs actual, exception and the relevant stack lines) and a category: product-bug, test-bug, environment, flaky or integrity. Read the test and the code under test to suggest where the root cause most likely is.",
         "- Suspected flaky test: re-run just that test up to two times; report it as flaky only if the result changes.",
         "- After a fix round, inspect the fixer's diff: report an `integrity` failure for any change that makes tests pass without fixing the cause (deleted or skipped tests, weakened or removed assertions, swallowed exceptions, hard-coded results, expectations changed to match a bug) unless the fixer's justification is convincing.",
+        "- When the user requested changes after the task finished (IDs U1, U2, ...), verify they were carried out; changes the user explicitly asked for are not integrity problems.",
         "- status: passed only when everything requested ran and passed with no integrity problems; blocked when the automation cannot run at all (say exactly what is missing); failed otherwise.",
         ...skillsLine(skills),
         "- Finish EVERY run by calling the `submit_test_results` tool exactly once. Never end your turn without calling it.",
@@ -213,6 +226,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- Never make tests pass by deleting or skipping them, weakening or removing assertions, catching and ignoring errors, or hard-coding results. The executor inspects your diff and reports such changes as integrity failures.",
         "- Keep fixes focused on the failures; follow the repository's conventions. Run the previously failing tests (and closely related ones) before submitting, and report exactly what you ran and the results in `validation`.",
         "- A failure you cannot fix in code (environment, missing credential or service): decline it with a precise description of what is needed.",
+        USER_REQUESTS_AUTHOR,
         ...skillsLine(skills),
         "- Finish every round by calling the `submit_work` tool exactly once, with a response for every failure ID. Never end your turn without calling it.",
       ].join("\n");
@@ -304,14 +318,23 @@ export function formatComments(comments: readonly ReviewComment[]): string {
     .join("\n");
 }
 
-function formatResponses(comments: readonly ReviewComment[]): string {
+function formatResponses(comments: readonly ReviewComment[], userRequests = false): string {
   return comments
     .map((comment) => {
       const response = comment.status === "open" ? "no response" : `${comment.status}: ${comment.response ?? ""}`;
-      const label = comment.test ? `(${comment.category ?? "unknown"}) ${comment.test}` : `(${comment.severity}) ${truncate(comment.body.trim(), 200)}`;
+      const label = userRequests
+        ? `(change request) ${truncate(comment.body.trim(), 2000).replace(/\n/g, "\n  ")}`
+        : comment.test
+          ? `(${comment.category ?? "unknown"}) ${comment.test}`
+          : `(${comment.severity}) ${truncate(comment.body.trim(), 200)}`;
       return `- [${comment.id}] ${label}\n  -> ${response}`;
     })
     .join("\n");
+}
+
+/** The user's change requests, in full. */
+function formatRequests(comments: readonly ReviewComment[]): string {
+  return comments.map((comment) => `- [${comment.id}] ${comment.body.trim().replace(/\n/g, "\n  ")}`).join("\n");
 }
 
 export interface AuthorPromptInput {
@@ -368,7 +391,23 @@ export function authorPrompt(input: AuthorPromptInput): string {
   const ids = input.openComments.map((comment) => comment.id).join(", ");
   const docStage = isDocStage(input.stage);
   const noun = input.stage === "design" ? "design document" : "document";
-  if (input.stage === "testing") {
+  if (input.review?.by === "user" && input.openComments.length) {
+    parts.push(
+      `## Round ${input.round}: make the changes the user requested`,
+      "",
+      "This task was finished earlier. The user reviewed the result and asked for the changes below. They take priority over earlier review preferences; keep the rest of the work intact.",
+      "",
+      "Change requests:",
+      formatRequests(input.openComments),
+      "",
+      input.stage === "testing"
+        ? "Make the changes, then run the test automation (at least the affected tests) to confirm it passes."
+        : docStage
+          ? `Update the ${noun} \`${input.docPath}\` accordingly.`
+          : "Make the changes in the code (add or update tests where it matters), then re-run the relevant validation.",
+      `Then call \`submit_work\` with a summary, ${docStage ? "" : "the validation you ran, "}and \`comment_responses\` covering exactly these IDs: ${ids} (addressed = done; declined only when a request is impossible or harmful, with the reason).`,
+    );
+  } else if (input.stage === "testing") {
     parts.push(`## Round ${input.round}: fix the test failures`);
     if (input.review) {
       const run = input.review.testRun;
@@ -433,6 +472,8 @@ export interface ReviewPromptInput {
   totalStat: string;
   roundDiff?: { text: string; truncated: boolean };
   previousComments: ReviewComment[];
+  /** The previous comments are the user's change requests (not this reviewer's own comments). */
+  userRequests?: boolean;
 }
 
 export function reviewPrompt(input: ReviewPromptInput): string {
@@ -451,7 +492,13 @@ export function reviewPrompt(input: ReviewPromptInput): string {
   parts.push(`${input.authorLabel} summary:`, input.submission.summary.trim() || "(none)");
   if (input.submission.validation?.trim()) parts.push("", "Validation reported by the author:", input.submission.validation.trim());
 
-  if (input.previousComments.length) {
+  if (input.previousComments.length && input.userRequests) {
+    parts.push(
+      "",
+      "After the task was finished, the user asked for the changes below. Verify each one was carried out as asked (accept a decline only when the request is impossible or harmful and the author explains why), then review this round's changes as usual:",
+      formatResponses(input.previousComments, true),
+    );
+  } else if (input.previousComments.length) {
     parts.push("", "Your previous comments and the author's responses:", formatResponses(input.previousComments));
   }
 
@@ -530,10 +577,22 @@ export function executionPrompt(input: ExecutionPromptInput): string {
     );
     return parts.join("\n");
   }
-  parts.push(`## Run ${input.round}: verify the test fixer's fixes`, "", commit, "", "Test fixer's summary:", input.fix.summary.trim() || "(none)");
+  const userRequests = input.previousRun?.by === "user";
+  parts.push(
+    userRequests ? `## Run ${input.round}: verify the changes the user requested` : `## Run ${input.round}: verify the test fixer's fixes`,
+    "",
+    commit,
+    "",
+    "Test fixer's summary:",
+    input.fix.summary.trim() || "(none)",
+  );
   if (input.fix.validation?.trim()) parts.push("", "Validation the fixer reported:", input.fix.validation.trim());
   if (input.previousRun?.comments.length) {
-    parts.push("", "Failures from your previous run and the fixer's responses:", formatResponses(input.previousRun.comments));
+    parts.push(
+      "",
+      userRequests ? "The user's change requests and the fixer's responses:" : "Failures from your previous run and the fixer's responses:",
+      formatResponses(input.previousRun.comments, userRequests),
+    );
   }
   if (input.fix.commit && input.fixDiff?.text.trim()) {
     parts.push(
@@ -550,6 +609,11 @@ export function executionPrompt(input: ExecutionPromptInput): string {
     "",
     "Run the complete requested automation again (not only the previously failing tests) and verify the results.",
     "Check the fixer's diff for integrity problems (deleted/skipped tests, weakened assertions, swallowed errors, hard-coded results) and report each as an `integrity` failure.",
+    ...(userRequests
+      ? [
+          "Changes the user explicitly asked for are not integrity problems. If a requested change was not carried out, report it as a failure (category `unknown`) that names the request ID.",
+        ]
+      : []),
     "Then call `submit_test_results` with the status, the exact commands, the counts and one entry per remaining failure.",
   );
   return parts.join("\n");

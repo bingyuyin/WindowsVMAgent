@@ -86,7 +86,7 @@ function agentState(task, role) {
     if (!(task.agents ?? []).length && role !== "resolver") {
       const stage = task.stages.find((candidate) => candidate.kind === stageOfRole(role));
       const rounds = stage?.rounds ?? [];
-      const worked = REVIEWER[stageOfRole(role)] === role ? rounds.some((round) => round.verdict) : rounds.some((round) => round.authored);
+      const worked = REVIEWER[stageOfRole(role)] === role ? rounds.some((round) => round.verdict && !round.byUser) : rounds.some((round) => round.authored);
       if (worked) return { key: "done", label: "Done", cls: "success", agent };
     }
     return { key: "unused", label: "Not needed", cls: "neutral", agent };
@@ -668,6 +668,8 @@ export function agentsView(root) {
     const current = ACTIVE.includes(task.status) && task.currentStage === stage.kind;
     const budget = task.roundsBudget ?? task.maxRounds;
     const rounds = stage.rounds ?? [];
+    // The user's change requests are rounds of their own; they don't count against the agents' rounds.
+    const agentRounds = rounds.filter((round) => !round.byUser).length;
     const noun = testing ? "run" : "round";
     return h(
       "div",
@@ -696,28 +698,30 @@ export function agentsView(root) {
       h(
         "div",
         { class: "pipe-loop" },
-        h("span", { class: "muted small" }, rounds.length ? `${noun} ${rounds.length} of ${Math.max(budget, rounds.length)}` : `up to ${budget} ${noun}${budget === 1 ? "" : "s"}`),
+        h("span", { class: "muted small" }, agentRounds ? `${noun} ${agentRounds} of ${Math.max(budget, agentRounds)}` : `up to ${budget} ${noun}${budget === 1 ? "" : "s"}`),
         rounds.map((round) =>
-          h(
-            "span",
-            {
-              class: `round-dot ${round.verdict === "approve" ? "ok" : round.verdict === "request_changes" ? "changes" : "open"}`,
-              title: `Round ${round.n}: ${
-                round.verdict === "approve"
-                  ? testing
-                    ? "tests passed"
-                    : "approved"
-                  : round.verdict === "request_changes"
-                    ? testing
-                      ? round.testStatus === "blocked"
-                        ? "blocked"
-                        : `${round.comments} failure(s)`
-                      : `${round.comments} comment(s)`
-                    : "in progress"
-              }`,
-            },
-            round.verdict === "approve" ? "✓" : round.verdict === "request_changes" ? String(round.comments) : "…",
-          ),
+          round.byUser
+            ? h("span", { class: "round-dot user", title: `Round ${round.n}: your change request` }, "✎")
+            : h(
+                "span",
+                {
+                  class: `round-dot ${round.verdict === "approve" ? "ok" : round.verdict === "request_changes" ? "changes" : "open"}`,
+                  title: `Round ${round.n}: ${
+                    round.verdict === "approve"
+                      ? testing
+                        ? "tests passed"
+                        : "approved"
+                      : round.verdict === "request_changes"
+                        ? testing
+                          ? round.testStatus === "blocked"
+                            ? "blocked"
+                            : `${round.comments} failure(s)`
+                          : `${round.comments} comment(s)`
+                        : "in progress"
+                  }`,
+                },
+                round.verdict === "approve" ? "✓" : round.verdict === "request_changes" ? String(round.comments) : "…",
+              ),
         ),
       ),
     );

@@ -142,6 +142,14 @@ export function createApiRouter(deps: ApiDeps): Router {
     return runner.retry(params.id!, extra);
   });
 
+  router.post("/api/tasks/:id/change-request", ({ params, body }) =>
+    runner.requestChanges(params.id!, {
+      request: requireString(body, "request", 20_000),
+      stage: optionalString(body, "stage", 40) || undefined,
+      rounds: body.rounds === undefined || body.rounds === null || body.rounds === "" ? undefined : Number(body.rounds),
+    }),
+  );
+
   router.post("/api/tasks/:id/input", ({ params, body }) => {
     runner.answer(params.id!, requireString(body, "inputId", 100), requireString(body, "answer", 10_000));
     return { ok: true };

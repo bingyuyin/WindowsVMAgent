@@ -1119,6 +1119,9 @@ details > summary {
   padding: 20px;
   box-shadow: var(--shadow);
 }
+.modal.modal-wide {
+  width: min(640px, calc(100vw - 32px));
+}
 .modal-actions {
   display: flex;
   justify-content: flex-end;
@@ -1730,6 +1733,44 @@ details > summary {
   padding-top: 6px;
   border-top: 1px dashed var(--border);
   font-size: 13px;
+}
+
+/* ---- change requests (the user's follow-up changes) ------------------------------------------ */
+
+.round-card.round-user {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--attention) 45%, var(--border));
+}
+.conv-block.user-request {
+  border-left: 3px solid var(--attention);
+}
+.comment.comment-user {
+  border-left-color: var(--attention);
+}
+.change-requests .comment:first-child {
+  margin-top: 0;
+}
+.change-requests + .row {
+  margin-top: 10px;
+}
+.hero-request {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-left: 3px solid var(--attention);
+  border-radius: 6px;
+  background: var(--attention-muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.rn-user {
+  background: var(--attention-muted);
+  color: var(--attention);
+}
+.pm-dot.pm-user,
+.round-dot.user {
+  background: var(--attention-muted);
+  border-color: transparent;
+  color: var(--attention);
 }
 
 .timeline {

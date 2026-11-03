@@ -1112,3 +1112,191 @@ describe("push & pull requests", () => {
     }
   });
 });
+
+describe("change requests", () => {
+  test("an approved task takes a change request: the resolver makes it and the reviewer verifies it", async () => {
+    const h = createHarness({
+      coder: [steps(writeFile("hello.js", "export const hello = () => 'hi';\n"), submitWork("Add hello()"))],
+      resolver: [
+        steps(
+          (spec, prompt) => {
+            assert.match(prompt, /## Round 3: make the changes the user requested/);
+            assert.match(prompt, /Change requests:\n- \[U1\] Rename hello\(\) to greet\(\)\n  and keep it exported/);
+            assert.match(prompt, /## Work so far/, "a fresh resolver gets the change so far");
+            assert.match(prompt, /comment_responses` covering exactly these IDs: U1/);
+            assert.match(spec.systemPrompt, /Change requests from the user \(IDs U1, U2, \.\.\.\) take priority/);
+          },
+          writeFile("hello.js", "export const greet = () => 'hi';\n"),
+          submitWork("Renamed hello() to greet()", [{ comment_id: "U1", status: "addressed", note: "Renamed and still exported" }]),
+        ),
+      ],
+      "code-reviewer": [
+        submitReview("approve"),
+        steps((spec, prompt) => {
+          assert.match(prompt, /After the task was finished, the user asked for the changes below/);
+          assert.match(prompt, /- \[U1\] \(change request\) Rename hello\(\) to greet\(\)\n  and keep it exported\n  -> addressed: Renamed and still exported/);
+          assert.match(spec.systemPrompt, /Change requests the user made after the task finished/);
+        }, submitReview("approve")),
+      ],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Add a hello function", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.result?.approved, true);
+      const approvedHead = branchHead(h.repoPath, task.branch!);
+
+      assert.throws(() => h.runner.requestChanges(task.id, { request: "  " }), /Describe the changes you want/);
+      assert.throws(() => h.runner.requestChanges(task.id, { request: "x", stage: "design" }), /Stage must be one of: coding/);
+      assert.throws(() => h.runner.requestChanges(task.id, { request: "x", rounds: 11 }), /Rounds must be an integer between 1 and 10/);
+      h.runner.requestChanges(task.id, { request: "Rename hello() to greet()\nand keep it exported", rounds: 2 });
+      assert.match(task.status, /^(queued|running)$/);
+      assert.equal(task.roundsBudget, 2);
+      assert.throws(() => h.runner.requestChanges(task.id, { request: "More" }), /once the task has finished/);
+      await h.runner.idle();
+
+      assert.equal(task.status, "completed");
+      assert.equal(task.result?.approved, true);
+      assert.equal(task.attempt, 2);
+      assert.deepEqual(task.changeRequests?.map((request) => [request.id, request.stage, request.round, request.attempt, request.rounds]), [["U1", "coding", 2, 2, 2]]);
+      const [first, request, change] = task.stages[0]!.rounds;
+      assert.equal(first!.review?.verdict, "approve");
+      assert.equal(request!.author, undefined);
+      assert.equal(request!.review?.by, "user");
+      assert.deepEqual(request!.review?.comments.map((comment) => [comment.id, comment.status, comment.response]), [["U1", "addressed", "Renamed and still exported"]]);
+      assert.equal(change!.author?.role, "resolver");
+      assert.equal(change!.review?.verdict, "approve");
+      // The change builds on the approved result and lands on the task branch.
+      assert.equal(change!.author?.prevCommit, approvedHead);
+      assert.match(git(h.repoPath, "show", `${task.branch}:hello.js`), /greet/);
+      assert.match(git(h.repoPath, "log", "-1", "--format=%s", task.branch!), /requested changes U1 round 3: Renamed hello\(\) to greet\(\)/);
+      const comm = h.store.recentComm({ taskId: task.id });
+      assert.ok(comm.some((entry) => entry.from === "user" && entry.to === "manager" && entry.text === "Change request U1 for the Coding stage: Rename hello() to greet()"));
+      assert.ok(comm.some((entry) => entry.to === "resolver" && entry.kind === "assign" && /^Making the changes you requested \(round 3\): U1 on /.test(entry.text)));
+      assert.deepEqual(summarizeTask(task).stages[0]!.rounds.map((round) => Boolean(round.byUser)), [false, true, false]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a change to the design is carried through to the code", async () => {
+    const h = createHarness({
+      designer: [
+        steps((spec, prompt) => writeFile(designPathFrom(prompt), "# Cache design\n\nUse an LRU cache.\n")(spec, prompt), submitWork("Designed an LRU cache")),
+        steps(
+          (spec, prompt) => {
+            assert.match(prompt, /## Round 3: make the changes the user requested/);
+            writeFile(designPathFrom(prompt), "# Cache design\n\nUse an LFU cache.\n")(spec, prompt);
+          },
+          submitWork("Switched the design to LFU", [{ comment_id: "U1", status: "addressed", note: "Now LFU" }]),
+        ),
+      ],
+      "design-reviewer": [submitReview("approve"), submitReview("approve")],
+      coder: [steps(writeFile("cache.js", "// LRU\n"), submitWork("Implemented the LRU cache"))],
+      resolver: [
+        steps(
+          (_spec, prompt) => {
+            assert.match(prompt, /The design document changed in the Design stage for the user's change request U1 \(quoted below\)\. Bring the implementation/);
+            assert.match(prompt, /> Use LFU eviction instead of LRU/);
+            assert.match(prompt, /Use an LFU cache/, "the coder side sees the revised design");
+          },
+          writeFile("cache.js", "// LFU\n"),
+          submitWork("Switched the cache to LFU", [{ comment_id: "U1", status: "addressed", note: "Matches the design" }]),
+        ),
+      ],
+      "code-reviewer": [submitReview("approve"), submitReview("approve")],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Design and build a cache", kind: "design-coding", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      h.runner.requestChanges(task.id, { request: "Use LFU eviction instead of LRU", stage: "design" });
+      await h.runner.idle();
+      assert.equal(task.status, "completed");
+      assert.equal(task.result?.approved, true);
+      const [design, coding] = task.stages;
+      assert.deepEqual(design!.rounds.map((round) => [round.n, round.author?.role ?? null, round.review?.by ?? round.review?.verdict]), [
+        [1, "designer", "approve"],
+        [2, null, "user"],
+        [3, "designer", "approve"],
+      ]);
+      assert.deepEqual(coding!.rounds.map((round) => [round.n, round.author?.role ?? null, round.review?.by ?? round.review?.verdict]), [
+        [1, "coder", "approve"],
+        [2, null, "user"],
+        [3, "resolver", "approve"],
+      ]);
+      assert.equal(coding!.rounds[1]!.review?.comments[0]?.status, "addressed");
+      assert.match(git(h.repoPath, "show", `${task.branch}:cache.js`), /LFU/);
+      assert.ok(h.store.recentComm({ taskId: task.id }).some((entry) => entry.text === "After U1: update the Coding stage to match"));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("changed code is re-tested, and a change request on the tests goes to the fixer and the executor", async () => {
+    const h = createHarness({
+      planner: [submitPlan(["coding", "testing"], { coding: "Add mul()", testing: "Run the tests" })],
+      coder: [steps(writeFile("calc.js", "export const mul = (a, b) => a * b;\n"), submitWork("Added mul()"))],
+      "code-reviewer": [submitReview("approve"), submitReview("approve")],
+      resolver: [
+        steps(writeFile("calc.js", "export const mul = (a, b) => Number(a) * Number(b);\n"), submitWork("mul() accepts numeric strings", [{ comment_id: "U1", status: "addressed", note: "Converts" }])),
+      ],
+      executor: [
+        submitTests("passed", [], { total: 3 }),
+        steps((_spec, prompt) => {
+          assert.match(prompt, /## Run 2: run the test automation and verify the results/);
+        }, submitTests("passed", [], { total: 3 })),
+        steps((_spec, prompt) => {
+          assert.match(prompt, /## Run 4: verify the changes the user requested/);
+          assert.match(prompt, /The user's change requests and the fixer's responses:\n- \[U2\] \(change request\) Also test negative numbers\n  -> addressed: Added/);
+          assert.match(prompt, /Changes the user explicitly asked for are not integrity problems/);
+        }, submitTests("passed", [], { total: 4 })),
+      ],
+      fixer: [
+        steps(
+          (_spec, prompt) => {
+            assert.match(prompt, /## Round 4: make the changes the user requested/);
+            assert.match(prompt, /- \[U2\] Also test negative numbers/);
+            assert.match(prompt, /run the test automation \(at least the affected tests\)/);
+          },
+          writeFile("calc.test.js", "// negative numbers\n"),
+          submitWork("Added a negative-number test", [{ comment_id: "U2", status: "addressed", note: "Added" }]),
+        ),
+      ],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Add multiplication and run the tests", kind: "auto", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      const testing = task.stages.find((stage) => stage.kind === "testing")!;
+
+      h.runner.requestChanges(task.id, { request: "mul() should accept numeric strings", stage: "coding" });
+      assert.equal(testing.rerun, true);
+      await h.runner.idle();
+      assert.equal(task.status, "completed");
+      assert.equal(testing.rerun, undefined);
+      assert.deepEqual(testing.rounds.map((round) => [round.n, Boolean(round.author), round.review?.verdict]), [
+        [1, false, "approve"],
+        [2, false, "approve"],
+      ]);
+      assert.ok(h.store.recentComm({ taskId: task.id }).some((entry) => entry.text === "After U1: re-run the tests"));
+
+      // Without a stage, the request goes to the last stage.
+      h.runner.requestChanges(task.id, { request: "Also test negative numbers" });
+      await h.runner.idle();
+      assert.equal(task.status, "completed");
+      assert.equal(task.result?.approved, true);
+      assert.equal(task.result?.tests?.total, 4);
+      assert.deepEqual(task.changeRequests?.map((request) => [request.id, request.stage, request.round]), [
+        ["U1", "coding", 2],
+        ["U2", "testing", 3],
+      ]);
+      assert.equal(testing.rounds[3]?.author?.role, "fixer");
+      assert.equal(h.driver.prompts.coder?.length, 1, "the coder was not asked to start over");
+    } finally {
+      h.cleanup();
+    }
+  });
+});

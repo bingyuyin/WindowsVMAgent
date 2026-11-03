@@ -52,7 +52,7 @@ export interface TaskSummary {
   stages: Array<{
     kind: StageKind;
     status: StageStatus;
-    rounds: Array<{ n: number; verdict: Verdict | null; comments: number; authored: boolean; testStatus?: TestStatus }>;
+    rounds: Array<{ n: number; verdict: Verdict | null; comments: number; authored: boolean; testStatus?: TestStatus; byUser?: boolean }>;
   }>;
   usage: Usage;
   attempt: number;
@@ -124,6 +124,7 @@ export function summarizeTask(task: Task): TaskSummary {
         comments: round.review?.comments.length ?? 0,
         authored: Boolean(round.author),
         testStatus: round.review?.testRun?.status,
+        byUser: round.review?.by === "user" || undefined,
       })),
     })),
     usage: task.usage,

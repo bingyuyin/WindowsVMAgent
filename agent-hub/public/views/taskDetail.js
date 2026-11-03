@@ -44,6 +44,13 @@ const STAGE_STATUS = {
   cancelled: ["Cancelled", "neutral"],
 };
 const SEVERITY_CLASS = { blocker: "danger", major: "warning", minor: "info", nit: "neutral" };
+/** Who makes and who verifies a change request in each stage. */
+const CHANGE_TEAMS = {
+  design: "the designer revises the design, the design reviewer verifies",
+  coding: "the comment resolver changes the code, the code reviewer verifies",
+  testing: "the test fixer makes the change, the test executor re-runs and verifies",
+  document: "the technical writer revises the document, the doc reviewer verifies",
+};
 const PROVIDER_NAMES = { github: "GitHub", "azure-devops": "Azure DevOps", gitlab: "GitLab", bitbucket: "Bitbucket" };
 /** Testing stages pass or fail rather than being approved. */
 const stageStatus = (stage) =>
@@ -109,6 +116,8 @@ export function taskDetailView(root, { params }) {
   let pushBusy = false;
   let prBusy = false;
   let createPageUrl = null;
+  // Text typed into the Request changes dialog, kept if the dialog is closed or the request fails.
+  let requestDraft = "";
   const deliveryHero = h("div", { class: "delivery" });
   const deliveryResult = h("div", { class: "delivery" });
 
@@ -333,6 +342,7 @@ export function taskDetailView(root, { params }) {
     if (task.status === "completed" && task.result && !task.result.approved) {
       actions.push(h("button", { class: "btn btn-primary", onclick: () => retryTask(true) }, task.stages.at(-1)?.kind === "testing" ? "Continue fixing" : "Continue review loop"));
     }
+    if (task.status === "completed" && task.result) actions.push(h("button", { class: "btn", onclick: requestChanges }, "✎ Request changes"));
     if (!ACTIVE.includes(task.status)) actions.push(h("button", { class: "btn btn-ghost-danger", onclick: deleteTask }, "Delete"));
     setContent(
       titleBox,
@@ -377,10 +387,28 @@ export function taskDetailView(root, { params }) {
   /** Top-of-page status: what is happening right now, or the outcome once the task has finished. */
   function renderHero() {
     const status = task.status;
+    // The change request this run works on (if it was started by one).
+    const activeRequest = ACTIVE.includes(status) ? (task.changeRequests ?? []).findLast((request) => request.attempt === task.attempt) : undefined;
+    const requestLine = activeRequest
+      ? h(
+          "div",
+          { class: "hero-request" },
+          h("span", { class: "mono comment-id" }, activeRequest.id),
+          h("span", { class: "muted" }, ` Your change request (${STAGE_LABELS[activeRequest.stage]} stage): `),
+          `“${excerpt(activeRequest.text, 240)}”`,
+        )
+      : null;
     if (status === "queued") {
       setContent(
         heroBox,
-        h("div", { class: "card hero" }, h("div", { class: "hero-kicker" }, "QUEUED"), h("div", { class: "hero-title" }, "Waiting for a free slot"), h("div", { class: "muted" }, `Up to ${state.settings?.maxConcurrency ?? 10} tasks run in parallel; this one starts automatically when a slot frees up.`)),
+        h(
+          "div",
+          { class: "card hero" },
+          h("div", { class: "hero-kicker" }, "QUEUED"),
+          h("div", { class: "hero-title" }, "Waiting for a free slot"),
+          h("div", { class: "muted" }, `Up to ${state.settings?.maxConcurrency ?? 10} tasks run in parallel; this one starts automatically when a slot frees up.`),
+          requestLine,
+        ),
       );
       return;
     }
@@ -417,6 +445,7 @@ export function taskDetailView(root, { params }) {
                       ? `${ROLE_LABELS[role]}: ${working?.assignment ?? phaseLabel(task.currentStage, task.phase)}`
                       : phaseLabel(task.currentStage, task.phase),
               ),
+              requestLine,
               now ? h("div", { class: "hero-now" }, h("span", { class: "muted" }, "Now: "), h("span", { class: "mono" }, now)) : null,
               working?.lastMessage ? h("div", { class: "hero-message" }, `“${excerpt(working.lastMessage)}”`) : null,
             ),
@@ -429,11 +458,15 @@ export function taskDetailView(root, { params }) {
       const result = task.result;
       const lastStage = task.stages.at(-1);
       const testsLast = lastStage?.kind === "testing";
-      const approvedRound = lastStage?.rounds.find((round) => round.review?.verdict === "approve");
+      // The latest approval (a change request adds rounds after the first one).
+      const approvedRound = lastStage?.rounds.findLast((round) => round.review?.verdict === "approve");
       const reviewer = lastStage ? ROLE_LABELS[REVIEWER_ROLE[lastStage.kind]] : "reviewer";
       const docPath = result.docPath ?? result.designDocPath;
       const docStage = task.stages.find((stage) => isDocStage(stage.kind));
       const tests = result.tests;
+      // Later attempts (retries, change requests) report their own run time, not the time since the first run.
+      const tookText =
+        task.attempt > 1 && task.attemptStartedAt ? `this run took ${duration(task.attemptStartedAt, task.finishedAt)}` : `took ${duration(task.startedAt, task.finishedAt)}`;
       const title = testsLast
         ? result.approved
           ? `✓ All tests pass — verified by the test executor${approvedRound ? ` in round ${approvedRound.n}` : ""}`
@@ -446,7 +479,7 @@ export function taskDetailView(root, { params }) {
         h(
           "div",
           { class: `card hero hero-result ${result.approved ? "hero-ok" : "hero-warn"}` },
-          h("div", { class: "hero-top" }, h("span", { class: "hero-kicker" }, "RESULT"), h("span", { class: "spacer" }), h("span", { class: "muted small" }, `took ${duration(task.startedAt, task.finishedAt)}`)),
+          h("div", { class: "hero-top" }, h("span", { class: "hero-kicker" }, "RESULT"), h("span", { class: "spacer" }), h("span", { class: "muted small" }, tookText)),
           h("div", { class: "hero-title" }, title),
           h(
             "div",
@@ -467,6 +500,7 @@ export function taskDetailView(root, { params }) {
             h("button", { class: "btn btn-sm", onclick: () => selectTab("conversation") }, roundsTabLabel(task)),
             h("button", { class: "btn btn-sm", onclick: () => selectTab("result") }, "Merge instructions"),
             !result.approved ? h("button", { class: "btn btn-sm btn-primary", onclick: () => retryTask(true) }, testsLast ? "Continue fixing" : "Continue review loop") : null,
+            h("button", { class: "btn btn-sm", title: "Ask the agents for further changes or adjustments", onclick: requestChanges }, "✎ Request changes"),
           ),
         ),
       );
@@ -743,6 +777,15 @@ export function taskDetailView(root, { params }) {
                 { class: "rounds" },
                 stage.rounds.length
                   ? stage.rounds.map((round) => {
+                      if (round.review?.by === "user") {
+                        const ids = round.review.comments.map((comment) => comment.id).join(", ");
+                        return h(
+                          "div",
+                          { class: "round-node round-node-user" },
+                          h("div", { class: "rn-title" }, `Round ${round.n}`),
+                          h("div", { class: "rn-steps" }, h("span", { class: "rn-step rn-user", title: round.review.comments.map((comment) => `${comment.id}: ${excerpt(comment.body, 200)}`).join("\n") }, `✎ Your request ${ids}`)),
+                        );
+                      }
                       const current = running && task.currentStage === stage.kind && task.currentRound === round.n;
                       const authorState = round.author ? "done" : current && task.phase !== "reviewing" ? "active" : "pending";
                       const reviewState = round.review ? (round.review.verdict === "approve" ? "approved" : "changes") : current && task.phase === "reviewing" ? "active" : "pending";
@@ -990,6 +1033,26 @@ export function taskDetailView(root, { params }) {
     const testing = stage.kind === "testing";
     const author = round.author;
     const review = round.review;
+    if (review?.by === "user") {
+      return h(
+        "div",
+        { class: "card round-card round-user" },
+        h(
+          "div",
+          { class: "round-head" },
+          h("strong", {}, `Round ${round.n}`),
+          chip("Your change request", "info"),
+          round.attempt > 1 ? chip(`attempt ${round.attempt}`, "outline") : null,
+          h("span", { class: "muted small" }, clock(round.startedAt)),
+        ),
+        h(
+          "div",
+          { class: "conv-block user-request" },
+          h("div", { class: "conv-block-head" }, h("span", { class: "role-tag role-user" }, "You"), h("span", { class: "muted small" }, review.summary)),
+          review.comments.map((comment) => commentCard(comment, true)),
+        ),
+      );
+    }
     const authorRole =
       author?.role ??
       (isDocStage(stage.kind) || testing ? AUTHOR_ROLE[stage.kind] : round.n > 1 || (current && task.phase === "revising") ? "resolver" : "coder");
@@ -1002,7 +1065,7 @@ export function taskDetailView(root, { params }) {
         "div",
         { class: "round-head" },
         h("strong", {}, `Round ${round.n}`),
-        testing && !author ? h("span", { class: "muted small" }, "initial run") : null,
+        testing && !author ? h("span", { class: "muted small" }, round.n > 1 ? "re-run" : "initial run") : null,
         round.attempt > 1 ? chip(`attempt ${round.attempt}`, "outline") : null,
         h("span", { class: "muted small" }, clock(round.startedAt)),
       ),
@@ -1064,7 +1127,7 @@ export function taskDetailView(root, { params }) {
               : null,
             run?.logExcerpt ? h("details", { class: "sub-block" }, h("summary", { class: "label" }, "Output excerpt"), h("pre", { class: "pre-wrap" }, run.logExcerpt)) : null,
             review.comments.length && run ? h("div", { class: "label sub-block" }, `Failures (${review.comments.length})`) : null,
-            review.comments.map(commentCard),
+            review.comments.map((comment) => commentCard(comment)),
           )
         : current && (author || testing) && task.phase === "reviewing"
           ? h("div", { class: "conv-block review" }, spinner(testing ? `${ROLE_LABELS[reviewerRole]} is running the tests…` : `${ROLE_LABELS[reviewerRole]} is reviewing…`))
@@ -1072,30 +1135,32 @@ export function taskDetailView(root, { params }) {
     );
   }
 
-  function commentCard(comment) {
+  function commentCard(comment, fromUser = false) {
     const statusChip =
       comment.status === "addressed"
-        ? chip(comment.test ? "Fix submitted" : "Addressed", "success")
+        ? chip(comment.test ? "Fix submitted" : fromUser ? "Done" : "Addressed", "success")
         : comment.status === "declined"
           ? chip("Declined", "warning")
           : chip("Open", "neutral");
     return h(
       "div",
-      { class: `comment sev-${comment.severity}` },
+      { class: `comment ${fromUser ? "comment-user" : `sev-${comment.severity}`}` },
       h(
         "div",
         { class: "comment-head" },
         h("span", { class: "mono comment-id" }, comment.id),
         comment.test
           ? chip(comment.category ?? "unknown", CATEGORY_CLASS[comment.category] ?? "neutral")
-          : chip(comment.severity, SEVERITY_CLASS[comment.severity] ?? "neutral"),
+          : fromUser
+            ? chip("change request", "info")
+            : chip(comment.severity, SEVERITY_CLASS[comment.severity] ?? "neutral"),
         comment.test ? h("strong", { class: "small break" }, comment.test) : null,
         comment.file ? h("span", { class: "mono small" }, comment.line ? `${comment.file}:${comment.line}` : comment.file) : null,
         h("span", { class: "spacer" }),
         statusChip,
       ),
       renderMarkdown(comment.body),
-      comment.response ? h("div", { class: "comment-response" }, h("span", { class: "muted" }, "↳ Resolution: "), comment.response) : null,
+      comment.response ? h("div", { class: "comment-response" }, h("span", { class: "muted" }, fromUser ? "↳ Agent's response: " : "↳ Resolution: "), comment.response) : null,
     );
   }
 
@@ -1302,7 +1367,7 @@ export function taskDetailView(root, { params }) {
   }
 
   function renderResult(force) {
-    const signature = JSON.stringify([task.status, task.result]);
+    const signature = JSON.stringify([task.status, task.result, task.changeRequests?.length]);
     if (!force && signatures.result === signature) return;
     signatures.result = signature;
     const result = task.result;
@@ -1350,6 +1415,11 @@ export function taskDetailView(root, { params }) {
         ),
         h("h3", {}, "Final summary"),
         result.summary ? renderMarkdown(result.summary) : h("p", { class: "muted" }, "No summary."),
+        h("h3", {}, "Change requests"),
+        task.changeRequests?.length
+          ? h("div", { class: "change-requests" }, [...task.changeRequests].reverse().map(changeRequestRow))
+          : h("p", { class: "muted small" }, "Want something adjusted? Request changes: the agents rework the result and review it again, round by round."),
+        h("div", { class: "row" }, h("button", { class: "btn btn-sm", onclick: requestChanges }, "✎ Request changes")),
         h("h3", {}, "Remote & pull request"),
         deliveryResult,
         h("h3", {}, "Next steps"),
@@ -1360,7 +1430,107 @@ export function taskDetailView(root, { params }) {
     renderDelivery();
   }
 
+  /** One change request: what the user asked for, its state and the agent's response. */
+  function changeRequestRow(request) {
+    const stage = task.stages.find((candidate) => candidate.kind === request.stage);
+    const comment = stage?.rounds.find((round) => round.n === request.round)?.review?.comments.find((candidate) => candidate.id === request.id);
+    const working = ACTIVE.includes(task.status) && task.attempt === request.attempt;
+    const [label, cls] = working
+      ? ["In progress", "running"]
+      : comment?.status === "addressed"
+        ? ["Done", "success"]
+        : comment?.status === "declined"
+          ? ["Declined", "warning"]
+          : ["Open", "neutral"];
+    const responder = stage?.rounds.find((round) => round.n === request.round + 1)?.author?.role;
+    return h(
+      "div",
+      { class: "comment comment-user" },
+      h(
+        "div",
+        { class: "comment-head" },
+        h("span", { class: "mono comment-id" }, request.id),
+        chip(`${STAGE_LABELS[request.stage]} stage`, "outline"),
+        h("span", { class: "muted small" }, `requested ${relTime(request.requestedAt)}`),
+        h("span", { class: "spacer" }),
+        chip(label, cls),
+      ),
+      renderMarkdown(request.text),
+      comment?.response ? h("div", { class: "comment-response" }, h("span", { class: "muted" }, `↳ ${responder ? ROLE_LABELS[responder] : "Agent"}: `), comment.response) : null,
+    );
+  }
+
   // ---- actions ---------------------------------------------------------------------------
+
+  /** Asks the agents for further changes to the finished task (approved or not). */
+  async function requestChanges() {
+    if (!task || task.status !== "completed") return;
+    const kinds = task.stages.map((stage) => stage.kind);
+    const lastKind = kinds.at(-1);
+    const nextId = `U${(task.changeRequests?.length ?? 0) + 1}`;
+    const text = h("textarea", {
+      class: "input",
+      rows: "7",
+      value: requestDraft,
+      placeholder: "Describe the changes or adjustments you want, e.g. “Rename hello() to greet(), accept a name parameter and add a unit test for an empty name.”",
+    });
+    const stageSelect =
+      kinds.length > 1
+        ? h(
+            "select",
+            { class: "input" },
+            kinds.map((kind) => h("option", { value: kind, selected: kind === lastKind }, `${STAGE_LABELS[kind]} stage`)),
+          )
+        : null;
+    const teamNote = h("small", { class: "muted" });
+    const updateNote = () => {
+      const kind = stageSelect?.value ?? lastKind;
+      const later = kinds.slice(kinds.indexOf(kind) + 1);
+      teamNote.textContent =
+        `${STAGE_LABELS[kind]} stage: ${CHANGE_TEAMS[kind] ?? "its agents make and verify the change"}.` +
+        (later.length ? ` Then ${later.map((other) => (other === "testing" ? "the tests run again" : `the ${STAGE_LABELS[other]} stage updates to match`)).join(", then ")}.` : "");
+    };
+    stageSelect?.addEventListener("change", updateNote);
+    updateNote();
+    const rounds = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(task.maxRounds) });
+    const pending = confirmDialog({
+      title: `Request changes · ${task.id}`,
+      body: h(
+        "div",
+        { class: "stack" },
+        h(
+          "p",
+          { class: "muted small" },
+          `This becomes change request ${nextId}. The agents make the change on their own branches and the reviewer verifies it, round by round, until it is approved or the rounds run out; then the task branch is pushed again.`,
+        ),
+        h("label", { class: "field" }, h("span", { class: "field-label" }, "What should change?"), text),
+        stageSelect ? h("label", { class: "field" }, h("span", { class: "field-label" }, "Apply to"), stageSelect, teamNote) : teamNote,
+        h("label", { class: "field" }, h("span", { class: "field-label" }, "Rounds (review rounds or test runs per stage)"), rounds),
+      ),
+      confirmText: "Request changes",
+      wide: true,
+    });
+    text.focus();
+    const ok = await pending;
+    requestDraft = text.value;
+    if (!ok) return;
+    if (!text.value.trim()) {
+      toast("Describe the changes you want first", "error");
+      return;
+    }
+    try {
+      await post(`/api/tasks/${encodeURIComponent(task.id)}/change-request`, {
+        request: text.value,
+        stage: stageSelect?.value,
+        rounds: Number(rounds.value) || undefined,
+      });
+      requestDraft = "";
+      toast(`Change request ${nextId} queued`, "success");
+      selectTab("conversation", false);
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
 
   async function pushTaskBranch() {
     if (pushBusy) return;

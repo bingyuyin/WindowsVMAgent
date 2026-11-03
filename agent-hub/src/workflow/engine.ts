@@ -143,8 +143,12 @@ export class WorkflowEngine {
         this.task.stages.push({ kind, status: "pending", rounds: [], nextCommentNumber: 1 });
       }
     }
-    for (let index = this.resumeIndex(kinds); index < kinds.length; index++) {
+    const start = this.resumeIndex(kinds);
+    for (let index = start; index < kinds.length; index++) {
       this.throwIfAborted();
+      const stage = this.stage(kinds[index]!);
+      // Later stages that are already finished have nothing new to do (the first one is being continued).
+      if (index > start && (stage.status === "approved" || stage.status === "not-approved")) continue;
       const previous = index > 0 ? this.stage(kinds[index - 1]!) : undefined;
       if (previous?.status === "not-approved") {
         this.options.hooks.emit({
@@ -152,7 +156,7 @@ export class WorkflowEngine {
           text: `${STAGE_LABELS[previous.kind]} stage was not approved within its round budget; continuing with the latest version.`,
         });
       }
-      await this.runStage(this.stage(kinds[index]!));
+      await this.runStage(stage);
     }
     await this.finalize();
   }
@@ -288,6 +292,11 @@ export class WorkflowEngine {
     let reviewOnly: Round | null = last?.author && !last.review ? last : null;
     let lastReview = reviewOnly ? undefined : last?.review;
     let open = lastReview?.verdict === "request_changes" ? lastReview.comments.filter((comment) => comment.status === "open") : [];
+    // An earlier stage changed for a change request: run the tests again before fixing anything.
+    if (testing && stage.rerun && !reviewOnly) {
+      lastReview = undefined;
+      open = [];
+    }
 
     const used = new Set<AgentRole>();
     let reviews = 0;
@@ -314,7 +323,10 @@ export class WorkflowEngine {
           if (testing && !round.author.commit && responses.length && responses.every((response) => response.status === "declined")) {
             // Re-running unchanged code cannot change the outcome.
             stage.status = "not-approved";
-            const text = `The test fixer could not fix the remaining ${responses.length} failure(s) in code; stopped without re-running unchanged code.`;
+            const text =
+              lastReview?.by === "user"
+                ? `The test fixer declined the requested change(s) ${responses.map((response) => response.commentId).join(", ")} without changing any files; stopped without re-running unchanged code.`
+                : `The test fixer could not fix the remaining ${responses.length} failure(s) in code; stopped without re-running unchanged code.`;
             hooks.emit({ type: "warning", stage: kind, round: round.n, text });
             hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", stage: kind, round: round.n, text });
             break;
@@ -328,6 +340,7 @@ export class WorkflowEngine {
         const review = await this.reviewTurn(stage, round, reviewerRole, design);
         reviews++;
         round.review = review;
+        stage.rerun = undefined;
         const verdictText = review.testRun
           ? describeTestRun(review.testRun, review.comments)
           : review.verdict === "approve"
@@ -418,7 +431,8 @@ export class WorkflowEngine {
     const startHead = await ws.head();
     const fresh = !this.agents.has(role);
     const agent = await this.agentFor(role, kind, ws.path);
-    const assignment = assignmentFor(role, round.n, context.open.length);
+    const fromUser = context.lastReview?.by === "user";
+    const assignment = assignmentFor(role, round.n, context.open.length, fromUser);
     hooks.agent(role, (info) => {
       info.status = "working";
       info.workspace = ws.path;
@@ -472,7 +486,7 @@ export class WorkflowEngine {
     hooks.agent(role, (info) => {
       info.status = "idle";
     });
-    return this.recordAuthorRound(stage, round, role, ws, startHead, submission.input, submission.fallback, context.open);
+    return this.recordAuthorRound(stage, round, role, ws, startHead, submission.input, submission.fallback, context.open, fromUser);
   }
 
   private async reviewTurn(stage: Stage, round: Round, role: AgentRole, design: DesignContext | undefined): Promise<ReviewSubmission> {
@@ -731,6 +745,7 @@ export class WorkflowEngine {
     input: WorkSubmissionInput,
     fallback: boolean,
     open: ReviewComment[],
+    fromUser = false,
   ): Promise<AuthorSubmission> {
     const { workspace, hooks } = this.options;
     const task = this.task;
@@ -753,7 +768,15 @@ export class WorkflowEngine {
       }
     }
 
-    const label = stage.kind === "coding" ? (role === "resolver" ? "review fixes" : "code") : stage.kind === "testing" ? "test fixes" : stage.kind;
+    const label = fromUser
+      ? `requested changes ${open.map((comment) => comment.id).join(", ")}`
+      : stage.kind === "coding"
+        ? role === "resolver"
+          ? "review fixes"
+          : "code"
+        : stage.kind === "testing"
+          ? "test fixes"
+          : stage.kind;
     const subject = `[agent-hub] ${task.id} ${label} round ${round.n}: ${truncate(firstLine(input.summary), 72)}`;
     await ws.commitAll(subject, `${task.title}\n\nAuthor agent: ${ROLE_LABELS[role]}\n\n${CO_AUTHOR}`);
     // Also picks up commits an agent made itself despite the instructions.
@@ -861,7 +884,8 @@ export class WorkflowEngine {
     } else {
       roundDiff = await workspace.diff(prevSha, headSha, MAX_ROUND_DIFF_BYTES);
     }
-    const previousComments = stage.rounds.find((candidate) => candidate.n === round.n - 1)?.review?.comments ?? [];
+    const previousReview = stage.rounds.find((candidate) => candidate.n === round.n - 1)?.review;
+    const previousComments = previousReview?.comments ?? [];
     return reviewPrompt({
       task: this.task,
       role: reviewerRoleFor(stage.kind),
@@ -881,6 +905,7 @@ export class WorkflowEngine {
       totalStat,
       roundDiff,
       previousComments,
+      userRequests: previousReview?.by === "user",
     });
   }
 
@@ -985,8 +1010,20 @@ export class WorkflowEngine {
   }
 }
 
-export function assignmentFor(role: AgentRole, round: number, openComments: number): string {
+export function assignmentFor(role: AgentRole, round: number, openComments: number, fromUser = false): string {
   const comments = `${openComments} review comment${openComments === 1 ? "" : "s"}`;
+  if (fromUser) {
+    switch (role) {
+      case "designer":
+        return `Revising the design for your change request (round ${round})`;
+      case "writer":
+        return `Revising the document for your change request (round ${round})`;
+      case "coder":
+      case "resolver":
+      case "fixer":
+        return `Making the changes you requested (round ${round})`;
+    }
+  }
   switch (role) {
     case "planner":
       return "Planning: deciding which sub-agents to create and what each should do";

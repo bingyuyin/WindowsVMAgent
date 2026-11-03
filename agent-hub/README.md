@@ -105,6 +105,8 @@ flowchart LR
    version (v1, v2, … final).
 7. **Push & pull request**: the hub pushes the task branch to the repository's remote and the task gets a
    **Create pull request** button (see [Pushing branches and pull requests](#pushing-branches-and-pull-requests)).
+8. **Request changes**: once finished (approved or not) you can ask for further changes or adjustments,
+   as often as you like (see [Requesting changes after a task finishes](#requesting-changes-after-a-task-finishes)).
 
 Each agent keeps one Copilot session per stage, so it remembers earlier rounds; a comment resolver or test
 fixer that starts fresh gets the request, the previous summary and the diff so far. If an agent ends a turn
@@ -112,6 +114,24 @@ without calling its submit tool, the hub nudges it, and after two attempts deriv
 last message (a test run without structured results counts as *blocked*, never as passed). If an agent
 asks a question (`ask_user`), the task shows **Needs your input**; answer in the UI, or after the
 configured timeout the agent proceeds on its own judgment.
+
+## Requesting changes after a task finishes
+
+Every finished task, approved or not, has a **✎ Request changes** button (title bar, result card and
+Result tab). Describe what should change, optionally pick the stage it applies to (default: the last one)
+and the round budget:
+
+- The request becomes change request **U1** (then U2, …): a round of its own, shown as *Your change
+  request* in the Rounds tab and the pipelines. The stage's author makes the change on its own branch,
+  on top of the latest result: the comment resolver for code, the designer or technical writer for
+  documents, the test fixer for tests. It must answer U1 with *addressed* or *declined* (with a reason).
+- The stage's reviewer verifies that the request was carried out (a decline is accepted only when the
+  request is impossible or harmful), or the test executor re-runs the tests. They iterate as usual until
+  approved or the rounds run out. Your requests take priority over earlier review preferences.
+- Later stages are brought in line: after a design change the code is updated to match, and after a code
+  change the test executor re-runs the tests. Earlier stages are left as they are.
+- The task then completes again and its branch is pushed, so an open pull request picks up the change.
+  The Result tab lists every change request with its status and the agent's response.
 
 ## Execute & verify: running test automation
 
@@ -300,7 +320,7 @@ data/
   settings.json              settings
   repos.json                 registered repositories
   manager-log.jsonl          manager <-> sub-agent messages (Agents view; rotated at 8 MB)
-  tasks/<id>/task.json       last known state of the task (stages, rounds, comments, agents, result, push, pull request)
+  tasks/<id>/task.json       last known state of the task (stages, rounds, comments, agents, result, change requests, push, pull request)
   tasks/<id>/events.jsonl    timeline (append-only)
   tasks/<id>/doc-rN.html     design/document snapshot for round N (.md for Markdown documents)
   worktrees/<id>/author/     author agents' worktree (or <id>/<role>/ with per-agent worktrees)
@@ -328,6 +348,7 @@ deletes the task branch.
 | `GET/POST /api/repos` · `DELETE /api/repos/:id` · `GET /api/repos/:id/branches` | Repository registry |
 | `GET/POST /api/tasks` · `GET/DELETE /api/tasks/:id` | Tasks (`kind`: `auto`, `coding`, `testing`, `design`, `document`, `design-coding`; optional `managerModel` for Auto) |
 | `POST /api/tasks/:id/cancel` · `POST /api/tasks/:id/retry` · `POST /api/tasks/:id/input` | Control and answers |
+| `POST /api/tasks/:id/change-request` | Request further changes to a finished task (`request`, optional `stage` and `rounds`) |
 | `GET /api/tasks/:id/diff?from=&to=` | Changes |
 | `POST /api/tasks/:id/push` | Push the task branch to the remote now (retry, or with automatic pushes off) |
 | `GET /api/tasks/:id/pull-request` · `POST /api/tasks/:id/pull-request` | What the remote supports / open the pull request (returns it, or the host's `createUrl`) |

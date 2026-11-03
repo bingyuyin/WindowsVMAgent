@@ -294,7 +294,7 @@ export const copyButton = (text, label = "Copy") =>
   h("button", { class: "btn btn-xs btn-ghost", type: "button", title: `Copy ${text}`, onclick: () => copyText(text) }, label);
 
 /** Minimal modal dialog. Resolves with true when confirmed. */
-export function confirmDialog({ title, body, confirmText = "Confirm", danger = false }) {
+export function confirmDialog({ title, body, confirmText = "Confirm", danger = false, wide = false }) {
   return new Promise((resolve) => {
     const close = (result) => {
       overlay.remove();
@@ -310,7 +310,7 @@ export function confirmDialog({ title, body, confirmText = "Confirm", danger = f
       { class: "modal-overlay", onclick: (event) => event.target === overlay && close(false) },
       h(
         "div",
-        { class: "modal", role: "dialog", "aria-modal": "true", "aria-label": title },
+        { class: `modal ${wide ? "modal-wide" : ""}`, role: "dialog", "aria-modal": "true", "aria-label": title },
         h("h2", {}, title),
         h("div", { class: "modal-body" }, body),
         h("div", { class: "modal-actions" }, h("button", { class: "btn", onclick: () => close(false) }, "Cancel"), confirmButton),

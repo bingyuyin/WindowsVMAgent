@@ -34,6 +34,8 @@ import {
   type PullRequestInfo,
   type PushInfo,
   type Repo,
+  type Round,
+  type Stage,
   type StageKind,
   type Task,
   type TaskKind,
@@ -289,6 +291,81 @@ export class TaskRunner {
     const verb = unapproved ? "Continuing" : "Retrying";
     this.requeue(task, extraRounds ?? task.maxRounds, verb);
     this.comm(task, { from: "user", to: "manager", kind: "lifecycle", text: `${verb} (attempt ${task.attempt}, up to ${task.roundsBudget} more review round(s))` });
+    this.publish(task);
+    this.pump();
+    return task;
+  }
+
+  /**
+   * Asks for further changes to a finished task, approved or not. The request becomes comment U<n> in a new
+   * round of the chosen stage (the last one by default): that stage's author - the comment resolver for code,
+   * the test fixer for tests - makes the change on its own branch and the stage's reviewer (or the test
+   * executor) verifies it, round by round. Later stages then bring their work in line with it (the test
+   * executor re-runs the tests), and the task completes and is pushed again.
+   */
+  requestChanges(id: string, input: { request: string; stage?: string; rounds?: number }): Task {
+    const task = this.get(id);
+    if (this.running.has(id) || task.status !== "completed") throw new HttpError(409, "Changes can be requested once the task has finished");
+    const text = (input.request ?? "").trim();
+    if (!text) throw new HttpError(400, "Describe the changes you want");
+    if (text.length > 20_000) throw new HttpError(400, "The change request is too long (max 20,000 characters)");
+    const kinds = stageKindsOf(task);
+    const target = (input.stage || kinds.at(-1)) as StageKind | undefined;
+    const index = target ? kinds.indexOf(target) : -1;
+    if (!target || index < 0) throw new HttpError(400, kinds.length ? `Stage must be one of: ${kinds.join(", ")}` : "This task has no stages to change");
+    const rounds = input.rounds ?? task.maxRounds;
+    if (!Number.isInteger(rounds) || rounds < 1 || rounds > 10) throw new HttpError(400, "Rounds must be an integer between 1 and 10");
+
+    const requestId = `U${(task.changeRequests?.length ?? 0) + 1}`;
+    this.resumeQueue.delete(id);
+    task.autoResumes = 0;
+    this.requeue(task, rounds, `Change request ${requestId}`);
+    const now = nowIso();
+    const stageOf = (kind: StageKind): Stage => {
+      let stage = task.stages.find((candidate) => candidate.kind === kind);
+      if (!stage) task.stages.push((stage = { kind, status: "pending", rounds: [], nextCommentNumber: 1 }));
+      return stage;
+    };
+    // The request is a round of its own: a "review" by the user whose comment the stage's agents must address.
+    const addRequestRound = (stage: Stage, body: string, summary: string): Round => {
+      const round: Round = {
+        n: stage.rounds.length + 1,
+        attempt: task.attempt,
+        startedAt: now,
+        review: { verdict: "request_changes", by: "user", summary, comments: [{ id: requestId, severity: "major", body, status: "open" }], at: now },
+      };
+      stage.rounds.push(round);
+      stage.status = "pending";
+      return round;
+    };
+    const round = addRequestRound(stageOf(target), text, `Change request ${requestId} from the user`);
+    const later = kinds.slice(index + 1);
+    for (const kind of later) {
+      const stage = stageOf(kind);
+      if (kind === "testing") {
+        stage.rerun = true;
+        stage.status = "pending";
+      } else {
+        addRequestRound(stage, cascadeRequest(target, kind, requestId, text), `Bring this stage in line with change request ${requestId}`);
+      }
+    }
+    (task.changeRequests ??= []).push({ id: requestId, text, stage: target, round: round.n, attempt: task.attempt, rounds: task.roundsBudget ?? rounds, requestedAt: now });
+    this.emit(task, {
+      type: "info",
+      stage: target,
+      round: round.n,
+      text: `Change request ${requestId} from the user (${STAGE_TITLES[target]} stage): ${truncate(text, 2000)}`,
+      data: { changeRequest: requestId },
+    });
+    this.comm(task, { from: "user", to: "manager", kind: "lifecycle", stage: target, round: round.n, text: `Change request ${requestId} for the ${STAGE_TITLES[target]} stage: ${truncate(firstLine(text), 160)}` });
+    if (later.length) {
+      this.comm(task, {
+        from: "manager",
+        to: "manager",
+        kind: "lifecycle",
+        text: `After ${requestId}: ${later.map((kind) => (kind === "testing" ? "re-run the tests" : `update the ${STAGE_TITLES[kind]} stage to match`)).join(", then ")}`,
+      });
+    }
     this.publish(task);
     this.pump();
     return task;
@@ -553,7 +630,10 @@ export class TaskRunner {
     try {
       task.status = "running";
       task.phase = "preparing";
+      task.phaseStartedAt = nowIso();
+      task.currentRound = 0;
       task.startedAt ??= nowIso();
+      task.attemptStartedAt = nowIso();
       task.finishedAt = undefined;
       task.error = undefined;
       this.emit(task, { type: "status", text: `Started (attempt ${task.attempt})` });
@@ -957,3 +1037,20 @@ export function pullRequestBody(task: Task): string {
 }
 
 const STAGE_TITLES: Record<StageKind, string> = { design: "Design", coding: "Coding", testing: "Execute & verify", document: "Document" };
+
+const CHANGED_ARTIFACT: Record<StageKind, string> = { design: "design document", coding: "code", testing: "code and tests", document: "document" };
+
+/** What a later stage is asked to do after an earlier stage changed for a change request. */
+function cascadeRequest(changed: StageKind, stage: StageKind, id: string, request: string): string {
+  const action =
+    stage === "coding"
+      ? "Bring the implementation (and its tests) in line with it"
+      : stage === "design"
+        ? "Update the design document to match"
+        : "Update the document to match";
+  const quoted = truncate(request, 4000)
+    .split(/\r?\n/)
+    .map((line) => `> ${line}`)
+    .join("\n");
+  return `The ${CHANGED_ARTIFACT[changed]} changed in the ${STAGE_TITLES[changed]} stage for the user's change request ${id} (quoted below). ${action}; decline with the reason if nothing here needs to change.\n\n${quoted}`;
+}
