@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Bus } from "./bus.ts";
-import { cloneRepo, inspectRepo, listBranches } from "./git.ts";
+import { cloneRepo, initRepository, inspectRepo, listBranches } from "./git.ts";
 import type { Store } from "./store.ts";
 import { ACTIVE_STATUSES, type Repo } from "./types.ts";
 import { errorMessage, HttpError, nowIso, slugify } from "./util.ts";
@@ -10,6 +10,8 @@ export interface RegisterRepoInput {
   path?: string;
   cloneUrl?: string;
   name?: string;
+  /** Create a git repository in a plain folder (git init + initial commit of its contents). */
+  initGit?: boolean;
 }
 
 const CLONE_URL = /^(https:\/\/|ssh:\/\/|git@)[^\s]+$/i;
@@ -61,7 +63,17 @@ export class RepoService {
     try {
       info = await inspectRepo(directory);
     } catch (error) {
-      throw new HttpError(400, errorMessage(error));
+      const notGit = fs.existsSync(directory) && fs.statSync(directory).isDirectory() && /Not a git repository/.test(errorMessage(error));
+      if (!notGit) throw new HttpError(400, errorMessage(error));
+      if (!input.initGit) {
+        throw new HttpError(400, `${directory} is not a git repository. Enable “Initialize git in this folder” to let the hub create one, so agents can work on isolated branches.`);
+      }
+      try {
+        await initRepository(directory);
+        info = await inspectRepo(directory);
+      } catch (initError) {
+        throw new HttpError(400, `Could not initialize git in ${directory}: ${errorMessage(initError)}`);
+      }
     }
     if (!info.headSha) throw new HttpError(400, "The repository has no commits yet; commit something first");
     const existing = this.store.repos.find((repo) => samePath(repo.path, info.root));

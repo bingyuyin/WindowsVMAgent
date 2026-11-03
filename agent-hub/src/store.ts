@@ -15,11 +15,14 @@ interface PersistedState {
 export const DEFAULT_SETTINGS: Settings = {
   authorModel: null,
   reviewerModel: null,
+  resolverModel: null,
   maxRounds: 3,
   maxConcurrency: 2,
   designDocDir: "docs/designs",
   turnTimeoutMinutes: 90,
   inputTimeoutMinutes: 30,
+  isolation: "branch",
+  cleanupWorktrees: true,
 };
 
 const RECENT_EVENT_LIMIT = 500;

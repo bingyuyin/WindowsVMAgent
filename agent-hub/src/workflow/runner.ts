@@ -2,14 +2,15 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AgentDriver, AgentObserver, UserQuestion } from "../agents/driver.ts";
 import type { Bus } from "../bus.ts";
+import { describeContext, discoverContext, type HubSkills } from "../context.ts";
 import {
-  addWorktree,
   deleteBranch,
-  GitWorkspace,
+  deleteBranchesWithPrefix,
+  diffBetween,
+  diffStatBetween,
+  GitTaskWorkspace,
   inspectRepo,
   isValidBranchName,
-  isWorktree,
-  removeWorktree,
   resolveCommit,
   uniqueBranchName,
 } from "../git.ts";
@@ -18,6 +19,7 @@ import {
   ACTIVE_STATUSES,
   stagesFor,
   TASK_KINDS,
+  type AgentInfo,
   type AgentRole,
   type NewTaskEvent,
   type Repo,
@@ -26,7 +28,7 @@ import {
   type TaskKind,
 } from "../types.ts";
 import { CancelledError, errorMessage, firstLine, HttpError, KeyedMutex, nowIso, randomId, slugify, truncate } from "../util.ts";
-import { WorkflowEngine, type EngineHooks } from "./engine.ts";
+import { modelFor, WorkflowEngine, type EngineHooks } from "./engine.ts";
 import { summarizeTask } from "./summary.ts";
 
 export interface SubmitTaskInput {
@@ -37,6 +39,7 @@ export interface SubmitTaskInput {
   baseRef?: string;
   authorModel?: string;
   reviewerModel?: string;
+  resolverModel?: string;
   maxRounds?: number;
 }
 
@@ -52,6 +55,7 @@ export interface RunnerDeps {
   runtime: RuntimeGate;
   driver: AgentDriver;
   worktreesDir: string;
+  hubSkills?: HubSkills;
 }
 
 interface RunningTask {
@@ -123,6 +127,7 @@ export class TaskRunner {
     const settings = store.settings;
     const authorModel = (input.authorModel || settings.authorModel || "").trim();
     const reviewerModel = (input.reviewerModel || settings.reviewerModel || authorModel).trim();
+    const resolverModel = (input.resolverModel || settings.resolverModel || authorModel).trim();
     if (!authorModel || !reviewerModel) throw new HttpError(400, "Choose the author and reviewer models first (Settings)");
     const maxRounds = clampInt(input.maxRounds ?? settings.maxRounds, 1, 10);
 
@@ -147,13 +152,17 @@ export class TaskRunner {
       repoName: repo.name,
       baseRef,
       baseSha,
+      isolation: settings.isolation,
+      layout: 2,
       authorModel,
       reviewerModel,
+      resolverModel,
       maxRounds,
       status: "queued",
       phase: "queued",
       currentRound: 0,
       stages: stagesFor(input.kind).map((kind) => ({ kind, status: "pending", rounds: [], nextCommentNumber: 1 })),
+      agents: [],
       sessions: [],
       usage: { inputTokens: 0, outputTokens: 0, premiumRequests: 0, modelCalls: 0 },
       attempt: 1,
@@ -222,13 +231,15 @@ export class TaskRunner {
       throw new HttpError(409, "Cancel the task before deleting it");
     }
     const repo = store.getRepo(task.repoId);
-    if (repo && fs.existsSync(repo.path)) {
+    const root = task.workspaceRoot ?? task.worktreePath ?? path.join(this.deps.worktreesDir, task.id);
+    if (repo && fs.existsSync(repo.path) && task.baseSha && task.branch) {
+      await this.workspaceFor(task, repo, root).removeWorktrees();
       await this.repoLocks.run(repo.path, async () => {
-        if (task.worktreePath) await removeWorktree(repo.path, task.worktreePath);
-        if (task.branch && options.deleteBranch) await deleteBranch(repo.path, task.branch);
+        await deleteBranchesWithPrefix(repo.path, `${task.branch}--`);
+        if (options.deleteBranch) await deleteBranch(repo.path, task.branch!);
       });
-    } else if (task.worktreePath && fs.existsSync(task.worktreePath)) {
-      fs.rmSync(task.worktreePath, { recursive: true, force: true });
+    } else if (fs.existsSync(root)) {
+      fs.rmSync(root, { recursive: true, force: true });
     }
     await runtime.deleteSessions(task.sessions.map((session) => session.sessionId));
     store.removeTask(id);
@@ -267,12 +278,10 @@ export class TaskRunner {
   async diff(id: string, from?: string, to?: string): Promise<{ from: string; to: string; stat: string; text: string; truncated: boolean }> {
     const task = this.get(id);
     const repo = this.deps.store.getRepo(task.repoId);
-    const cwd = task.worktreePath && fs.existsSync(task.worktreePath) ? task.worktreePath : repo?.path;
-    if (!cwd || !task.baseSha || !task.branch) throw new HttpError(404, "This task has no changes yet");
+    if (!repo || !task.baseSha || !task.branch) throw new HttpError(404, "This task has no changes yet");
     const fromRef = from && SHA.test(from) ? from : task.baseSha;
     const toRef = to && SHA.test(to) ? to : task.branch;
-    const workspace = new GitWorkspace(cwd, task.baseSha);
-    const [diff, stat] = await Promise.all([workspace.diff(fromRef, toRef, 3_000_000), workspace.diffStat(fromRef, toRef)]);
+    const [diff, stat] = await Promise.all([diffBetween(repo.path, fromRef, toRef, 3_000_000), diffStatBetween(repo.path, fromRef, toRef)]);
     return { from: fromRef, to: toRef, stat, ...diff };
   }
 
@@ -302,7 +311,10 @@ export class TaskRunner {
       if (!repo) throw new Error("The repository is no longer registered");
       const workspace = await this.prepareWorkspace(task, repo);
       if (entry.controller.signal.aborted) throw new CancelledError();
-      const engine = new WorkflowEngine(task, { driver, workspace, settings: store.settings, hooks });
+      task.context = await discoverContext(repo.path, task.baseSha!);
+      this.emit(task, { type: "info", text: `Repository context: ${describeContext(task.context)}`, data: { context: true } });
+      this.publish(task);
+      const engine = new WorkflowEngine(task, { driver, workspace, settings: store.settings, hooks, hubSkills: this.deps.hubSkills });
       entry.engine = engine;
       await engine.run();
       task.status = "completed";
@@ -327,6 +339,11 @@ export class TaskRunner {
       task.finishedAt = nowIso();
       task.activity = undefined;
       task.pendingInput = undefined;
+      for (const agent of task.agents ?? []) {
+        if (agent.status === "working" || agent.status === "idle") {
+          agent.status = task.status === "completed" ? "done" : task.status === "failed" ? "failed" : "cancelled";
+        }
+      }
       this.running.delete(task.id);
       this.waiters.delete(task.id);
       this.publish(task);
@@ -334,24 +351,47 @@ export class TaskRunner {
     }
   }
 
-  private prepareWorkspace(task: Task, repo: Repo): Promise<GitWorkspace> {
-    return this.repoLocks.run(repo.path, async () => {
+  private workspaceFor(task: Task, repo: Repo, root = task.workspaceRoot ?? path.join(this.deps.worktreesDir, task.id)): GitTaskWorkspace {
+    return new GitTaskWorkspace({
+      repoPath: repo.path,
+      baseSha: task.baseSha!,
+      taskBranch: task.branch!,
+      root,
+      isolation: task.isolation ?? this.deps.store.settings.isolation,
+      lock: (work) => this.repoLocks.run(repo.path, work),
+    });
+  }
+
+  private async prepareWorkspace(task: Task, repo: Repo): Promise<GitTaskWorkspace> {
+    await this.repoLocks.run(repo.path, async () => {
       task.baseSha ??= await resolveCommit(repo.path, task.baseRef);
       if (!task.branch) {
         let base = `agent-hub/${task.id.toLowerCase()}-${slugify(task.title, 32)}`;
         if (!(await isValidBranchName(repo.path, base))) base = `agent-hub/${task.id.toLowerCase()}`;
         task.branch = await uniqueBranchName(repo.path, base);
       }
-      task.worktreePath ??= path.join(this.deps.worktreesDir, task.id);
-      if (await isWorktree(task.worktreePath)) {
-        this.emit(task, { type: "info", text: `Reusing worktree ${task.worktreePath} (branch ${task.branch})` });
-      } else {
-        await addWorktree(repo.path, task.worktreePath, task.branch, task.baseSha);
-        this.emit(task, { type: "info", text: `Created worktree ${task.worktreePath} on new branch ${task.branch}` });
-      }
-      this.publish(task);
-      return new GitWorkspace(task.worktreePath, task.baseSha);
     });
+    task.workspaceRoot ??= path.join(this.deps.worktreesDir, task.id);
+    task.isolation ??= this.deps.store.settings.isolation;
+    const workspace = this.workspaceFor(task, repo);
+    if (task.layout !== 2) {
+      // Tasks created before per-agent workspaces had one worktree on the task branch itself.
+      if (await workspace.migrateLegacyWorktree()) {
+        this.emit(task, { type: "info", text: "Moved this task to per-agent branches and worktrees." });
+      }
+      task.layout = 2;
+      task.worktreePath = undefined;
+    }
+    await this.repoLocks.run(repo.path, () => workspace.ensureTaskBranch());
+    this.emit(task, {
+      type: "info",
+      text:
+        task.isolation === "worktree"
+          ? `Task branch ${task.branch}; each sub-agent gets its own worktree and branch under ${task.workspaceRoot}`
+          : `Task branch ${task.branch}; author agents work on their own branches in ${path.join(task.workspaceRoot, "author")}, reviewers in ${path.join(task.workspaceRoot, "review")}`,
+    });
+    this.publish(task);
+    return workspace;
   }
 
   private hooksFor(task: Task, controller: AbortController): EngineHooks {
@@ -367,13 +407,40 @@ export class TaskRunner {
         task.sessions.push({ role, sessionId, attempt: task.attempt });
         this.publish(task);
       },
+      agent: (role, mutate) => {
+        mutate(this.agentInfo(task, role));
+        this.publish(task);
+      },
     };
+  }
+
+  /** Live state of a sub-agent, created on first use. */
+  private agentInfo(task: Task, role: AgentRole): AgentInfo {
+    task.agents ??= [];
+    let info = task.agents.find((candidate) => candidate.role === role);
+    if (!info) {
+      info = {
+        role,
+        model: modelFor(task, role),
+        status: "idle",
+        turns: 0,
+        rounds: [],
+        usage: { inputTokens: 0, outputTokens: 0, premiumRequests: 0, modelCalls: 0 },
+      };
+      task.agents.push(info);
+    }
+    info.updatedAt = nowIso();
+    return info;
   }
 
   private observer(task: Task, role: AgentRole, stage: StageKind): AgentObserver {
     return {
       onDelta: (messageId, text) => this.deps.bus.publishTask(task.id, { type: "delta", role, messageId, text }),
-      onMessage: (text) => this.emit(task, { type: "agent.message", role, stage, text: truncate(text, 20_000) }),
+      onMessage: (text) => {
+        this.agentInfo(task, role).lastMessage = truncate(text.trim(), 400);
+        this.emit(task, { type: "agent.message", role, stage, text: truncate(text, 20_000) });
+        this.scheduleUpdate(task);
+      },
       onIntent: (text) => this.setActivity(task, role, text),
       onToolStart: (info) => {
         this.emit(task, { type: "tool.start", role, stage, text: info.label, data: { toolCallId: info.id, tool: info.name, subAgent: info.subAgent } });
@@ -388,10 +455,12 @@ export class TaskRunner {
           data: { toolCallId: info.id, tool: info.name, success: info.success },
         }),
       onUsage: (usage) => {
-        task.usage.inputTokens += usage.inputTokens;
-        task.usage.outputTokens += usage.outputTokens;
-        task.usage.premiumRequests += usage.premiumRequests;
-        task.usage.modelCalls += 1;
+        for (const target of [task.usage, this.agentInfo(task, role).usage]) {
+          target.inputTokens += usage.inputTokens;
+          target.outputTokens += usage.outputTokens;
+          target.premiumRequests += usage.premiumRequests;
+          target.modelCalls += 1;
+        }
         this.scheduleUpdate(task);
       },
       onError: (message) => this.emit(task, { type: "error", role, stage, text: message }),
@@ -401,6 +470,7 @@ export class TaskRunner {
 
   private setActivity(task: Task, role: AgentRole, text: string): void {
     task.activity = { role, text: truncate(firstLine(text), 200), at: nowIso() };
+    this.agentInfo(task, role).lastActivity = task.activity.text;
     this.deps.bus.publishTask(task.id, { type: "activity", activity: task.activity });
     this.scheduleUpdate(task);
   }

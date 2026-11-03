@@ -6,6 +6,8 @@ export interface AppConfig {
   port: number;
   projectRoot: string;
   publicDir: string;
+  /** Best-practice skills bundled with the hub (fallback when a repository has no guidance). */
+  skillsDir: string;
   dataDir: string;
   worktreesDir: string;
   reposDir: string;
@@ -29,6 +31,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     port,
     projectRoot,
     publicDir: path.join(projectRoot, "public"),
+    skillsDir: path.join(projectRoot, "skills"),
     dataDir,
     worktreesDir: path.join(dataDir, "worktrees"),
     reposDir: path.join(dataDir, "repos"),

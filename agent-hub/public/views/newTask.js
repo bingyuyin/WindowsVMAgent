@@ -7,19 +7,19 @@ const TYPES = [
   {
     id: "coding",
     title: "Coding",
-    text: "A coder agent implements the request; a reviewer agent reviews the diff. They iterate until approval.",
+    text: "Agents: a coder implements the request, a code reviewer reviews each commit, and a comment resolver fixes review comments, round by round until approval.",
     placeholder: "Describe the change: what to build or fix, acceptance criteria, constraints, files or areas involved…",
   },
   {
     id: "design",
     title: "Design",
-    text: "A designer agent writes a design document; a reviewer critiques it. The doc is revised into a finalized version.",
+    text: "Agents: a designer writes the design document and revises it; a design reviewer critiques it until a finalized version is approved.",
     placeholder: "Describe the problem to design for: goals, requirements, constraints, open questions…",
   },
   {
     id: "design-coding",
     title: "Design → Coding",
-    text: "First finalize a reviewed design, then implement it with the coder/reviewer loop.",
+    text: "Agents: designer and design reviewer finalize a design first; then coder, code reviewer and comment resolver implement it.",
     placeholder: "Describe the feature: goals, requirements and acceptance criteria. The design is written first, then implemented…",
   },
 ];
@@ -34,6 +34,8 @@ export function newTaskView(root) {
   const description = h("textarea", { class: "input", rows: "10", required: true });
   const authorSelect = h("select", { class: "input" });
   const reviewerSelect = h("select", { class: "input" });
+  const resolverSelect = h("select", { class: "input" });
+  const resolverField = h("label", { class: "field" }, h("span", { class: "field-label" }, "Comment resolver model"), resolverSelect);
   const roundsInput = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(state.settings?.maxRounds ?? 3) });
   const submitButton = h("button", { class: "btn btn-primary", type: "submit" }, "Create task");
 
@@ -52,11 +54,12 @@ export function newTaskView(root) {
     h(
       "details",
       { class: "advanced" },
-      h("summary", {}, "Models and review rounds"),
+      h("summary", {}, "Agents, models and review rounds"),
       h(
         "div",
-        { class: "grid-3" },
-        h("label", { class: "field" }, h("span", { class: "field-label" }, "Author model"), authorSelect),
+        { class: "grid-2" },
+        h("label", { class: "field" }, h("span", { class: "field-label" }, "Author model (designer / coder)"), authorSelect),
+        resolverField,
         h("label", { class: "field" }, h("span", { class: "field-label" }, "Reviewer model"), reviewerSelect),
         h("label", { class: "field" }, h("span", { class: "field-label" }, "Max review rounds"), roundsInput),
       ),
@@ -66,7 +69,7 @@ export function newTaskView(root) {
 
   root.append(
     h("a", { class: "back", href: "#/tasks" }, "← Tasks"),
-    h("div", { class: "page-header" }, h("div", {}, h("h1", {}, "New task"), h("p", { class: "muted" }, "Agents work in an isolated git worktree on a new branch; your checkout is never modified."))),
+    h("div", { class: "page-header" }, h("div", {}, h("h1", {}, "New task"), h("p", { class: "muted" }, "Each agent works on its own branch in an isolated worktree; tasks on the same repository run side by side and your checkout is never modified."))),
     form,
   );
 
@@ -93,6 +96,7 @@ export function newTaskView(root) {
     const type = TYPES.find((candidate) => candidate.id === kind);
     typeHelp.textContent = type.text;
     description.placeholder = type.placeholder;
+    resolverField.hidden = kind === "design";
   }
 
   function renderRepos() {
@@ -129,6 +133,7 @@ export function newTaskView(root) {
       const models = await loadModels();
       setContent(authorSelect, modelOptions(models, state.settings?.authorModel));
       setContent(reviewerSelect, modelOptions(models, state.settings?.reviewerModel));
+      setContent(resolverSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.resolverModel));
     } catch (error) {
       toast(`Could not load models: ${error.message}`, "error");
     }
@@ -151,6 +156,7 @@ export function newTaskView(root) {
         description: description.value,
         authorModel: authorSelect.value || undefined,
         reviewerModel: reviewerSelect.value || undefined,
+        resolverModel: kind === "design" ? undefined : resolverSelect.value || undefined,
         maxRounds: Number(roundsInput.value) || undefined,
       });
       toast(`Created ${task.id}`, "success");

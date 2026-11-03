@@ -23,6 +23,7 @@ export class CopilotAgentDriver implements AgentDriver {
       readOnly: spec.readOnly,
       workingDirectory: spec.workingDirectory,
       scratchRoots: [path.join(this.copilot.copilotHome, "session-state")],
+      readRoots: spec.skillDirectories,
     });
 
     const session = await client.createSession({
@@ -33,6 +34,8 @@ export class CopilotAgentDriver implements AgentDriver {
       trustWorkingDirectory: "session",
       systemMessage: { mode: "append", content: spec.systemPrompt },
       tools: [buildSubmitTool(spec.submit)],
+      skillDirectories: spec.skillDirectories,
+      disabledSkills: spec.disabledSkills,
       onPermissionRequest: (request) => policy(request),
       onUserInputRequest: async (request) => {
         const choices = request.choices ?? [];
@@ -126,6 +129,10 @@ export function describeTool(name: string, args: unknown, cwd: string): string {
   if (name === "submit_review") {
     const verdict = isRecord(args) && typeof args.verdict === "string" ? args.verdict.replace("_", " ") : "";
     return `Submitting review${verdict ? ` (${verdict})` : ""}`;
+  }
+  if (name === "skill") {
+    const skill = isRecord(args) ? Object.values(args).find((value): value is string => typeof value === "string" && value.trim().length > 0) : undefined;
+    return skill ? `Loading skill: ${truncate(skill, 80)}` : "Loading a skill";
   }
   if (!isRecord(args)) return name;
   for (const key of ARGUMENT_KEYS) {

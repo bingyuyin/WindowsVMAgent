@@ -76,8 +76,53 @@ export const ROLE_LABELS = {
   designer: "Designer",
   "design-reviewer": "Design reviewer",
   coder: "Coder",
+  resolver: "Comment resolver",
   "code-reviewer": "Code reviewer",
 };
+
+export const ROLE_ICONS = { designer: "✎", "design-reviewer": "◎", coder: "⌨", resolver: "⚒", "code-reviewer": "◎" };
+
+export const ROLE_DESCRIPTIONS = {
+  designer: "Writes the design document and revises it for review comments",
+  "design-reviewer": "Reviews the design in a read-only worktree",
+  coder: "Implements the request on its own branch",
+  resolver: "Resolves code review comments on its own branch",
+  "code-reviewer": "Reviews each commit in a read-only worktree pinned to it",
+};
+
+/** Hub best-practice skills each role is asked to apply (mirrors the server's ROLE_SKILLS). */
+export const ROLE_SKILLS = {
+  designer: ["system-design"],
+  "design-reviewer": ["design-review"],
+  coder: ["coding-best-practices"],
+  resolver: ["review-comment-resolution", "coding-best-practices"],
+  "code-reviewer": ["code-review"],
+};
+
+/** Sub-agents a task kind uses, in workflow order. */
+export function rolesFor(kind) {
+  if (kind === "design") return ["designer", "design-reviewer"];
+  if (kind === "design-coding") return ["designer", "design-reviewer", "coder", "code-reviewer", "resolver"];
+  return ["coder", "code-reviewer", "resolver"];
+}
+
+export function agentStatusInfo(agent) {
+  if (!agent) return { label: "Not started", cls: "neutral" };
+  switch (agent.status) {
+    case "working":
+      return { label: "Working", cls: "running" };
+    case "idle":
+      return { label: "Waiting for its next turn", cls: "info-soft" };
+    case "done":
+      return { label: "Done", cls: "success" };
+    case "failed":
+      return { label: "Failed", cls: "danger" };
+    case "cancelled":
+      return { label: "Stopped", cls: "neutral" };
+    default:
+      return { label: agent.status, cls: "neutral" };
+  }
+}
 
 export const KIND_LABELS = { coding: "Coding", design: "Design", "design-coding": "Design → Coding" };
 export const STAGE_LABELS = { design: "Design", coding: "Coding" };
@@ -89,7 +134,7 @@ export function phaseLabel(stage, phase) {
     case "reviewing":
       return stage === "design" ? "Reviewing design" : "Reviewing code";
     case "revising":
-      return stage === "design" ? "Revising design" : "Addressing review comments";
+      return stage === "design" ? "Revising design" : "Resolving review comments";
     case "preparing":
       return "Preparing workspace";
     case "finalizing":
@@ -127,6 +172,8 @@ export function statusInfo(task) {
 export const isActive = (task) => ["queued", "running", "needs-input"].includes(task.status);
 
 export const chip = (label, cls = "neutral", title) => h("span", { class: `chip chip-${cls}`, title }, label);
+
+export const roleTag = (role) => h("span", { class: `role-tag role-${role}` }, ROLE_LABELS[role] ?? role);
 
 export function toast(message, kind = "info") {
   const host = document.getElementById("toasts");

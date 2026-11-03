@@ -1,9 +1,11 @@
-import type { AgentRole, AuthorSubmission, ReviewComment, ReviewSubmission, StageKind, Task } from "../types.ts";
+import type { AgentRole, AuthorSubmission, RepoContext, ReviewComment, ReviewSubmission, StageKind, Task } from "../types.ts";
 import { truncate } from "../util.ts";
 
-export interface WorkspaceInfo {
+/** Where an agent works: its own worktree, on its own branch (authors) or pinned to a commit (reviewers). */
+export interface AgentEnvironment {
   worktree: string;
-  branch: string;
+  branch: string | null;
+  taskBranch: string;
   baseSha: string;
 }
 
@@ -15,50 +17,59 @@ export interface DesignContext {
 }
 
 const MAX_INLINE_DOC = 40_000;
+export const MAX_INLINE_DIFF = 40_000;
 const short = (sha: string) => sha.slice(0, 10);
 
-function environmentBlock(ws: WorkspaceInfo): string {
+function environmentBlock(role: AgentRole, env: AgentEnvironment): string {
+  const reviewer = role === "code-reviewer" || role === "design-reviewer";
+  const workspace = reviewer
+    ? [
+        `- Working directory: ${env.worktree}`,
+        "  Your own read-only git worktree, pinned (detached HEAD) to the exact commit under review. Other agents work in their own worktrees and branches.",
+      ]
+    : [
+        `- Working directory: ${env.worktree}`,
+        `  A git worktree checked out on your own branch \`${env.branch}\`, created from the task branch \`${env.taskBranch}\` at its latest commit (the task started from base ${short(env.baseSha)}).`,
+        "- The hub commits your changes after the round and fast-forwards the task branch. Never commit, push, switch branches, rebase or reset.",
+      ];
   return [
     "Environment:",
-    `- Working directory: ${ws.worktree}`,
-    `  It is a dedicated git worktree on branch \`${ws.branch}\`, created from base commit ${short(ws.baseSha)}.`,
-    "- The hub commits the working tree after every author round. Never commit, push, switch branches, rebase or reset.",
+    ...workspace,
     "- There is no human watching this conversation. Work autonomously; use the ask_user tool only if you are truly blocked by an ambiguity that changes the outcome, and otherwise state your assumptions.",
   ].join("\n");
 }
 
-export function systemPromptFor(role: AgentRole, ws: WorkspaceInfo): string {
+function skillsLine(skills: string[]): string[] {
+  if (!skills.length) return [];
+  const names = skills.map((skill) => `\`${skill}\``).join(" and ");
+  return [
+    `- Best practices: load the ${names} skill${skills.length > 1 ? "s" : ""} (skill tool) before you start and follow ${skills.length > 1 ? "them" : "it"}. Repository instructions, guides and repo skills take precedence where they differ; when the repository has no guidance, the skill is the standard.`,
+  ];
+}
+
+export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: string[] = []): string {
   const intro =
-    "You are an autonomous agent inside Copilot Agent Hub, an automated author <-> reviewer workflow. " +
-    "The hub relays your structured results (via the submit tool) to the other agent, iteration by iteration, until the reviewer approves.";
+    "You are an autonomous sub-agent inside Copilot Agent Hub, an automated author <-> reviewer workflow. " +
+    "The hub relays your structured results (via your submit tool) to the other agents, iteration by iteration, until the reviewer approves.";
+  const header = (roleLine: string) => [intro, "", roleLine, "", environmentBlock(role, env), "", "Rules:"];
   switch (role) {
     case "designer":
       return [
-        intro,
-        "",
-        "ROLE: DESIGN AUTHOR. Write a clear, practical technical design document for the request, grounded in the actual repository.",
-        "",
-        environmentBlock(ws),
-        "",
-        "Rules:",
-        "- Explore the repository first (structure, relevant code, conventions, existing docs and instruction files) so the design fits the existing architecture. Reference concrete files, modules and symbols.",
+        ...header(
+          "ROLE: DESIGN AUTHOR. Write a clear, practical technical design document for the request, grounded in the actual repository, and revise it until the design reviewer approves.",
+        ),
+        "- Explore the repository first (structure, relevant code, conventions, existing design docs/ADRs and instruction files) so the design fits the existing architecture. Reference concrete files, modules and symbols.",
         "- Write the design as Markdown to the exact file path you are given. Do not create or modify any other files.",
-        "- Suggested outline: Title; Summary; Context and problem; Goals and non-goals; Current state (with file references); Proposed design (components, data flow, interfaces/APIs, data model, error handling); Alternatives considered; Risks and mitigations; Testing and validation plan; Implementation plan (ordered steps); Open questions.",
+        ...skillsLine(skills),
         "- When you receive review comments, address every comment ID: update the document (preferred) or decline with a concrete technical justification.",
         "- Finish EVERY round by calling the `submit_work` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
     case "design-reviewer":
       return [
-        intro,
-        "",
-        "ROLE: DESIGN REVIEWER. Critically review the design document written by the author agent.",
-        "",
-        environmentBlock(ws),
-        "",
-        "Rules:",
+        ...header("ROLE: DESIGN REVIEWER. Critically review the design document written by the design author."),
         "- You are strictly read-only: never create, modify or delete files and never run commands with side effects.",
         "- Verify the design against the request and the real codebase: check that referenced files, APIs and assumptions actually exist and hold.",
-        "- Evaluate correctness, completeness against the request, feasibility, fit with existing architecture and conventions, edge cases and failure modes, security, performance, testability, clarity, and whether the implementation plan is actionable.",
+        ...skillsLine(skills),
         "- Each comment must be specific and actionable and point to the section (and file/symbol when relevant). Severities: blocker (wrong, unsafe or infeasible), major (significant gap), minor (worthwhile improvement), nit (polish).",
         "- Approve when no blocker or major issues remain. Do not withhold approval for nits or matters of taste.",
         "- On re-review, check each previous comment against the author's response, accept reasonable declines, and raise new issues only if they are significant. Do not repeat resolved comments.",
@@ -66,32 +77,33 @@ export function systemPromptFor(role: AgentRole, ws: WorkspaceInfo): string {
       ].join("\n");
     case "coder":
       return [
-        intro,
-        "",
-        "ROLE: CODING AUTHOR. Implement the request in the working directory with production-quality changes.",
-        "",
-        environmentBlock(ws),
-        "",
-        "Rules:",
-        "- Work only inside the working directory. Follow the repository's conventions, architecture and instruction files (AGENTS.md, .github/copilot-instructions.md, CONTRIBUTING, etc.).",
+        ...header(
+          "ROLE: CODING AGENT. Implement the request with production-quality changes. A separate reviewer will review your work and a comment-resolver agent will address review feedback.",
+        ),
+        "- Work only inside the working directory. Follow the repository's conventions, architecture and instruction files.",
+        ...skillsLine(skills),
         "- Make focused, complete changes. Add or update tests where the codebase has tests, and update directly related documentation.",
         "- Validate your work: run the relevant build, linters and tests (install dependencies if needed) and fix failures caused by your change. Report exactly what you ran and the results.",
         "- Do not leave temporary files, logs or build outputs in the tree unless they belong in the repository.",
-        "- When you receive review comments, address every comment ID: fix the code (preferred) or decline with a concrete technical justification, then re-validate.",
-        "- Finish EVERY round by calling the `submit_work` tool exactly once. Never end your turn without calling it.",
+        "- Finish by calling the `submit_work` tool exactly once. Never end your turn without calling it.",
+      ].join("\n");
+    case "resolver":
+      return [
+        ...header(
+          "ROLE: COMMENT-RESOLUTION AGENT. Another agent implemented the change; a reviewer requested changes. Resolve every open review comment in the code.",
+        ),
+        "- Start by understanding the change so far: read the diff against the base commit and the files the comments refer to.",
+        ...skillsLine(skills),
+        "- Address every comment ID: fix the code at the root cause (preferred) or decline with a concrete technical justification. Keep fixes focused; do not rewrite unrelated code.",
+        "- Add or adjust tests for behavioral fixes, then re-run the relevant build and tests and report the results.",
+        "- Finish every round by calling the `submit_work` tool exactly once, with a response for every open comment ID. Never end your turn without calling it.",
       ].join("\n");
     case "code-reviewer":
       return [
-        intro,
-        "",
-        "ROLE: CODE REVIEWER. Review the author agent's change like a senior engineer reviewing a pull request.",
-        "",
-        environmentBlock(ws),
-        "",
-        "Rules:",
+        ...header("ROLE: CODE REVIEWER. Review the change like a senior engineer reviewing a pull request."),
         "- You are strictly read-only: never create, modify or delete files and never run commands with side effects. Use file viewing/search tools and read-only git commands (git diff, git log, git show, git status).",
-        `- Review the complete change against the base commit (git diff ${short(ws.baseSha)}..HEAD) and the request (and the approved design when one is provided).`,
-        "- Look for bugs and logic errors, unhandled edge cases, error handling, security issues, concurrency problems, performance problems, missing or weak tests, broken builds, unintended API/contract changes, deviations from repository conventions, missing docs, and incomplete implementation of the request.",
+        `- Review the complete change against the base commit (git diff ${short(env.baseSha)}..HEAD) and the request (and the approved design when one is provided).`,
+        ...skillsLine(skills),
         "- Do not comment on pure formatting or style unless it violates repository conventions. Prefer a few high-signal comments over many trivial ones.",
         "- Each comment: file and line when applicable, a clear description of the problem and the expected fix. Severities: blocker, major, minor, nit.",
         "- Approve when no blocker or major issues remain.",
@@ -103,6 +115,32 @@ export function systemPromptFor(role: AgentRole, ws: WorkspaceInfo): string {
 
 function requestBlock(task: Task): string {
   return [`# Task ${task.id}: ${task.title}`, "", "## Request", "", task.description.trim()].join("\n");
+}
+
+/** Summarizes the repository guidance the hub discovered, so agents read it before working. */
+export function contextBlock(context: RepoContext | undefined, role: AgentRole): string {
+  if (!context) return "";
+  const lines = ["", "## Repository context (discovered by the hub)"];
+  const list = (items: string[], max = 12) => items.slice(0, max).map((item) => `\`${item}\``).join(", ") + (items.length > max ? `, … (${items.length - max} more)` : "");
+  if (context.instructions.length) lines.push(`- Instruction files (loaded automatically; follow them): ${list(context.instructions)}`);
+  if (context.guides.length) lines.push(`- Guides to read before starting (the relevant ones): ${list(context.guides)}`);
+  if (context.designDocs.length) {
+    lines.push(
+      role === "designer" || role === "design-reviewer"
+        ? `- Existing design docs/ADRs (follow their format, terminology and prior decisions): ${list(context.designDocs)}`
+        : `- Existing design docs/ADRs (respect their decisions): ${list(context.designDocs)}`,
+    );
+  }
+  if (context.skills.length) {
+    lines.push("- Repository skills (load with the skill tool when relevant):");
+    for (const skill of context.skills.slice(0, 15)) lines.push(`  - \`${skill.name}\`${skill.description ? ` - ${skill.description}` : ""}`);
+  }
+  if (context.stack.length) lines.push(`- Stack: ${context.stack.join(", ")}`);
+  if (context.validation.length && role !== "designer" && role !== "design-reviewer") {
+    lines.push(`- Validation commands detected: ${context.validation.map((command) => `\`${command}\``).join(", ")}`);
+  }
+  if (lines.length === 2) lines.push("- No repository-specific guidance was found. Follow the conventions visible in the code and the hub best-practice skill.");
+  return lines.join("\n");
 }
 
 function designBlock(design: DesignContext): string {
@@ -139,27 +177,45 @@ function formatResponses(comments: readonly ReviewComment[]): string {
 
 export interface AuthorPromptInput {
   task: Task;
+  role: AgentRole;
   stage: StageKind;
   round: number;
   docPath?: string;
   design?: DesignContext;
-  /** True when this is the first message of a new author session (fresh context). */
+  context?: RepoContext;
+  /** True for the first message of a new agent session (fresh context). */
   includeContext: boolean;
-  /** True when resuming a task that already has work in the worktree. */
+  /** True when resuming a task that already has work on the task branch. */
   resumed: boolean;
   review?: ReviewSubmission;
   openComments: ReviewComment[];
+  /** For a fresh comment-resolution session: what the previous author did and the change so far. */
+  previousWork?: { summary: string; stat: string; diff?: { text: string; truncated: boolean } };
 }
 
 export function authorPrompt(input: AuthorPromptInput): string {
   const parts: string[] = [];
   if (input.includeContext) {
     parts.push(requestBlock(input.task));
+    const context = contextBlock(input.context, input.role);
+    if (context) parts.push(context);
     if (input.stage === "coding" && input.design) parts.push(designBlock(input.design));
-    if (input.resumed) {
+    if (input.previousWork) {
+      parts.push("", "## Work so far", "", "Summary from the previous author round:", input.previousWork.summary.trim() || "(none)");
+      if (input.previousWork.stat) parts.push("", "Change against the base commit (git diff --stat):", "```", input.previousWork.stat, "```");
+      if (input.previousWork.diff?.text.trim()) {
+        parts.push(
+          "",
+          `Diff against the base commit${input.previousWork.diff.truncated ? " (TRUNCATED - run git diff for the rest)" : ""}:`,
+          "```diff",
+          input.previousWork.diff.text,
+          "```",
+        );
+      }
+    } else if (input.resumed) {
       parts.push(
         "",
-        "Note: this task is being resumed. The working directory already contains work from earlier rounds (see `git log` and `git status`). Continue from it rather than starting over.",
+        "Note: this task is being resumed. Your branch already contains the work from earlier rounds (see `git log`). Continue from it rather than starting over.",
       );
     }
     parts.push("");
@@ -167,7 +223,7 @@ export function authorPrompt(input: AuthorPromptInput): string {
 
   const ids = input.openComments.map((comment) => comment.id).join(", ");
   if (input.openComments.length) {
-    parts.push(`## Round ${input.round}: address review comments`);
+    parts.push(`## Round ${input.round}: resolve review comments`);
     if (input.review) parts.push("", `Reviewer summary: ${input.review.summary.trim()}`);
     parts.push("", "Open comments:", formatComments(input.openComments), "");
     parts.push(
@@ -196,13 +252,16 @@ export function authorPrompt(input: AuthorPromptInput): string {
 
 export interface ReviewPromptInput {
   task: Task;
+  role: AgentRole;
   stage: StageKind;
   round: number;
   includeContext: boolean;
   design?: DesignContext;
+  context?: RepoContext;
   docPath?: string;
   docContent?: string;
   submission: AuthorSubmission;
+  authorLabel: string;
   baseSha: string;
   prevSha: string;
   headSha: string;
@@ -215,11 +274,14 @@ export function reviewPrompt(input: ReviewPromptInput): string {
   const parts: string[] = [];
   if (input.includeContext) {
     parts.push(requestBlock(input.task));
+    const context = contextBlock(input.context, input.role);
+    if (context) parts.push(context);
     if (input.stage === "coding" && input.design) parts.push(designBlock(input.design));
     parts.push("");
   }
-  parts.push(`## Round ${input.round}: review the author's submission`, "");
-  parts.push("Author summary:", input.submission.summary.trim() || "(none)");
+  parts.push(`## Round ${input.round}: review the ${input.authorLabel.toLowerCase()}'s submission`, "");
+  parts.push(`Your worktree is now pinned to commit ${short(input.headSha)}.`, "");
+  parts.push(`${input.authorLabel} summary:`, input.submission.summary.trim() || "(none)");
   if (input.submission.validation?.trim()) parts.push("", "Validation reported by the author:", input.submission.validation.trim());
 
   if (input.previousComments.length) {
@@ -235,7 +297,7 @@ export function reviewPrompt(input: ReviewPromptInput): string {
   } else {
     parts.push(
       "",
-      `Base commit: ${short(input.baseSha)}  Current HEAD: ${short(input.headSha)}${input.round > 1 ? `  Previous review at: ${short(input.prevSha)}` : ""}`,
+      `Base commit: ${short(input.baseSha)}  Commit under review: ${short(input.headSha)}${input.round > 1 ? `  Previous review at: ${short(input.prevSha)}` : ""}`,
       "",
       "Overall change (git diff --stat base..HEAD):",
       "```",

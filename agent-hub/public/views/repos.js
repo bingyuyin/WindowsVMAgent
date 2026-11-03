@@ -9,6 +9,7 @@ export function reposView(root) {
   const urlInput = h("input", { class: "input", type: "text", placeholder: "https://github.com/owner/repo.git", spellcheck: "false" });
   const destInput = h("input", { class: "input", type: "text", placeholder: "Optional – defaults to the hub's data/repos folder", spellcheck: "false" });
   const nameInput = h("input", { class: "input", type: "text", placeholder: "Optional display name" });
+  const initGit = h("input", { type: "checkbox" });
   const submitButton = h("button", { class: "btn btn-primary", type: "submit" }, "Register");
   const modeBar = h("div", { class: "seg" });
   const fields = h("div", { class: "stack" });
@@ -17,7 +18,7 @@ export function reposView(root) {
     h(
       "div",
       { class: "page-header" },
-      h("div", {}, h("h1", {}, "Repositories"), h("p", { class: "muted" }, "Register the git repositories agents may work on. Tasks run in isolated worktrees; your checkout is never modified.")),
+      h("div", {}, h("h1", {}, "Repositories"), h("p", { class: "muted" }, "Register the repositories or folders agents may work on. Each task and each agent gets its own branch and worktree, so several tasks can run on the same repository at once; your checkout is never modified.")),
     ),
     h("form", { class: "card form", onsubmit: submit }, h("h2", { class: "section-title" }, "Register a repository"), modeBar, fields, h("div", { class: "row end" }, submitButton)),
     h("h2", { class: "section-title" }, "Registered repositories"),
@@ -48,7 +49,15 @@ export function reposView(root) {
     setContent(
       fields,
       mode === "path"
-        ? h("label", { class: "field" }, h("span", { class: "field-label" }, "Local repository path"), pathInput)
+        ? [
+            h("label", { class: "field" }, h("span", { class: "field-label" }, "Local repository or folder path"), pathInput),
+            h(
+              "label",
+              { class: "row small init-git" },
+              initGit,
+              "If the folder is not a git repository yet, initialize one (git init + an initial commit of its current files) so agents can work on isolated branches.",
+            ),
+          ]
         : [
             h("label", { class: "field" }, h("span", { class: "field-label" }, "Clone URL (https or ssh)"), urlInput),
             h("label", { class: "field" }, h("span", { class: "field-label" }, "Destination folder"), destInput),
@@ -60,7 +69,7 @@ export function reposView(root) {
 
   async function submit(event) {
     event.preventDefault();
-    const body = mode === "path" ? { path: pathInput.value.trim() } : { cloneUrl: urlInput.value.trim(), path: destInput.value.trim() || undefined };
+    const body = mode === "path" ? { path: pathInput.value.trim(), initGit: initGit.checked } : { cloneUrl: urlInput.value.trim(), path: destInput.value.trim() || undefined };
     if (!body.path && !body.cloneUrl) {
       toast(mode === "path" ? "Enter a repository path" : "Enter a clone URL", "error");
       return;
@@ -75,6 +84,7 @@ export function reposView(root) {
       notify("repos");
       toast(`Registered ${repo.name}`, "success");
       pathInput.value = urlInput.value = destInput.value = nameInput.value = "";
+      initGit.checked = false;
     } catch (error) {
       toast(error.message, "error");
     } finally {

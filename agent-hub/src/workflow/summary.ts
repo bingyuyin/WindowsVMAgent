@@ -1,4 +1,4 @@
-import type { Activity, Phase, StageKind, StageStatus, Task, TaskKind, TaskStatus, Usage, Verdict } from "../types.ts";
+import type { Activity, AgentInfo, Phase, StageKind, StageStatus, Task, TaskKind, TaskStatus, Usage, Verdict } from "../types.ts";
 
 export interface TaskSummary {
   id: string;
@@ -10,6 +10,7 @@ export interface TaskSummary {
   branch?: string;
   status: TaskStatus;
   phase: Phase;
+  phaseStartedAt?: string;
   currentStage?: StageKind;
   currentRound: number;
   maxRounds: number;
@@ -17,7 +18,10 @@ export interface TaskSummary {
   activity?: Activity;
   authorModel: string;
   reviewerModel: string;
+  agents: Array<Pick<AgentInfo, "role" | "status" | "model" | "assignment" | "lastActivity" | "branch">>;
   approved: boolean | null;
+  shortStat?: string;
+  openComments?: number;
   needsInput: boolean;
   error?: string;
   stages: Array<{
@@ -44,6 +48,7 @@ export function summarizeTask(task: Task): TaskSummary {
     branch: task.branch,
     status: task.status,
     phase: task.phase,
+    phaseStartedAt: task.phaseStartedAt,
     currentStage: task.currentStage,
     currentRound: task.currentRound,
     maxRounds: task.maxRounds,
@@ -51,7 +56,17 @@ export function summarizeTask(task: Task): TaskSummary {
     activity: task.activity,
     authorModel: task.authorModel,
     reviewerModel: task.reviewerModel,
+    agents: (task.agents ?? []).map(({ role, status, model, assignment, lastActivity, branch }) => ({
+      role,
+      status,
+      model,
+      assignment,
+      lastActivity,
+      branch,
+    })),
     approved: task.result ? task.result.approved : null,
+    shortStat: task.result?.shortStat,
+    openComments: task.result?.openComments,
     needsInput: Boolean(task.pendingInput),
     error: task.error,
     stages: task.stages.map((stage) => ({

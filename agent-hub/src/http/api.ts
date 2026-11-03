@@ -3,7 +3,7 @@ import type { Bus, TaskMessage } from "../bus.ts";
 import type { CopilotService, LoginProvider } from "../copilot/service.ts";
 import type { RepoService } from "../repos.ts";
 import type { Store } from "../store.ts";
-import type { Settings, TaskKind } from "../types.ts";
+import { ISOLATION_MODES, type IsolationMode, type Settings, type TaskKind } from "../types.ts";
 import { HttpError } from "../util.ts";
 import type { TaskRunner } from "../workflow/runner.ts";
 import { summarizeTask } from "../workflow/summary.ts";
@@ -85,6 +85,7 @@ export function createApiRouter(deps: ApiDeps): Router {
       path: optionalString(body, "path", 1000),
       cloneUrl: optionalString(body, "cloneUrl", 1000),
       name: optionalString(body, "name", 100),
+      initGit: body.initGit === true,
     }),
   );
   router.delete("/api/repos/:id", ({ params }) => {
@@ -108,6 +109,7 @@ export function createApiRouter(deps: ApiDeps): Router {
       baseRef: optionalString(body, "baseRef", 300),
       authorModel: optionalString(body, "authorModel", 200),
       reviewerModel: optionalString(body, "reviewerModel", 200),
+      resolverModel: optionalString(body, "resolverModel", 200),
       maxRounds,
     });
   });
@@ -206,11 +208,19 @@ function intIn(value: unknown, min: number, max: number, key: string): number {
 
 export function parseSettingsPatch(body: Record<string, unknown>): Partial<Settings> {
   const patch: Partial<Settings> = {};
-  for (const key of ["authorModel", "reviewerModel"] as const) {
+  for (const key of ["authorModel", "reviewerModel", "resolverModel"] as const) {
     if (!(key in body)) continue;
     const value = body[key];
     if (value !== null && typeof value !== "string") throw new HttpError(400, `'${key}' must be a string`);
     patch[key] = typeof value === "string" && value.trim() ? value.trim() : null;
+  }
+  if ("isolation" in body) {
+    if (!ISOLATION_MODES.includes(body.isolation as IsolationMode)) throw new HttpError(400, `'isolation' must be one of: ${ISOLATION_MODES.join(", ")}`);
+    patch.isolation = body.isolation as IsolationMode;
+  }
+  if ("cleanupWorktrees" in body) {
+    if (typeof body.cleanupWorktrees !== "boolean") throw new HttpError(400, "'cleanupWorktrees' must be a boolean");
+    patch.cleanupWorktrees = body.cleanupWorktrees;
   }
   if ("maxRounds" in body) patch.maxRounds = intIn(body.maxRounds, 1, 10, "maxRounds");
   if ("maxConcurrency" in body) patch.maxConcurrency = intIn(body.maxConcurrency, 1, 8, "maxConcurrency");

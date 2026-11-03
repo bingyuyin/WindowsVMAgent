@@ -1,4 +1,17 @@
-import { chip, h, KIND_LABELS, phaseLabel, relTime, ROLE_LABELS, setContent, STAGE_LABELS, statusInfo } from "../lib/dom.js";
+import {
+  agentStatusInfo,
+  chip,
+  h,
+  KIND_LABELS,
+  phaseLabel,
+  relTime,
+  ROLE_LABELS,
+  roleTag,
+  rolesFor,
+  setContent,
+  STAGE_LABELS,
+  statusInfo,
+} from "../lib/dom.js";
 import { state, subscribe } from "../lib/store.js";
 
 const FILTERS = [
@@ -47,7 +60,12 @@ export function tasksView(root) {
     h(
       "div",
       { class: "page-header" },
-      h("div", {}, h("h1", {}, "Tasks"), h("p", { class: "muted" }, "Each task runs an author agent and a reviewer agent that iterate until the reviewer approves.")),
+      h(
+        "div",
+        {},
+        h("h1", {}, "Tasks"),
+        h("p", { class: "muted" }, "Coding tasks run a coder, a code reviewer and a comment resolver; design tasks run a designer and a design reviewer. Each agent works on its own branch."),
+      ),
       h("a", { class: "btn btn-primary", href: "#/tasks/new" }, "+ New task"),
     ),
     filterBar,
@@ -132,11 +150,8 @@ function taskCard(task) {
       ),
       h("div", { class: "task-title" }, task.title),
       pipelineMini(task),
-      running && task.activity
-        ? h("div", { class: "task-activity" }, h("span", { class: "role-tag" }, ROLE_LABELS[task.activity.role]), h("span", { class: "ellipsis" }, task.activity.text))
-        : task.error
-          ? h("div", { class: "task-activity danger ellipsis" }, task.error)
-          : null,
+      agentStrip(task),
+      running ? liveLine(task) : resultLine(task),
     ),
     h(
       "div",
@@ -147,4 +162,56 @@ function taskCard(task) {
       h("div", { class: "muted small" }, relTime(task.updatedAt)),
     ),
   );
+}
+
+/** One pill per sub-agent of the task, colored by its live status. */
+export function agentStrip(task) {
+  const finished = !["queued", "running", "needs-input"].includes(task.status);
+  // Tasks that ran before per-agent tracking have no agent records to show.
+  if (finished && !(task.agents ?? []).length) return null;
+  const byRole = new Map((task.agents ?? []).map((agent) => [agent.role, agent]));
+  return h(
+    "div",
+    { class: "agent-strip" },
+    rolesFor(task.kind).map((role) => {
+      const agent = byRole.get(role);
+      const label = !agent && task.status === "completed" ? "Not needed" : agentStatusInfo(agent).label;
+      return h(
+        "span",
+        {
+          class: `agent-pill agent-${agent?.status ?? (task.status === "completed" ? "unused" : "pending")}`,
+          title: `${ROLE_LABELS[role]}: ${label}${agent?.model ? ` · ${agent.model}` : ""}`,
+        },
+        h("span", { class: "agent-dot", "aria-hidden": "true" }),
+        ROLE_LABELS[role],
+      );
+    }),
+  );
+}
+
+function liveLine(task) {
+  if (task.status === "needs-input") return h("div", { class: "task-activity attention-text" }, "An agent is waiting for your answer");
+  const active = (task.agents ?? []).find((agent) => agent.status === "working");
+  if (!active && !task.activity) return null;
+  const role = active?.role ?? task.activity?.role;
+  const now = task.activity?.role === role ? task.activity.text : active?.lastActivity;
+  return h(
+    "div",
+    { class: "task-activity" },
+    roleTag(role),
+    h("span", { class: "ellipsis" }, [active?.assignment, now ? `now: ${now}` : null].filter(Boolean).join(" — ")),
+  );
+}
+
+function resultLine(task) {
+  if (task.status === "completed") {
+    return h(
+      "div",
+      { class: `task-result ${task.approved ? "ok" : "warn"}` },
+      task.approved ? "✓ Approved" : "Not approved",
+      task.shortStat ? h("span", { class: "muted" }, ` · ${task.shortStat}`) : null,
+      !task.approved && task.openComments ? h("span", { class: "muted" }, ` · ${task.openComments} open comment(s)`) : null,
+    );
+  }
+  return task.error ? h("div", { class: "task-activity danger ellipsis" }, task.error) : null;
 }

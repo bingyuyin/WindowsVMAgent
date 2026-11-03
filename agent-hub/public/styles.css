@@ -524,6 +524,299 @@ details > summary {
   background: var(--attention-muted);
   color: var(--attention);
 }
+.chip-info-soft {
+  background: transparent;
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* ---- status hero ------------------------------------------------------------------------- */
+
+.hero {
+  padding: 18px 20px;
+  border-width: 1px;
+}
+.hero-live {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: linear-gradient(180deg, var(--accent-muted), transparent 70%), var(--bg-elev);
+}
+.hero-attention {
+  border-color: var(--attention);
+  background: linear-gradient(180deg, var(--attention-muted), transparent 70%), var(--bg-elev);
+}
+.hero-ok {
+  border-color: color-mix(in srgb, var(--success) 55%, transparent);
+  background: linear-gradient(180deg, var(--success-muted), transparent 70%), var(--bg-elev);
+}
+.hero-warn {
+  border-color: color-mix(in srgb, var(--warning) 55%, transparent);
+  background: linear-gradient(180deg, var(--warning-muted), transparent 70%), var(--bg-elev);
+}
+.hero-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.hero-kicker {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.hero-main {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+.hero-icon {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  font-size: 20px;
+  background: var(--violet-muted);
+  color: var(--violet);
+}
+.hero-icon.role-code-reviewer,
+.hero-icon.role-design-reviewer {
+  background: var(--accent-muted);
+  color: var(--accent);
+}
+.hero-icon.role-resolver {
+  background: var(--attention-muted);
+  color: var(--attention);
+}
+.hero-title {
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.35;
+  margin-bottom: 4px;
+}
+.hero-now {
+  font-size: 13px;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+.hero-message {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--border);
+  color: var(--text-muted);
+  font-size: 13px;
+  font-style: italic;
+}
+.result-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin: 6px 0 10px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.hero-summary {
+  max-height: 220px;
+  overflow: auto;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-muted);
+}
+
+/* ---- agents ------------------------------------------------------------------------------ */
+
+.agents {
+  margin-bottom: 16px;
+}
+.agent-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 12px;
+}
+.agent-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  min-width: 0;
+}
+.agent-card.agent-working {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-muted);
+}
+.agent-card.agent-pending,
+.agent-card.agent-unused {
+  opacity: 0.7;
+}
+.agent-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.agent-icon {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  font-size: 15px;
+  background: var(--violet-muted);
+  color: var(--violet);
+}
+.agent-icon.role-code-reviewer,
+.agent-icon.role-design-reviewer {
+  background: var(--accent-muted);
+  color: var(--accent);
+}
+.agent-icon.role-resolver {
+  background: var(--attention-muted);
+  color: var(--attention);
+}
+.agent-name {
+  font-weight: 600;
+}
+.agent-now {
+  font-weight: 500;
+  color: var(--accent);
+  font-size: 13px;
+}
+.agent-activity {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.agent-message {
+  font-size: 12.5px;
+  font-style: italic;
+  color: var(--text-muted);
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+  overflow-wrap: anywhere;
+}
+.agent-meta {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 10px;
+  margin: 2px 0 0;
+  font-size: 12.5px;
+}
+.agent-meta dt {
+  color: var(--text-subtle);
+  font-weight: 600;
+}
+.agent-meta dd {
+  margin: 0;
+  min-width: 0;
+}
+.skill-chip {
+  display: inline-block;
+  margin: 0 4px 2px 0;
+  padding: 1px 7px;
+  border-radius: 5px;
+  font: 11.5px var(--mono);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border-muted);
+}
+
+.agent-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.agent-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 9px 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border-muted);
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.agent-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--border);
+}
+.agent-pill.agent-working {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.agent-pill.agent-working .agent-dot {
+  background: var(--accent);
+  animation: pulse 1.6s infinite;
+}
+.agent-pill.agent-idle .agent-dot {
+  background: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+.agent-pill.agent-done .agent-dot {
+  background: var(--success);
+}
+.agent-pill.agent-failed .agent-dot {
+  background: var(--danger);
+}
+.agent-pill.agent-unused {
+  opacity: 0.55;
+  border-style: dashed;
+}
+.task-result {
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.task-result.ok {
+  color: var(--success);
+}
+.task-result.warn {
+  color: var(--warning);
+}
+.attention-text {
+  color: var(--attention);
+}
+
+/* ---- context ------------------------------------------------------------------------------ */
+
+.context-section + .context-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-muted);
+}
+.context-section h3 {
+  margin: 0 0 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.context-section .count {
+  font-size: 11.5px;
+  color: var(--text-subtle);
+  font-weight: 500;
+}
+.context-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+.context-list li {
+  margin: 3px 0;
+}
+.cmd {
+  font: 12px var(--mono);
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border-muted);
+}
+.init-git {
+  align-items: flex-start;
+  margin: -4px 0 12px;
+  color: var(--text-muted);
+}
 
 .dot {
   display: inline-block;

@@ -1,24 +1,37 @@
 export type TaskKind = "coding" | "design" | "design-coding";
 export type TaskStatus = "queued" | "running" | "needs-input" | "completed" | "failed" | "cancelled" | "interrupted";
 export type StageKind = "design" | "coding";
-export type AgentRole = "designer" | "design-reviewer" | "coder" | "code-reviewer";
+export type AgentRole = "designer" | "design-reviewer" | "coder" | "resolver" | "code-reviewer";
 export type Phase = "queued" | "preparing" | "authoring" | "reviewing" | "revising" | "finalizing" | "done";
 export type Severity = "blocker" | "major" | "minor" | "nit";
 export type Verdict = "approve" | "request_changes";
 export type CommentStatus = "open" | "addressed" | "declined";
 export type StageStatus = "pending" | "running" | "approved" | "not-approved" | "failed" | "cancelled";
+export type AgentStatus = "idle" | "working" | "done" | "failed" | "cancelled";
+/**
+ * Workspace isolation inside a task. "branch": author agents share one author worktree but each
+ * works on its own branch (dependencies/build output are reused); reviewers use a separate
+ * read-only worktree. "worktree": every sub-agent gets its own worktree and branch.
+ */
+export type IsolationMode = "branch" | "worktree";
 
 export const TASK_KINDS: readonly TaskKind[] = ["coding", "design", "design-coding"];
 export const SEVERITIES: readonly Severity[] = ["blocker", "major", "minor", "nit"];
+export const ISOLATION_MODES: readonly IsolationMode[] = ["branch", "worktree"];
 
 export interface Settings {
   authorModel: string | null;
   reviewerModel: string | null;
+  /** Model for the comment-resolver agent; null means "same as the author model". */
+  resolverModel: string | null;
   maxRounds: number;
   maxConcurrency: number;
   designDocDir: string;
   turnTimeoutMinutes: number;
   inputTimeoutMinutes: number;
+  isolation: IsolationMode;
+  /** Remove agent worktrees when a task completes (branches are always kept). */
+  cleanupWorktrees: boolean;
 }
 
 export interface Repo {
@@ -47,6 +60,10 @@ export interface CommentResponse {
 }
 
 export interface AuthorSubmission {
+  /** Which author agent produced this round (designer, coder or resolver). */
+  role?: AgentRole;
+  /** The author agent's own branch the round was committed on. */
+  branch?: string;
   summary: string;
   validation?: string;
   responses: CommentResponse[];
@@ -64,6 +81,8 @@ export interface ReviewSubmission {
   verdict: Verdict;
   summary: string;
   comments: ReviewComment[];
+  /** Commit the reviewer's worktree was pinned to. */
+  reviewedSha?: string;
   fallback?: boolean;
   at: string;
 }
@@ -126,6 +145,48 @@ export interface SessionRef {
   attempt: number;
 }
 
+/** Live state of one sub-agent working on a task (shown in the UI's Agents panel). */
+export interface AgentInfo {
+  role: AgentRole;
+  model: string;
+  status: AgentStatus;
+  /** Worktree the agent works in. */
+  workspace?: string;
+  workspaceRemoved?: boolean;
+  /** The agent's own branch; null for reviewers, which use a detached worktree at the reviewed commit. */
+  branch?: string | null;
+  sessionId?: string;
+  turns: number;
+  rounds: number[];
+  /** What the agent is assigned to right now, e.g. "Addressing 2 review comments (round 2)". */
+  assignment?: string;
+  lastActivity?: string;
+  lastMessage?: string;
+  updatedAt?: string;
+  usage: Usage;
+}
+
+export interface ContextSkill {
+  name: string;
+  description: string;
+  /** Repository-relative path for repo skills; skill folder name for hub skills. */
+  path: string;
+  source: "repo" | "hub";
+}
+
+/** Guidance the hub found in the repository at the task's base commit. */
+export interface RepoContext {
+  instructions: string[];
+  guides: string[];
+  designDocs: string[];
+  skills: ContextSkill[];
+  /** Repository-relative skill folders (parents of <name>/SKILL.md) passed to agents. */
+  skillRoots: string[];
+  validation: string[];
+  stack: string[];
+  discoveredAt: string;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -135,17 +196,28 @@ export interface Task {
   repoName: string;
   baseRef: string;
   baseSha?: string;
+  /** Final task branch; the hub fast-forwards it to each author round's commit. */
   branch?: string;
+  /** Legacy single-worktree path (tasks created before per-agent workspaces). */
   worktreePath?: string;
+  /** Folder holding this task's agent worktrees. */
+  workspaceRoot?: string;
+  isolation?: IsolationMode;
+  /** 2 = per-agent branches/worktrees. */
+  layout?: number;
   authorModel: string;
   reviewerModel: string;
+  resolverModel?: string;
   maxRounds: number;
   status: TaskStatus;
   phase: Phase;
+  phaseStartedAt?: string;
   currentStage?: StageKind;
   currentRound: number;
   activity?: Activity;
   stages: Stage[];
+  agents?: AgentInfo[];
+  context?: RepoContext;
   pendingInput?: PendingInput;
   sessions: SessionRef[];
   error?: string;
@@ -204,6 +276,11 @@ export function authorRoleFor(stage: StageKind): AgentRole {
   return stage === "design" ? "designer" : "coder";
 }
 
+/** Agent that addresses review comments: a dedicated resolver for code, the designer for designs. */
+export function resolverRoleFor(stage: StageKind): AgentRole {
+  return stage === "design" ? "designer" : "resolver";
+}
+
 export function reviewerRoleFor(stage: StageKind): AgentRole {
   return stage === "design" ? "design-reviewer" : "code-reviewer";
 }
@@ -212,10 +289,22 @@ export function isReviewerRole(role: AgentRole): boolean {
   return role === "design-reviewer" || role === "code-reviewer";
 }
 
+/** Sub-agents a task of the given kind uses, in workflow order. */
+export function rolesFor(kind: TaskKind): AgentRole[] {
+  const roles: AgentRole[] = [];
+  for (const stage of stagesFor(kind)) {
+    for (const role of [authorRoleFor(stage), reviewerRoleFor(stage), resolverRoleFor(stage)]) {
+      if (!roles.includes(role)) roles.push(role);
+    }
+  }
+  return roles;
+}
+
 export const ROLE_LABELS: Record<AgentRole, string> = {
   designer: "Designer",
   "design-reviewer": "Design reviewer",
   coder: "Coder",
+  resolver: "Comment resolver",
   "code-reviewer": "Code reviewer",
 };
 

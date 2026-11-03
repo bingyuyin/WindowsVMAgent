@@ -3,6 +3,7 @@ import path from "node:path";
 import { CopilotAgentDriver } from "./agents/copilotDriver.ts";
 import { Bus } from "./bus.ts";
 import { loadConfig } from "./config.ts";
+import { loadHubSkills } from "./context.ts";
 import { CopilotService } from "./copilot/service.ts";
 import { createApiRouter } from "./http/api.ts";
 import { createHttpServer } from "./http/server.ts";
@@ -28,6 +29,7 @@ const runner = new TaskRunner({
   runtime: copilot,
   driver: new CopilotAgentDriver(copilot),
   worktreesDir: config.worktreesDir,
+  hubSkills: loadHubSkills(config.skillsDir),
 });
 const repos = new RepoService(store, bus, config.reposDir);
 runner.init();

@@ -130,5 +130,7 @@ describe("tool labels", () => {
     assert.equal(describeTool("powershell", { command: "npm test\nmore" }, cwd), "powershell: npm test");
     assert.equal(describeTool("view", { path: path.join(cwd, "src", "a.ts") }, cwd), "view: src/a.ts");
     assert.equal(describeTool("submit_review", { verdict: "request_changes" }, cwd), "Submitting review (request changes)");
+    assert.equal(describeTool("skill", { skill: "code-review" }, cwd), "Loading skill: code-review");
+    assert.equal(describeTool("skill", {}, cwd), "Loading a skill");
   });
 });

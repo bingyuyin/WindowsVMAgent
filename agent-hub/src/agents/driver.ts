@@ -68,6 +68,10 @@ export interface AgentSpec {
   workingDirectory: string;
   systemPrompt: string;
   readOnly: boolean;
+  /** Parent folders of <name>/SKILL.md skills: repository skill roots in the agent's worktree plus the hub's. */
+  skillDirectories: string[];
+  /** Hub skills that do not apply to this role. */
+  disabledSkills: string[];
   submit: SubmitChannel;
   observer: AgentObserver;
   askUser: (question: UserQuestion) => Promise<string>;

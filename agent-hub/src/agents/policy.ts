@@ -21,11 +21,14 @@ export interface PolicyOptions {
   workingDirectory: string;
   /** Agent scratch space outside the repository (the runtime's session-state folder). */
   scratchRoots?: readonly string[];
+  /** Extra folders the agent may read but not write (e.g. skill folders). */
+  readRoots?: readonly string[];
 }
 
 const APPROVE: PolicyDecision = { kind: "approve-once" };
 const reject = (feedback: string): PolicyDecision => ({ kind: "reject", feedback });
 const inScratch = (target: string, options: PolicyOptions) => (options.scratchRoots ?? []).some((root) => isInside(root, target));
+const inReadRoots = (target: string, options: PolicyOptions) => (options.readRoots ?? []).some((root) => isInside(root, target));
 
 const GIT_OPTIONS_WITH_VALUE = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"]);
 const REVIEWER_GIT_ALLOWED = new Set([
@@ -55,7 +58,7 @@ export function evaluatePermission(request: PermissionRequestLike, options: Poli
     case "read": {
       const raw = request.resolvedPath ?? request.path;
       const target = raw ? path.resolve(cwd, raw) : null;
-      if (target && !isInside(cwd, target) && !inScratch(target, options)) {
+      if (target && !isInside(cwd, target) && !inScratch(target, options) && !inReadRoots(target, options)) {
         return reject(`Reads are limited to the task worktree (${cwd}).`);
       }
       return APPROVE;

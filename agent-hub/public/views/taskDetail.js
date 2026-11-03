@@ -1,5 +1,6 @@
 import { del, get, post } from "../lib/api.js";
 import {
+  agentStatusInfo,
   chip,
   clock,
   compactNumber,
@@ -9,7 +10,12 @@ import {
   h,
   KIND_LABELS,
   phaseLabel,
+  ROLE_DESCRIPTIONS,
+  ROLE_ICONS,
   ROLE_LABELS,
+  ROLE_SKILLS,
+  roleTag,
+  rolesFor,
   setContent,
   shortSha,
   spinner,
@@ -21,7 +27,6 @@ import { renderDiff, renderMarkdown } from "../lib/markdown.js";
 import { state } from "../lib/store.js";
 
 const ACTIVE = ["queued", "running", "needs-input"];
-const AUTHOR_ROLE = { design: "designer", coding: "coder" };
 const REVIEWER_ROLE = { design: "design-reviewer", coding: "code-reviewer" };
 const STAGE_STATUS = {
   pending: ["Pending", "neutral"],
@@ -47,8 +52,11 @@ const EVENT_ICONS = {
   "input.answer": "↩",
 };
 
-const roleTag = (role) => h("span", { class: `role-tag role-${role}` }, ROLE_LABELS[role] ?? role);
 const meta = (label, ...value) => h("div", { class: "meta" }, h("div", { class: "meta-label" }, label), h("div", { class: "meta-value" }, value));
+const excerpt = (text, max = 280) => {
+  const flat = String(text ?? "").replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+};
 
 export function taskDetailView(root, { params }) {
   const id = params[0];
@@ -71,8 +79,10 @@ export function taskDetailView(root, { params }) {
   const titleBox = h("div", { class: "detail-title-row" });
   const metaBox = h("div", { class: "meta-grid" });
   const requestBox = h("details", { class: "request card" });
-  const alertBox = h("div");
+  const heroBox = h("div");
+  const heroElapsed = h("span", { class: "muted small mono" });
   const inputBox = h("div");
+  const agentsBox = h("section", { class: "agents" });
   const pipelineBox = h("div");
   const streamRole = h("span", { class: "muted small" });
   const streamPre = h("pre", { class: "stream", "aria-live": "off" });
@@ -93,11 +103,12 @@ export function taskDetailView(root, { params }) {
   root.append(
     h("a", { class: "back", href: "#/tasks" }, "← Tasks"),
     h("div", { class: "detail-header" }, titleBox, metaBox),
-    requestBox,
-    alertBox,
+    heroBox,
     inputBox,
+    agentsBox,
     pipelineBox,
     liveBox,
+    requestBox,
     tabsBar,
     tabBody,
   );
@@ -106,6 +117,11 @@ export function taskDetailView(root, { params }) {
 
   load();
   const ticker = setInterval(() => task && ACTIVE.includes(task.status) && renderMeta(), 5000);
+  const heroTicker = setInterval(() => {
+    if (task && ["running", "needs-input"].includes(task.status) && task.phaseStartedAt) {
+      heroElapsed.textContent = `${duration(task.phaseStartedAt)} in this step`;
+    }
+  }, 1000);
 
   async function load() {
     try {
@@ -155,6 +171,7 @@ export function taskDetailView(root, { params }) {
         if (task) {
           task.activity = message.activity;
           renderLiveHead();
+          renderHero();
         }
         break;
     }
@@ -184,8 +201,9 @@ export function taskDetailView(root, { params }) {
     if (!task) return;
     renderTitle();
     renderMeta();
-    renderAlert();
+    renderHero();
     renderInput();
+    renderAgents();
     renderPipeline();
     renderLive();
     renderTabs();
@@ -215,14 +233,22 @@ export function taskDetailView(root, { params }) {
 
   function renderMeta() {
     const usage = task.usage ?? {};
+    const resolver = task.kind !== "design" && task.resolverModel && task.resolverModel !== task.authorModel ? ` · resolver ${task.resolverModel}` : "";
     setContent(
       metaBox,
       meta("Repository", task.repoName),
       meta("Base", h("span", { class: "mono" }, `${task.baseRef} @ ${shortSha(task.baseSha)}`)),
-      meta("Branch", task.branch ? [h("span", { class: "mono" }, task.branch), " ", copyButton(task.branch)] : "—"),
-      meta("Worktree", task.worktreePath ? [h("span", { class: "mono small break" }, task.worktreePath), " ", copyButton(task.worktreePath)] : "—"),
-      meta("Author model", h("span", { class: "mono" }, task.authorModel)),
-      meta("Reviewer model", h("span", { class: "mono" }, task.reviewerModel)),
+      meta("Task branch", task.branch ? [h("span", { class: "mono" }, task.branch), " ", copyButton(task.branch)] : "—"),
+      meta(
+        "Workspaces",
+        task.workspaceRoot
+          ? [h("span", { class: "mono small break" }, task.workspaceRoot), " ", copyButton(task.workspaceRoot)]
+          : task.worktreePath
+            ? h("span", { class: "mono small break" }, task.worktreePath)
+            : "—",
+        h("div", { class: "muted small" }, task.isolation === "worktree" ? "one worktree per agent" : "authors share a worktree on their own branches; reviewers have their own"),
+      ),
+      meta("Models", h("span", { class: "mono small" }, `author ${task.authorModel}${resolver} · reviewer ${task.reviewerModel}`)),
       meta("Review rounds", `up to ${task.roundsBudget ?? task.maxRounds}${task.attempt > 1 ? ` · attempt ${task.attempt}` : ""}`),
       meta("Duration", task.startedAt ? duration(task.startedAt, ACTIVE.includes(task.status) ? null : task.finishedAt) : "—"),
       meta(
@@ -232,14 +258,188 @@ export function taskDetailView(root, { params }) {
     );
   }
 
-  function renderAlert() {
-    if (task.status === "failed" && task.error) {
-      setContent(alertBox, h("div", { class: "callout callout-danger" }, h("strong", {}, "Failed: "), task.error, h("div", { class: "muted small" }, "Retry resumes from the last completed step, reusing the worktree.")));
-    } else if (task.status === "interrupted") {
-      setContent(alertBox, h("div", { class: "callout callout-warning" }, "The hub stopped while this task was running. Retry resumes from the last completed step."));
-    } else {
-      setContent(alertBox);
+  /** Top-of-page status: what is happening right now, or the outcome once the task has finished. */
+  function renderHero() {
+    const status = task.status;
+    if (status === "queued") {
+      setContent(
+        heroBox,
+        h("div", { class: "card hero" }, h("div", { class: "hero-kicker" }, "QUEUED"), h("div", { class: "hero-title" }, "Waiting for a free slot"), h("div", { class: "muted" }, `Up to ${state.settings?.maxConcurrency ?? 2} tasks run in parallel; this one starts automatically.`)),
+      );
+      return;
     }
+    if (status === "running" || status === "needs-input") {
+      const working = (task.agents ?? []).find((agent) => agent.status === "working");
+      const role = working?.role ?? task.activity?.role;
+      const budget = task.roundsBudget ?? task.maxRounds;
+      const now = task.activity && task.activity.role === role ? task.activity.text : working?.lastActivity;
+      const kicker = [phaseLabel(task.currentStage, task.phase).toUpperCase(), task.currentRound ? `ROUND ${task.currentRound} OF ${Math.max(budget, task.currentRound)}` : null]
+        .filter(Boolean)
+        .join(" · ");
+      heroElapsed.textContent = task.phaseStartedAt ? `${duration(task.phaseStartedAt)} in this step` : "";
+      setContent(
+        heroBox,
+        h(
+          "div",
+          { class: `card hero hero-live ${status === "needs-input" ? "hero-attention" : ""}` },
+          h("div", { class: "hero-top" }, h("span", { class: "pulse", "aria-hidden": "true" }), h("span", { class: "hero-kicker" }, `LIVE · ${kicker}`), h("span", { class: "spacer" }), heroElapsed),
+          h(
+            "div",
+            { class: "hero-main" },
+            h("div", { class: `hero-icon role-${role ?? "none"}`, "aria-hidden": "true" }, role ? ROLE_ICONS[role] : "…"),
+            h(
+              "div",
+              { class: "grow" },
+              h(
+                "div",
+                { class: "hero-title" },
+                status === "needs-input"
+                  ? `${ROLE_LABELS[task.pendingInput?.role] ?? "An agent"} is waiting for your answer`
+                  : role
+                    ? `${ROLE_LABELS[role]}: ${working?.assignment ?? phaseLabel(task.currentStage, task.phase)}`
+                    : phaseLabel(task.currentStage, task.phase),
+              ),
+              now ? h("div", { class: "hero-now" }, h("span", { class: "muted" }, "Now: "), h("span", { class: "mono" }, now)) : null,
+              working?.lastMessage ? h("div", { class: "hero-message" }, `“${excerpt(working.lastMessage)}”`) : null,
+            ),
+          ),
+        ),
+      );
+      return;
+    }
+    if (status === "completed" && task.result) {
+      const result = task.result;
+      const lastStage = task.stages.at(-1);
+      const approvedRound = lastStage?.rounds.find((round) => round.review?.verdict === "approve");
+      const reviewer = lastStage ? ROLE_LABELS[REVIEWER_ROLE[lastStage.kind]] : "reviewer";
+      setContent(
+        heroBox,
+        h(
+          "div",
+          { class: `card hero hero-result ${result.approved ? "hero-ok" : "hero-warn"}` },
+          h("div", { class: "hero-top" }, h("span", { class: "hero-kicker" }, "RESULT"), h("span", { class: "spacer" }), h("span", { class: "muted small" }, `took ${duration(task.startedAt, task.finishedAt)}`)),
+          h(
+            "div",
+            { class: "hero-title" },
+            result.approved
+              ? `✓ Approved by the ${reviewer.toLowerCase()}${approvedRound ? ` in round ${approvedRound.n}` : ""}`
+              : `Finished without approval — ${result.openComments} review comment(s) still open`,
+          ),
+          h(
+            "div",
+            { class: "result-stats" },
+            h("span", {}, h("strong", {}, String(result.commits ?? 0)), " commit(s)"),
+            result.shortStat ? h("span", {}, result.shortStat) : null,
+            result.designDocPath ? h("span", {}, "design ", h("span", { class: "mono" }, result.designDocPath)) : null,
+            task.branch ? h("span", {}, "branch ", h("span", { class: "mono" }, task.branch), " ", copyButton(task.branch)) : null,
+          ),
+          result.summary ? h("div", { class: "hero-summary" }, renderMarkdown(result.summary)) : null,
+          h(
+            "div",
+            { class: "row wrap" },
+            h("button", { class: "btn btn-sm", onclick: () => selectTab("changes") }, "View changes"),
+            h("button", { class: "btn btn-sm", onclick: () => selectTab("conversation") }, "Review rounds"),
+            h("button", { class: "btn btn-sm", onclick: () => selectTab("result") }, "Merge instructions"),
+            !result.approved ? h("button", { class: "btn btn-sm btn-primary", onclick: () => retryTask(true) }, "Continue review loop") : null,
+          ),
+        ),
+      );
+      return;
+    }
+    if (status === "failed") {
+      setContent(heroBox, h("div", { class: "callout callout-danger" }, h("strong", {}, "Failed: "), task.error ?? "unknown error", h("div", { class: "muted small" }, "Retry resumes from the last completed step; the agents' branches and worktrees are kept.")));
+    } else if (status === "interrupted") {
+      setContent(heroBox, h("div", { class: "callout callout-warning" }, "The hub stopped while this task was running. Retry resumes from the last completed step."));
+    } else if (status === "cancelled") {
+      setContent(heroBox, h("div", { class: "callout" }, "Cancelled. Work committed so far stays on the task branch; Retry resumes from the last completed step."));
+    } else {
+      setContent(heroBox);
+    }
+  }
+
+  /** One card per sub-agent: role, model, status, own branch/workspace, current assignment and activity. */
+  function renderAgents() {
+    const byRole = new Map((task.agents ?? []).map((agent) => [agent.role, agent]));
+    const signature = JSON.stringify([task.status, task.agents, task.activity?.text]);
+    if (signatures.agents === signature) return;
+    signatures.agents = signature;
+    if (!task.agents?.length && task.layout !== 2 && !ACTIVE.includes(task.status)) {
+      setContent(
+        agentsBox,
+        h("h2", { class: "section-title" }, "Agents"),
+        h("div", { class: "callout" }, "This task ran before per-agent branches and tracking were added; see Review rounds and Timeline for what each agent did."),
+      );
+      return;
+    }
+    setContent(
+      agentsBox,
+      h("h2", { class: "section-title" }, "Agents"),
+      h(
+        "div",
+        { class: "agent-grid" },
+        rolesFor(task.kind).map((role) => {
+          const agent = byRole.get(role);
+          const notNeeded = !agent && !ACTIVE.includes(task.status) && task.status === "completed";
+          const info = notNeeded ? { label: "Not needed", cls: "neutral" } : agentStatusInfo(agent);
+          const reviewer = role === "code-reviewer" || role === "design-reviewer";
+          const tokens = agent ? (agent.usage?.inputTokens ?? 0) + (agent.usage?.outputTokens ?? 0) : 0;
+          const workspace = agent?.workspace
+            ? agent.workspaceRemoved
+              ? h("span", { class: "muted small" }, "worktree removed after completion")
+              : [h("span", { class: "mono small break" }, agent.workspace), " ", copyButton(agent.workspace)]
+            : h("span", { class: "muted small" }, "—");
+          const branch = reviewer
+            ? h("span", { class: "muted small" }, "detached at the reviewed commit (read-only)")
+            : agent?.branch
+              ? [h("span", { class: "mono small break" }, agent.branch), " ", copyButton(agent.branch)]
+              : h("span", { class: "muted small" }, notNeeded ? "—" : "created when the agent starts");
+          return h(
+            "div",
+            { class: `agent-card agent-${agent?.status ?? (notNeeded ? "unused" : "pending")}` },
+            h(
+              "div",
+              { class: "agent-head" },
+              h("span", { class: `agent-icon role-${role}`, "aria-hidden": "true" }, ROLE_ICONS[role]),
+              h("div", { class: "grow" }, h("div", { class: "agent-name" }, ROLE_LABELS[role]), h("div", { class: "muted small" }, ROLE_DESCRIPTIONS[role])),
+              chip(info.label, info.cls),
+            ),
+            agent?.status === "working" && agent.assignment ? h("div", { class: "agent-now" }, agent.assignment) : null,
+            agent?.lastActivity && agent.status === "working" ? h("div", { class: "agent-activity mono ellipsis", title: agent.lastActivity }, `› ${agent.lastActivity}`) : null,
+            agent?.lastMessage ? h("div", { class: "agent-message", title: agent.lastMessage }, `“${excerpt(agent.lastMessage, 180)}”`) : null,
+            h(
+              "dl",
+              { class: "agent-meta" },
+              h("dt", {}, "Model"),
+              h("dd", { class: "mono small" }, agent?.model ?? modelForRole(role)),
+              h("dt", {}, reviewer ? "Checkout" : "Branch"),
+              h("dd", {}, branch),
+              h("dt", {}, "Worktree"),
+              h("dd", {}, workspace),
+              h("dt", {}, "Progress"),
+              h(
+                "dd",
+                { class: "small" },
+                agent
+                  ? `${agent.rounds.length ? `round${agent.rounds.length > 1 ? "s" : ""} ${agent.rounds.join(", ")} · ` : ""}${agent.turns} turn(s) · ${compactNumber(tokens)} tokens`
+                  : notNeeded
+                    ? role === "resolver"
+                      ? "approved without review comments to resolve"
+                      : "not used by this run"
+                    : "not started",
+              ),
+              h("dt", {}, "Skills"),
+              h("dd", { class: "small" }, ROLE_SKILLS[role].map((skill) => h("span", { class: "skill-chip" }, skill))),
+            ),
+          );
+        }),
+      ),
+    );
+  }
+
+  function modelForRole(role) {
+    if (role === "code-reviewer" || role === "design-reviewer") return task.reviewerModel;
+    if (role === "resolver") return task.resolverModel || task.authorModel;
+    return task.authorModel;
   }
 
   function renderInput() {
@@ -378,6 +578,7 @@ export function taskDetailView(root, { params }) {
       ["timeline", "Timeline"],
       hasDesign ? ["design", "Design doc"] : null,
       ["changes", "Changes"],
+      ["context", "Context"],
       ["result", "Result"],
     ].filter(Boolean);
     if (!tabs.some(([tabId]) => tabId === activeTab)) activeTab = "conversation";
@@ -390,12 +591,7 @@ export function taskDetailView(root, { params }) {
             class: `tab ${activeTab === tabId ? "active" : ""}`,
             role: "tab",
             "aria-selected": String(activeTab === tabId),
-            onclick: () => {
-              if (activeTab === tabId) return;
-              activeTab = tabId;
-              renderTabs();
-              renderActiveTab(true);
-            },
+            onclick: () => selectTab(tabId, false),
           },
           label,
         ),
@@ -403,12 +599,96 @@ export function taskDetailView(root, { params }) {
     );
   }
 
+  function selectTab(tabId, scroll = true) {
+    if (activeTab !== tabId) {
+      activeTab = tabId;
+      renderTabs();
+      renderActiveTab(true);
+    }
+    if (scroll) tabsBar.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   function renderActiveTab(force) {
-    const renderers = { conversation: renderConversation, timeline: renderTimeline, design: renderDesign, changes: renderChanges, result: renderResult };
+    const renderers = {
+      conversation: renderConversation,
+      timeline: renderTimeline,
+      design: renderDesign,
+      changes: renderChanges,
+      context: renderContext,
+      result: renderResult,
+    };
     renderers[activeTab]?.(force);
   }
 
   // ---- tabs ------------------------------------------------------------------------------
+
+  function renderContext(force) {
+    const context = task.context;
+    const signature = JSON.stringify(context ?? null);
+    if (!force && signatures.context === signature) return;
+    signatures.context = signature;
+    const roles = rolesFor(task.kind);
+    const hubSkills = h(
+      "div",
+      { class: "context-section" },
+      h("h3", {}, "Hub best-practice skills"),
+      h("p", { class: "muted small" }, "Each agent loads its role's skill; repository instructions and skills take precedence where they differ."),
+      h(
+        "ul",
+        { class: "context-list" },
+        roles.map((role) => h("li", {}, roleTag(role), " ", ROLE_SKILLS[role].map((skill) => h("span", { class: "skill-chip" }, skill)))),
+      ),
+    );
+    if (!context) {
+      setContent(
+        tabBody,
+        h("div", { class: "card" }, h("p", { class: "muted" }, ACTIVE.includes(task.status) ? "Repository context is discovered when the task starts." : "No repository context was recorded for this task."), hubSkills),
+      );
+      return;
+    }
+    const files = (title, items, help) =>
+      h(
+        "div",
+        { class: "context-section" },
+        h("h3", {}, title, " ", h("span", { class: "count" }, String(items.length))),
+        help ? h("p", { class: "muted small" }, help) : null,
+        items.length ? h("ul", { class: "context-list" }, items.map((item) => h("li", { class: "mono small" }, item))) : h("p", { class: "muted small" }, "None found."),
+      );
+    const empty = !context.instructions.length && !context.guides.length && !context.designDocs.length && !context.skills.length;
+    setContent(
+      tabBody,
+      h(
+        "div",
+        { class: "card" },
+        h("p", { class: "muted small" }, `Discovered at the base commit ${shortSha(task.baseSha)} on ${new Date(context.discoveredAt).toLocaleString()}.`),
+        empty ? h("div", { class: "callout callout-info" }, "No repository-specific guidance was found, so the agents follow the code's visible conventions and the hub best-practice skills.") : null,
+        files("Instruction files", context.instructions, "Loaded automatically by the Copilot runtime from each agent's worktree."),
+        files("Guides", context.guides, "Agents are asked to read the relevant ones before starting."),
+        files("Design docs and ADRs", context.designDocs, "Designers follow their format and prior decisions; coders respect them."),
+        h(
+          "div",
+          { class: "context-section" },
+          h("h3", {}, "Repository skills ", h("span", { class: "count" }, String(context.skills.length))),
+          h("p", { class: "muted small" }, "Passed to every agent; loaded on demand with the skill tool."),
+          context.skills.length
+            ? h(
+                "ul",
+                { class: "context-list" },
+                context.skills.map((skill) => h("li", {}, h("span", { class: "skill-chip" }, skill.name), " ", h("span", { class: "muted small" }, skill.description || skill.path))),
+              )
+            : h("p", { class: "muted small" }, "None found."),
+        ),
+        h(
+          "div",
+          { class: "context-section" },
+          h("h3", {}, "Build and test commands"),
+          context.validation.length ? h("div", { class: "row wrap" }, context.validation.map((command) => h("code", { class: "cmd" }, command))) : h("p", { class: "muted small" }, "None detected; agents look for them in the repository."),
+          context.stack.length ? h("p", { class: "muted small" }, `Stack: ${context.stack.join(", ")}`) : null,
+        ),
+        hubSkills,
+      ),
+    );
+  }
 
   function renderConversation(force) {
     const signature = JSON.stringify([task.status, task.phase, task.currentRound, task.stages]);
@@ -434,10 +714,10 @@ export function taskDetailView(root, { params }) {
 
   function roundCard(stage, round) {
     const current = ["running", "needs-input"].includes(task.status) && task.currentStage === stage.kind && task.currentRound === round.n;
-    const authorRole = AUTHOR_ROLE[stage.kind];
-    const reviewerRole = REVIEWER_ROLE[stage.kind];
     const author = round.author;
     const review = round.review;
+    const authorRole = author?.role ?? (stage.kind === "design" ? "designer" : round.n > 1 || (current && task.phase === "revising") ? "resolver" : "coder");
+    const reviewerRole = REVIEWER_ROLE[stage.kind];
     return h(
       "div",
       { class: `card round-card ${current ? "current" : ""}` },
@@ -457,6 +737,7 @@ export function taskDetailView(root, { params }) {
               { class: "conv-block-head" },
               roleTag(authorRole),
               author.commit ? h("span", { class: "mono small" }, `commit ${shortSha(author.commit)}`) : chip("no file changes", "outline"),
+              author.branch ? h("span", { class: "mono small muted" }, `on ${author.branch}`) : null,
               author.shortStat ? h("span", { class: "muted small" }, author.shortStat) : null,
               author.fallback ? chip("no structured submission", "warning") : null,
             ),
@@ -491,6 +772,7 @@ export function taskDetailView(root, { params }) {
               { class: "conv-block-head" },
               roleTag(reviewerRole),
               review.verdict === "approve" ? chip("Approved", "success") : chip("Changes requested", "warning"),
+              review.reviewedSha ? h("span", { class: "mono small muted" }, `reviewed ${shortSha(review.reviewedSha)}`) : null,
               review.fallback ? chip("no structured review", "warning") : null,
             ),
             renderMarkdown(review.summary),
@@ -518,7 +800,7 @@ export function taskDetailView(root, { params }) {
         statusChip,
       ),
       renderMarkdown(comment.body),
-      comment.response ? h("div", { class: "comment-response" }, h("span", { class: "muted" }, "↳ Author: "), comment.response) : null,
+      comment.response ? h("div", { class: "comment-response" }, h("span", { class: "muted" }, "↳ Resolution: "), comment.response) : null,
     );
   }
 
@@ -790,6 +1072,7 @@ export function taskDetailView(root, { params }) {
   return () => {
     disposed = true;
     clearInterval(ticker);
+    clearInterval(heroTicker);
     clearTimeout(reconnectTimer);
     stream?.close();
   };

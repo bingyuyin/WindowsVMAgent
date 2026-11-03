@@ -7,7 +7,15 @@ export function settingsView(root) {
   const account = h("div", { class: "card" });
   const authorSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const reviewerSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
+  const resolverSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const settings = state.settings ?? {};
+  const isolation = h(
+    "select",
+    { class: "input" },
+    h("option", { value: "branch", selected: (settings.isolation ?? "branch") === "branch" }, "Own branch per agent (authors share a worktree; reviewers get their own)"),
+    h("option", { value: "worktree", selected: settings.isolation === "worktree" }, "Own worktree and branch per agent (most isolation, more disk)"),
+  );
+  const cleanup = h("input", { type: "checkbox", checked: settings.cleanupWorktrees ?? true });
   const rounds = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(settings.maxRounds ?? 3) });
   const concurrency = h("input", { class: "input", type: "number", min: "1", max: "8", value: String(settings.maxConcurrency ?? 2) });
   const docDir = h("input", { class: "input", type: "text", value: settings.designDocDir ?? "docs/designs", spellcheck: "false" });
@@ -28,9 +36,23 @@ export function settingsView(root) {
       h("div", { class: "row between" }, h("h2", { class: "section-title" }, "Models"), refreshButton),
       h(
         "div",
-        { class: "grid-2" },
+        { class: "grid-3" },
         field("Author model (designer, coder)", authorSelect),
-        field("Reviewer model (design and code reviewers)", reviewerSelect, "Using a different model for reviews gives the author a second opinion."),
+        field("Comment resolver model", resolverSelect, "Resolves code review comments; defaults to the author model."),
+        field("Reviewer model (design and code reviewers)", reviewerSelect, "A different model for reviews gives a second opinion."),
+      ),
+      h("h2", { class: "section-title" }, "Workspaces"),
+      h(
+        "div",
+        { class: "grid-2" },
+        field("Agent isolation", isolation, "Every sub-agent works on its own branch; tasks on the same repository never share a worktree."),
+        h(
+          "label",
+          { class: "field" },
+          h("span", { class: "field-label" }, "Cleanup"),
+          h("span", { class: "row small" }, cleanup, "Remove agent worktrees when a task completes (branches are kept)"),
+          h("small", { class: "muted" }, "Failed or cancelled tasks keep their worktrees so you can inspect or retry them."),
+        ),
       ),
       h("h2", { class: "section-title" }, "Workflow"),
       h(
@@ -70,6 +92,7 @@ export function settingsView(root) {
       const models = await loadModels(force);
       setContent(authorSelect, modelOptions(models, state.settings?.authorModel));
       setContent(reviewerSelect, modelOptions(models, state.settings?.reviewerModel));
+      setContent(resolverSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.resolverModel));
       if (force) toast("Model list refreshed", "success");
     } catch (error) {
       toast(`Could not load models: ${error.message}`, "error");
@@ -85,6 +108,9 @@ export function settingsView(root) {
       state.settings = await put("/api/settings", {
         authorModel: authorSelect.value,
         reviewerModel: reviewerSelect.value,
+        resolverModel: resolverSelect.value || null,
+        isolation: isolation.value,
+        cleanupWorktrees: cleanup.checked,
         maxRounds: Number(rounds.value),
         maxConcurrency: Number(concurrency.value),
         designDocDir: docDir.value,
