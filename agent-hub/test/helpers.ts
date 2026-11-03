@@ -25,6 +25,8 @@ export type Step = (spec: AgentSpec, prompt: string) => Promise<void> | void;
 export class ScriptedDriver implements AgentDriver {
   readonly prompts: Partial<Record<AgentRole, string[]>> = {};
   readonly started: AgentSpec[] = [];
+  /** Session IDs whose handles were disposed (closed or killed). */
+  readonly disposed: string[] = [];
   private readonly script: Partial<Record<AgentRole, Step[]>>;
   private readonly cursor = new Map<AgentRole, number>();
 
@@ -34,9 +36,10 @@ export class ScriptedDriver implements AgentDriver {
 
   async start(spec: AgentSpec): Promise<AgentHandle> {
     this.started.push(spec);
+    const sessionId = `fake-${spec.role}-${this.started.length}`;
     let rejectCurrent: ((error: Error) => void) | null = null;
     return {
-      sessionId: `fake-${spec.role}-${this.started.length}`,
+      sessionId,
       send: async (prompt: string) => {
         (this.prompts[spec.role] ??= []).push(prompt);
         const index = this.cursor.get(spec.role) ?? 0;
@@ -46,13 +49,20 @@ export class ScriptedDriver implements AgentDriver {
         const aborted = new Promise<never>((_, reject) => {
           rejectCurrent = reject;
         });
-        await Promise.race([Promise.resolve(step(spec, prompt)), aborted]);
+        try {
+          await Promise.race([Promise.resolve(step(spec, prompt)), aborted]);
+        } finally {
+          // A later abort() must not reject a promise nobody awaits (e.g. after a step threw synchronously).
+          rejectCurrent = null;
+        }
         return { lastMessage: `${spec.role} turn ${index + 1} done` };
       },
       abort: async () => {
         rejectCurrent?.(new Error("aborted"));
       },
-      dispose: async () => {},
+      dispose: async () => {
+        this.disposed.push(sessionId);
+      },
     };
   }
 
@@ -107,11 +117,14 @@ export const submitTests =
   };
 
 export const submitPlan =
-  (stages: string[], instructions: Record<string, string>, rationale = "Fits the request"): Step =>
+  (stages: string[], instructions: Record<string, string>, rationale = "Fits the request", briefing = "calc.js holds the math helpers; tests run with node --test."): Step =>
   async (spec) => {
     if (spec.submit.kind !== "plan") throw new Error(`${spec.role} cannot submit a plan`);
-    await spec.submit.onSubmit({ stages, rationale, instructions } as unknown as PlanSubmissionInput);
+    await spec.submit.onSubmit({ stages, rationale, instructions, briefing } as unknown as PlanSubmissionInput);
   };
+
+/** A turn that never finishes on its own (until the manager aborts it). */
+export const hang: Step = () => new Promise<void>(() => {});
 
 /** Extracts the design/document path the hub asked the author to write. */
 export const designPathFrom = (prompt: string): string => {

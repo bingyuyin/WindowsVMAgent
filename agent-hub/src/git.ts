@@ -33,7 +33,8 @@ export function git(cwd: string, args: string[], options: GitOptions = {}): Prom
   return new Promise((resolve, reject) => {
     execFile(
       "git",
-      args,
+      // A system-wide core.safecrlf=true makes `git add` fail on LF files that agents write; line endings still follow core.autocrlf.
+      ["-c", "core.safecrlf=false", ...args],
       {
         cwd,
         encoding: "utf8",

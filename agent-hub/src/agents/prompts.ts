@@ -1,7 +1,10 @@
+import { isAutoLoadedInstruction } from "../context.ts";
 import { docForPrompt } from "../docs.ts";
 import {
   isDocStage,
   isReviewerRole,
+  ROLE_LABELS,
+  worksDetached,
   type AgentRole,
   type AuthorSubmission,
   type DocFormat,
@@ -59,14 +62,16 @@ function environmentBlock(role: AgentRole, env: AgentEnvironment): string {
     "Environment:",
     ...workspace,
     "- There is no human watching this conversation. Work autonomously; use the ask_user tool only if you are truly blocked by an ambiguity that changes the outcome, and otherwise state your assumptions.",
+    "- The manager monitors your activity and interrupts or restarts an agent that stops making progress. Run commands non-interactively and with timeouts, and never leave servers, watchers or interactive prompts running in the foreground.",
   ].join("\n");
 }
 
 function skillsLine(skills: string[]): string[] {
   if (!skills.length) return [];
-  const names = skills.map((skill) => `\`${skill}\``).join(" and ");
+  const names = skills.map((skill) => `\`${skill}\``);
+  const list = names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names.at(-1)}` : names[0];
   return [
-    `- Best practices: load the ${names} skill${skills.length > 1 ? "s" : ""} (skill tool) before you start and follow ${skills.length > 1 ? "them" : "it"}. Repository instructions, guides and repo skills take precedence where they differ; when the repository has no guidance, the skill is the standard.`,
+    `- Best practices: load the ${list} skill${skills.length > 1 ? "s" : ""} (skill tool) before you start and follow ${skills.length > 1 ? "them" : "it"}. Repository instructions, guides and repo skills take precedence where they differ; when the repository has no guidance, the skill is the standard.`,
   ];
 }
 
@@ -246,6 +251,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- You are read-only: never create, modify or delete files and never run commands with side effects. Inspect the repository with view/grep/glob and read-only git commands.",
         "- Choose the smallest set of stages that fully covers the request. Do not add design or documentation the request does not need; do add testing when the request asks to verify behavior or when code changes and runnable tests exist.",
         "- For each chosen stage write a concrete assignment: what to do, scope (files, areas), acceptance criteria, and for testing the exact commands or suites to run (verify they exist in the repository).",
+        "- Write a `briefing` that every sub-agent starts with, so none of them has to rediscover the repository: the architecture and the modules/files relevant to this request, the conventions to follow, how to build and test (commands you verified), and pitfalls. Make it specific to this request; the agents already get the repository context and best-practice skills.",
         "- Be quick: a few minutes of targeted inspection is enough. Finish by calling the `submit_plan` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
   }
@@ -261,12 +267,21 @@ function managerBlock(task: Task, stage: StageKind): string {
   return text ? ["", "## Manager's assignment for this stage", "", text].join("\n") : "";
 }
 
+/** What the manager learned about the repository while planning (Auto tasks), given to every sub-agent. */
+function briefingBlock(task: Task): string {
+  const text = task.plan?.briefing?.trim();
+  return text ? ["", "## Manager's briefing on the repository", "", text].join("\n") : "";
+}
+
 /** Summarizes the repository guidance the hub discovered, so agents read it before working. */
 export function contextBlock(context: RepoContext | undefined, role: AgentRole): string {
   if (!context) return "";
   const lines = ["", "## Repository context (discovered by the hub)"];
   const list = (items: string[], max = 12) => items.slice(0, max).map((item) => `\`${item}\``).join(", ") + (items.length > max ? `, … (${items.length - max} more)` : "");
-  if (context.instructions.length) lines.push(`- Instruction files (loaded automatically; follow them): ${list(context.instructions)}`);
+  const loaded = context.instructions.filter(isAutoLoadedInstruction);
+  const unloaded = context.instructions.filter((file) => !isAutoLoadedInstruction(file));
+  if (loaded.length) lines.push(`- Instruction files (loaded automatically; follow them): ${list(loaded)}`);
+  if (unloaded.length) lines.push(`- More instruction files (not loaded automatically; read the ones that apply, such as those for the folders you work in, and follow them): ${list(unloaded)}`);
   if (context.guides.length) lines.push(`- Guides to read before starting (the relevant ones): ${list(context.guides)}`);
   if (context.designDocs.length) {
     lines.push(
@@ -364,6 +379,8 @@ export function authorPrompt(input: AuthorPromptInput): string {
     parts.push(requestBlock(input.task));
     const context = contextBlock(input.context, input.role);
     if (context) parts.push(context);
+    const briefing = briefingBlock(input.task);
+    if (briefing) parts.push(briefing);
     const assignment = managerBlock(input.task, input.stage);
     if (assignment) parts.push(assignment);
     if ((input.stage === "coding" || input.stage === "testing") && input.design) parts.push(designBlock(input.design));
@@ -482,6 +499,8 @@ export function reviewPrompt(input: ReviewPromptInput): string {
     parts.push(requestBlock(input.task));
     const context = contextBlock(input.context, input.role);
     if (context) parts.push(context);
+    const briefing = briefingBlock(input.task);
+    if (briefing) parts.push(briefing);
     const assignment = managerBlock(input.task, input.stage);
     if (assignment) parts.push(assignment);
     if (input.stage === "coding" && input.design) parts.push(designBlock(input.design));
@@ -561,6 +580,8 @@ export function executionPrompt(input: ExecutionPromptInput): string {
     parts.push(requestBlock(input.task));
     const context = contextBlock(input.context, "executor");
     if (context) parts.push(context);
+    const briefing = briefingBlock(input.task);
+    if (briefing) parts.push(briefing);
     const assignment = managerBlock(input.task, "testing");
     if (assignment) parts.push(assignment);
     if (input.design) parts.push(designBlock(input.design));
@@ -620,6 +641,7 @@ export function executionPrompt(input: ExecutionPromptInput): string {
 }
 
 export function plannerPrompt(task: Task, context: RepoContext | undefined): string {
+  const skills = context?.techSkills?.length ? ` and the technology skills ${context.techSkills.map((skill) => `\`${skill}\``).join(", ")}` : "";
   return [
     requestBlock(task),
     contextBlock(context, "planner"),
@@ -627,7 +649,8 @@ export function plannerPrompt(task: Task, context: RepoContext | undefined): str
     "## Plan this task",
     "",
     "Inspect the repository as much as you need to understand what the request involves (structure, relevant code, how it is built and tested).",
-    "Then call `submit_plan` with the stages to run, your rationale, and a concrete assignment for each stage's agents.",
+    `Every sub-agent you create starts with the repository context above, the instruction files and the hub's best-practice skills for its role${skills}. Your briefing adds what you learned that is specific to this request.`,
+    "Then call `submit_plan` with the stages to run, your rationale, a concrete assignment for each stage's agents and the briefing.",
   ].join("\n");
 }
 
@@ -644,5 +667,41 @@ export const NUDGE_TEST =
   "Then call `submit_test_results` with the status, the commands you ran, the counts and the failures. Do not end your turn without calling it.";
 
 export const NUDGE_PLAN =
-  "You ended your turn without calling the `submit_plan` tool. Call `submit_plan` now with the stages, your rationale and an assignment for each stage. " +
+  "You ended your turn without calling the `submit_plan` tool. Call `submit_plan` now with the stages, your rationale, an assignment for each stage and the briefing. " +
   "Do not end your turn without calling it.";
+
+/** The tool that ends each kind of agent's turn. */
+export function submitToolFor(role: AgentRole): string {
+  if (role === "planner") return "submit_plan";
+  if (role === "executor") return "submit_test_results";
+  return isReviewerRole(role) ? "submit_review" : "submit_work";
+}
+
+const AVOID_HANGS =
+  "Do not repeat what got stuck: give long-running commands a timeout, run tools non-interactively (for example `CI=true`, `--yes`, `--no-watch`, `-NonInteractive`), never wait on servers, watchers or interactive prompts in the foreground, and narrow a run that hangs (one project, file or test) to find the culprit. If a command hangs again, stop it and report the hang instead of waiting on it.";
+
+/** Sent in the same session after the manager interrupted a stuck turn: the agent keeps its conversation. */
+export function recoveryPrompt(role: AgentRole, reason: string): string {
+  return [
+    `The manager interrupted your previous turn because it stopped making progress: ${reason}.`,
+    "Your conversation and the files in your working directory are intact. Continue your assignment from where you left off.",
+    AVOID_HANGS,
+    `Then finish by calling \`${submitToolFor(role)}\`. Do not end your turn without calling it.`,
+  ].join("\n\n");
+}
+
+/** Leads the first prompt of a fresh session that replaces a stuck or failed one. */
+export function restartNote(role: AgentRole, reason: string): string {
+  const lines = [
+    "## Note from the manager: you replace a stuck session",
+    "",
+    `A previous session of this ${ROLE_LABELS[role].toLowerCase()} agent stopped making progress (${reason}), so the manager ended it and started you with the same assignment, below.`,
+  ];
+  if (!worksDetached(role)) {
+    lines.push("", "Your working directory still holds that session's uncommitted changes: run `git status` and `git diff` first and build on them instead of starting over.");
+  } else if (role === "executor") {
+    lines.push("", "The checkout may hold dependencies and build output from that session; reuse them.");
+  }
+  lines.push("", AVOID_HANGS, "", "---", "");
+  return lines.join("\n");
+}

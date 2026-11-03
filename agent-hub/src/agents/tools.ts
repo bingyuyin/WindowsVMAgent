@@ -128,8 +128,13 @@ export const submitPlanSchema = {
         document: { type: "string" },
       },
     },
+    briefing: {
+      type: "string",
+      description:
+        "What every sub-agent should know about the repository before it starts, from your inspection: the architecture and the modules/files relevant to this request, conventions to follow, how to build and test (commands you verified exist) and pitfalls. Specific to this request, not generic advice.",
+    },
   },
-  required: ["stages", "rationale", "instructions"],
+  required: ["stages", "rationale", "instructions", "briefing"],
 } as const;
 
 /** Builds the terminal tool through which an agent hands its structured result to the workflow. */

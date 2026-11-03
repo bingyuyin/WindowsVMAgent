@@ -318,6 +318,9 @@ export function taskDetailView(root, { params }) {
           ]),
         ),
         h("p", { class: "plan-rationale" }, plan.rationale),
+        plan.briefing
+          ? h("details", { class: "plan-assignments" }, h("summary", {}, "Briefing on the repository the manager gave every sub-agent"), h("div", { class: "plan-assignment" }, renderMarkdown(plan.briefing)))
+          : null,
         plan.stages.some((stage) => plan.instructions?.[stage])
           ? h(
               "details",
@@ -649,6 +652,8 @@ export function taskDetailView(root, { params }) {
           const info = notNeeded ? { label: "Not needed", cls: "neutral" } : agentStatusInfo(agent);
           const detached = worksDetached(role);
           const tokens = agent ? (agent.usage?.inputTokens ?? 0) + (agent.usage?.outputTokens ?? 0) : 0;
+          const skills = agent?.skills ?? ROLE_SKILLS[role];
+          const recoveries = agent?.recoveries ? ` · recovered ${agent.recoveries}×` : "";
           const workspace = agent?.workspace
             ? agent.workspaceRemoved
               ? h("span", { class: "muted small" }, "worktree removed after completion")
@@ -694,13 +699,13 @@ export function taskDetailView(root, { params }) {
                 "dd",
                 { class: "small" },
                 agent
-                  ? `${agent.rounds.length ? `round${agent.rounds.length > 1 ? "s" : ""} ${agent.rounds.join(", ")} · ` : ""}${agent.turns} turn(s) · ${compactNumber(tokens)} tokens`
+                  ? `${agent.rounds.length ? `round${agent.rounds.length > 1 ? "s" : ""} ${agent.rounds.join(", ")} · ` : ""}${agent.turns} turn(s) · ${compactNumber(tokens)} tokens${recoveries}`
                   : notNeeded
                     ? unusedText
                     : "not started",
               ),
-              ROLE_SKILLS[role].length ? h("dt", {}, "Skills") : null,
-              ROLE_SKILLS[role].length ? h("dd", { class: "small" }, ROLE_SKILLS[role].map((skill) => h("span", { class: "skill-chip" }, skill))) : null,
+              skills.length ? h("dt", {}, "Skills") : null,
+              skills.length ? h("dd", { class: "small" }, skills.map((skill) => h("span", { class: "skill-chip" }, skill))) : null,
             ),
           );
         }),
@@ -941,12 +946,20 @@ export function taskDetailView(root, { params }) {
       "div",
       { class: "context-section" },
       h("h3", {}, "Hub best-practice skills"),
-      h("p", { class: "muted small" }, "Each agent loads its role's skill; repository instructions and skills take precedence where they differ."),
+      h("p", { class: "muted small" }, "Each agent loads its role's skills; repository instructions and skills take precedence where they differ."),
       h(
         "ul",
         { class: "context-list" },
         roles.map((role) => h("li", {}, roleTag(role), " ", ROLE_SKILLS[role].map((skill) => h("span", { class: "skill-chip" }, skill)))),
       ),
+      context?.techSkills?.length
+        ? h(
+            "p",
+            { class: "small" },
+            "Technology best practices (for the agents that design, write, review or test code): ",
+            context.techSkills.map((skill) => h("span", { class: "skill-chip" }, skill)),
+          )
+        : null,
     );
     if (!context) {
       setContent(
@@ -971,7 +984,7 @@ export function taskDetailView(root, { params }) {
         { class: "card" },
         h("p", { class: "muted small" }, `Discovered at the base commit ${shortSha(task.baseSha)} on ${new Date(context.discoveredAt).toLocaleString()}.`),
         empty ? h("div", { class: "callout callout-info" }, "No repository-specific guidance was found, so the agents follow the code's visible conventions and the hub best-practice skills.") : null,
-        files("Instruction files", context.instructions, "Loaded automatically by the Copilot runtime from each agent's worktree."),
+        files("Instruction files", context.instructions, "Root instruction files are loaded automatically by the Copilot runtime from each agent's worktree; agents are told to read the others (for example AGENTS.md in subfolders)."),
         files("Guides", context.guides, "Agents are asked to read the relevant ones before starting."),
         files("Design docs and ADRs", context.designDocs, "Designers follow their format and prior decisions; coders respect them."),
         h(

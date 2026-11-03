@@ -5,10 +5,11 @@ import type { AgentRole, ContextSkill, RepoContext } from "./types.ts";
 import { nowIso, truncate } from "./util.ts";
 
 /**
- * Repository guidance the hub looks for. Instruction files are also auto-loaded by the Copilot
+ * Repository guidance the hub looks for. Root instruction files are also auto-loaded by the Copilot
  * runtime from each agent's working directory; the rest is surfaced to agents in their prompt.
  */
 const INSTRUCTION_FILES = ["AGENTS.md", "CLAUDE.md", "GEMINI.md", ".github/copilot-instructions.md", ".cursorrules"];
+const AUTO_LOADED_INSTRUCTIONS = /^(AGENTS\.md|CLAUDE\.md|GEMINI\.md|\.github\/copilot-instructions\.md|\.github\/instructions\/.+\.instructions\.md)$/i;
 const GUIDE_PATTERNS = [
   /^(\.github\/|docs\/)?CONTRIBUTING\.md$/i,
   /^(docs\/)?ARCHITECTURE\.md$/i,
@@ -38,6 +39,38 @@ export const ROLE_SKILLS: Record<AgentRole, string[]> = {
   fixer: ["test-fixing", "coding-best-practices"],
 };
 
+/** Hub skills with the best practices of each technology, keyed by the stack labels `discoverContext` reports. */
+const STACK_SKILLS: Record<string, string> = {
+  "Node.js": "typescript-best-practices",
+  TypeScript: "typescript-best-practices",
+  ".NET": "dotnet-best-practices",
+  Python: "python-best-practices",
+  Go: "go-best-practices",
+  Rust: "rust-best-practices",
+  "Java (Maven)": "java-best-practices",
+  "JVM (Gradle)": "java-best-practices",
+  PowerShell: "powershell-best-practices",
+  "C/C++": "cpp-best-practices",
+};
+
+/** Roles that design, write, review or test code also apply the best practices of the repository's technologies. */
+const TECH_ROLES: ReadonlySet<AgentRole> = new Set(["designer", "design-reviewer", "coder", "resolver", "code-reviewer", "executor", "fixer"]);
+
+export function techSkillsFor(stack: readonly string[]): string[] {
+  return [...new Set(stack.map((label) => STACK_SKILLS[label]).filter((skill): skill is string => Boolean(skill)))];
+}
+
+/** Hub skills an agent is asked to load: its role's skills plus the skills for the repository's technologies. */
+export function skillsForRole(role: AgentRole, context: Pick<RepoContext, "stack"> | undefined): string[] {
+  const tech = TECH_ROLES.has(role) ? techSkillsFor(context?.stack ?? []) : [];
+  return [...new Set([...ROLE_SKILLS[role], ...tech])];
+}
+
+/** Instruction files the Copilot runtime loads by itself (from the root of the agent's worktree). */
+export function isAutoLoadedInstruction(file: string): boolean {
+  return AUTO_LOADED_INSTRUCTIONS.test(file);
+}
+
 export interface HubSkills {
   dir: string | null;
   skills: ContextSkill[];
@@ -65,6 +98,8 @@ export async function discoverContext(repoPath: string, sha: string): Promise<Re
   const instructions = [
     ...INSTRUCTION_FILES.map(find).filter((file): file is string => Boolean(file)),
     ...files.filter((file) => /^\.github\/instructions\/.+\.instructions\.md$/i.test(file)),
+    // Folder-level agent instructions (monorepos); the runtime only loads the root one.
+    ...files.filter((file) => /.\/AGENTS\.md$/i.test(file)),
   ].slice(0, MAX_LISTED);
   const guides = GUIDE_PATTERNS.flatMap((pattern) => files.filter((file) => pattern.test(file))).slice(0, MAX_LISTED);
   const designDocs = files.filter((file) => DESIGN_DOCS.test(file)).slice(0, MAX_LISTED);
@@ -83,7 +118,7 @@ export async function discoverContext(repoPath: string, sha: string): Promise<Re
   }
 
   const { validation, stack } = await detectToolchain(repoPath, sha, files, find);
-  return { instructions, guides, designDocs, skills, skillRoots, validation, stack, discoveredAt: nowIso() };
+  return { instructions, guides, designDocs, skills, skillRoots, validation, stack, techSkills: techSkillsFor(stack), discoveredAt: nowIso() };
 }
 
 async function detectToolchain(
@@ -142,6 +177,14 @@ async function detectToolchain(
       if (new RegExp(`^${target}\\s*:`, "m").test(content)) validation.push(`make ${target}`);
     }
   }
+  const cmake = find("CMakeLists.txt");
+  if (cmake || files.some((file) => /\.vcxproj$/i.test(file)) || find("meson.build")) {
+    if (files.some((file) => /\.(c|cc|cpp|cxx|h|hh|hpp|hxx|ixx)$/i.test(file))) stack.push("C/C++");
+    if (cmake) {
+      validation.push("cmake -S . -B build", "cmake --build build");
+      if (/\b(enable_testing|add_test)\s*\(/i.test((await readFileAt(repoPath, sha, cmake)) ?? "")) validation.push("ctest --test-dir build --output-on-failure");
+    }
+  }
   if (files.some((file) => /\.(ps1|psm1|psd1)$/i.test(file))) {
     stack.push("PowerShell");
     if (files.some((file) => /\.tests\.ps1$/i.test(file))) validation.push("Invoke-Pester");
@@ -165,6 +208,7 @@ export function describeContext(context: RepoContext): string {
     context.designDocs.length ? `${context.designDocs.length} design doc(s)` : null,
     context.skills.length ? `${context.skills.length} repo skill(s)` : null,
     context.validation.length ? `validation: ${context.validation.join(", ")}` : null,
+    context.techSkills?.length ? `best practices: ${context.techSkills.join(", ")}` : null,
   ].filter(Boolean);
   return parts.length ? parts.join(" · ") : "no repository guidance found; agents use the hub's best-practice skills";
 }

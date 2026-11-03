@@ -3,7 +3,8 @@ import path from "node:path";
 import { describe, test } from "node:test";
 import { evaluatePermission, parseGitCommand, splitCommandText } from "../src/agents/policy.ts";
 import { describeTool } from "../src/agents/copilotDriver.ts";
-import { systemPromptFor } from "../src/agents/prompts.ts";
+import { recoveryPrompt, restartNote, systemPromptFor } from "../src/agents/prompts.ts";
+import { loadHubSkills, ROLE_SKILLS, skillsForRole, techSkillsFor } from "../src/context.ts";
 import { docForPrompt, docForViewer, documentProblem, formatOfPath, loadDocTemplates, renderDocTemplate } from "../src/docs.ts";
 import { parseSettingsPatch } from "../src/http/api.ts";
 import { branchWebUrl, parseRemote, pullRequestPageUrl, sanitizeRemoteUrl } from "../src/remote.ts";
@@ -199,9 +200,12 @@ describe("manager plans", () => {
       stages: ["docs", "implementation", "verify", "implementation"],
       rationale: "why",
       instructions: { document: "Document it", coding: "Build it", testing: "Run npm test", design: "ignored" },
+      briefing: " src/calc.js holds the math; run npm test ",
     });
     assert.deepEqual(plan.stages, ["coding", "testing", "document"]);
     assert.deepEqual(plan.instructions, { coding: "Build it", testing: "Run npm test", document: "Document it" });
+    assert.equal(plan.briefing, "src/calc.js holds the math; run npm test");
+    assert.throws(() => normalizePlan({ stages: ["coding"], rationale: "r", instructions: { coding: "x" } }), /`briefing` is required/);
     assert.throws(() => normalizePlan({ stages: ["deploy"], rationale: "r", instructions: {} }), /Unknown stage 'deploy'/);
     assert.throws(() => normalizePlan({ stages: [], rationale: "r", instructions: {} }), /non-empty array/);
     assert.throws(() => normalizePlan({ stages: ["coding"], rationale: "", instructions: { coding: "x" } }), /rationale/);
@@ -334,6 +338,54 @@ describe("HTML documents", () => {
     assert.deepEqual(parseSettingsPatch({ maxConcurrency: 1 }), { maxConcurrency: 1 });
     assert.throws(() => parseSettingsPatch({ maxConcurrency: 11 }), /maxConcurrency' must be an integer between 1 and 10/);
     assert.throws(() => parseSettingsPatch({ maxConcurrency: 0 }), /maxConcurrency/);
+  });
+
+  test("the stuck-agent threshold can be set from 3 to 240 minutes", () => {
+    assert.deepEqual(parseSettingsPatch({ stuckAgentMinutes: 20 }), { stuckAgentMinutes: 20 });
+    assert.throws(() => parseSettingsPatch({ stuckAgentMinutes: 2 }), /stuckAgentMinutes' must be an integer between 3 and 240/);
+    assert.throws(() => parseSettingsPatch({ stuckAgentMinutes: 241 }), /stuckAgentMinutes/);
+  });
+});
+
+describe("best-practice skills", () => {
+  test("agents that design, write, review or test code also get the skills for the repository's technologies", () => {
+    const stack = { stack: ["Node.js", "TypeScript", "PowerShell"] };
+    assert.deepEqual(techSkillsFor(stack.stack), ["typescript-best-practices", "powershell-best-practices"]);
+    assert.deepEqual(skillsForRole("coder", stack), ["coding-best-practices", "typescript-best-practices", "powershell-best-practices"]);
+    assert.deepEqual(skillsForRole("executor", { stack: [".NET"] }), ["test-execution", "dotnet-best-practices"]);
+    assert.deepEqual(skillsForRole("design-reviewer", { stack: ["Go"] }), ["design-review", "go-best-practices"]);
+    assert.deepEqual(skillsForRole("writer", { stack: [".NET"] }), ["technical-writing"]);
+    assert.deepEqual(skillsForRole("planner", { stack: ["Python"] }), []);
+    assert.deepEqual(skillsForRole("coder", undefined), ["coding-best-practices"]);
+    assert.deepEqual(techSkillsFor(["Java (Maven)", "JVM (Gradle)", "Unknown"]), ["java-best-practices"]);
+  });
+
+  test("every skill the hub refers to ships in skills/ under its own name", () => {
+    const hub = loadHubSkills(path.join(import.meta.dirname, "..", "skills"));
+    const names = hub.skills.map((skill) => skill.name);
+    for (const skill of hub.skills) {
+      assert.equal(skill.path, skill.name, "folder name matches the skill name");
+      assert.ok(skill.description.length > 20, `${skill.name} has a description`);
+    }
+    const stacks = ["Node.js", "TypeScript", ".NET", "Python", "Go", "Rust", "Java (Maven)", "JVM (Gradle)", "PowerShell", "C/C++"];
+    for (const skill of [...Object.values(ROLE_SKILLS).flat(), ...techSkillsFor(stacks)]) assert.ok(names.includes(skill), `${skill} is missing`);
+    assert.equal(techSkillsFor(stacks).length, 8);
+  });
+});
+
+describe("recovery prompts", () => {
+  test("an interrupted agent continues in its session; a replacement session builds on the stuck one's work", () => {
+    const resume = recoveryPrompt("executor", "no activity for 20 min (last: powershell: npm test)");
+    assert.match(resume, /stopped making progress: no activity for 20 min \(last: powershell: npm test\)\./);
+    assert.match(resume, /give long-running commands a timeout/);
+    assert.match(resume, /`submit_test_results`/);
+    assert.match(recoveryPrompt("code-reviewer", "x"), /`submit_review`/);
+    assert.match(recoveryPrompt("planner", "x"), /`submit_plan`/);
+    assert.match(recoveryPrompt("fixer", "x"), /`submit_work`/);
+    assert.match(restartNote("fixer", "its session failed: boom"), /test fixer agent stopped making progress \(its session failed: boom\)/);
+    assert.match(restartNote("fixer", "x"), /run `git status` and `git diff` first/);
+    assert.doesNotMatch(restartNote("code-reviewer", "x"), /git status/);
+    assert.match(restartNote("executor", "x"), /reuse them/);
   });
 });
 

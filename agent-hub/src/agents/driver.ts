@@ -32,6 +32,8 @@ export interface PlanSubmissionInput {
   stages: StageKind[];
   rationale: string;
   instructions: Partial<Record<StageKind, string>>;
+  /** What every sub-agent should know about the repository (absent in plans the hub derives itself). */
+  briefing?: string;
 }
 
 /**
@@ -74,6 +76,8 @@ export interface AgentObserver {
   onUsage(usage: UsageInfo): void;
   onError(message: string): void;
   onInfo(message: string): void;
+  /** Any session event (streaming, tool output, sub-agent work): the agent is alive. */
+  onHeartbeat(): void;
 }
 
 export interface UserQuestion {
@@ -105,6 +109,14 @@ export interface AgentSpec {
 
 export interface TurnResult {
   lastMessage?: string;
+}
+
+/** A turn ran past the turn timeout. The session may still be working on it, so abort it before reusing the session. */
+export class TurnTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`the turn ran longer than the ${Math.round(timeoutMs / 60_000)}-minute turn timeout`);
+    this.name = "TurnTimeoutError";
+  }
 }
 
 export interface AgentHandle {

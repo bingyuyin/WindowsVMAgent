@@ -47,6 +47,20 @@ export class CancelledError extends Error {
   }
 }
 
+/** Waits up to `ms` for a promise; resolves `false` when it does not settle in time (rejections count as settled). */
+export async function settledWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([promise.then(() => true, () => true), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Serializes async work per key (e.g. git worktree operations on the same repository). */
 export class KeyedMutex {
   private readonly tails = new Map<string, Promise<unknown>>();

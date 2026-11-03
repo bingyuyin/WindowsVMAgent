@@ -116,6 +116,8 @@ const NO_ANSWER =
   "The user did not answer in time. Proceed using your best judgment and state your assumptions explicitly in your summary.";
 const SHA = /^[0-9a-f]{7,40}$/i;
 const MAX_AUTO_RESUMES = 3;
+/** Heartbeats are frequent (streaming, tool output); publish them to the UI at most this often per task. */
+const HEARTBEAT_PUBLISH_MS = 30_000;
 
 export const KIND_LABELS: Record<TaskKind, string> = {
   auto: "Auto (manager plans)",
@@ -138,6 +140,7 @@ export class TaskRunner {
   /** Tasks interrupted by the last hub stop that resume once the runtime is signed in. */
   private readonly resumeQueue = new Set<string>();
   private readonly checkIns = new Set<string>();
+  private readonly heartbeatsPublished = new Map<string, number>();
   private readonly startedAt = nowIso();
   private monitorTimer: NodeJS.Timeout | null = null;
   private lastCheckAt: string | null = null;
@@ -689,6 +692,7 @@ export class TaskRunner {
       this.comm(task, { from: "manager", to: "user", kind: "lifecycle", text: this.outcomeText(task) });
       this.running.delete(task.id);
       this.waiters.delete(task.id);
+      this.heartbeatsPublished.delete(task.id);
       this.publish(task);
       this.pump();
       if (task.status === "completed" && store.settings.pushOnComplete && !this.shuttingDown) this.afterTask(this.pushTask(task, true));
@@ -839,6 +843,14 @@ export class TaskRunner {
       },
       onError: (message) => this.emit(task, { type: "error", role, stage, text: message }),
       onInfo: (message) => this.emit(task, { type: "info", role, stage, text: message }),
+      onHeartbeat: () => {
+        // agentInfo() stamps updatedAt, the agent's last sign of life that the monitor measures silence from.
+        this.agentInfo(task, role);
+        const now = Date.now();
+        if (now - (this.heartbeatsPublished.get(task.id) ?? 0) < HEARTBEAT_PUBLISH_MS) return;
+        this.heartbeatsPublished.set(task.id, now);
+        this.scheduleUpdate(task);
+      },
     };
   }
 
@@ -871,6 +883,8 @@ export class TaskRunner {
         this.waiters.delete(task.id);
         task.pendingInput = undefined;
         if (task.status === "needs-input") task.status = "running";
+        // Waiting for the user is not silence: restart the agent's clock.
+        this.agentInfo(task, role);
         if (answer !== null) {
           this.emit(task, { type: "input.answer", role, text: answer });
           this.comm(task, {
@@ -951,25 +965,38 @@ export class TaskRunner {
     this.monitorTimer = null;
   }
 
-  /** The manager's periodic check: posts a check-in for agents that have been silent for a while. */
+  /**
+   * The manager's periodic check on working agents. Silence is measured from each agent's last sign of
+   * life (any session event or a new turn): after a while it posts a check-in, and once the agent counts
+   * as stuck (Settings: stuckAgentMinutes) it has the engine recover it - interrupt the turn and let the
+   * agent continue, or kill the session and restart the agent with its full assignment.
+   */
   checkOnAgents(now = Date.now()): void {
     this.lastCheckAt = new Date(now).toISOString();
     const stallAfter = this.deps.stallAfterMs ?? 5 * 60_000;
-    for (const id of this.running.keys()) {
+    const stuckMinutes = this.deps.store.settings.stuckAgentMinutes;
+    for (const [id, entry] of this.running) {
       const task = this.deps.store.getTask(id);
       if (!task || task.status !== "running") continue;
       for (const agent of task.agents ?? []) {
         if (agent.status !== "working" || !agent.updatedAt) continue;
         const silentMs = now - Date.parse(agent.updatedAt);
+        const minutes = Math.round(silentMs / 60_000);
+        const last = agent.lastActivity ? ` (last: ${truncate(agent.lastActivity, 80)})` : "";
         const key = `${task.id}:${agent.role}:${agent.updatedAt}`;
+        if (silentMs >= stuckMinutes * 60_000) {
+          if (!this.checkIns.has(`${key}:stuck`) && entry.engine?.recover(agent.role, `no activity for ${minutes} min${last}`)) {
+            this.checkIns.add(`${key}:stuck`);
+          }
+          continue;
+        }
         if (silentMs < stallAfter || this.checkIns.has(key)) continue;
         this.checkIns.add(key);
-        const minutes = Math.round(silentMs / 60_000);
         this.comm(task, {
           from: "manager",
           to: agent.role,
           kind: "monitor",
-          text: `Check-in: no new activity for ${minutes} min${agent.lastActivity ? ` (last: ${truncate(agent.lastActivity, 80)})` : ""}; the turn times out after ${this.deps.store.settings.turnTimeoutMinutes} min`,
+          text: `Check-in: no new activity for ${minutes} min${last}; the manager recovers agents that stay silent for ${stuckMinutes} min`,
         });
       }
     }

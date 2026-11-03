@@ -292,6 +292,7 @@ export function parseSettingsPatch(body: Record<string, unknown>): Partial<Setti
   if ("maxRounds" in body) patch.maxRounds = intIn(body.maxRounds, 1, 10, "maxRounds");
   if ("maxConcurrency" in body) patch.maxConcurrency = intIn(body.maxConcurrency, 1, MAX_PARALLEL_TASKS, "maxConcurrency");
   if ("turnTimeoutMinutes" in body) patch.turnTimeoutMinutes = intIn(body.turnTimeoutMinutes, 5, 600, "turnTimeoutMinutes");
+  if ("stuckAgentMinutes" in body) patch.stuckAgentMinutes = intIn(body.stuckAgentMinutes, 3, 240, "stuckAgentMinutes");
   if ("inputTimeoutMinutes" in body) patch.inputTimeoutMinutes = intIn(body.inputTimeoutMinutes, 1, 1440, "inputTimeoutMinutes");
   if ("designDocDir" in body) patch.designDocDir = repoFolder(body.designDocDir, "designDocDir");
   if ("documentDir" in body) patch.documentDir = repoFolder(body.documentDir, "documentDir");

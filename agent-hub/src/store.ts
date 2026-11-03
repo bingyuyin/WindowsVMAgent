@@ -30,6 +30,7 @@ export const DEFAULT_SETTINGS: Settings = {
   documentDir: "docs",
   docFormat: "html",
   turnTimeoutMinutes: 90,
+  stuckAgentMinutes: 15,
   inputTimeoutMinutes: 30,
   isolation: "branch",
   cleanupWorktrees: true,

@@ -1,14 +1,15 @@
-import type {
-  AgentDriver,
-  AgentHandle,
-  AgentObserver,
-  PlanSubmissionInput,
-  ReviewSubmissionInput,
-  SubmitChannel,
-  TestRunSubmissionInput,
-  TurnResult,
-  UserQuestion,
-  WorkSubmissionInput,
+import {
+  TurnTimeoutError,
+  type AgentDriver,
+  type AgentHandle,
+  type AgentObserver,
+  type PlanSubmissionInput,
+  type ReviewSubmissionInput,
+  type SubmitChannel,
+  type TestRunSubmissionInput,
+  type TurnResult,
+  type UserQuestion,
+  type WorkSubmissionInput,
 } from "../agents/driver.ts";
 import path from "node:path";
 import {
@@ -20,11 +21,13 @@ import {
   NUDGE_TEST,
   NUDGE_WORK,
   plannerPrompt,
+  recoveryPrompt,
+  restartNote,
   reviewPrompt,
   systemPromptFor,
   type DesignContext,
 } from "../agents/prompts.ts";
-import { ROLE_SKILLS, type HubSkills } from "../context.ts";
+import { skillsForRole, type HubSkills } from "../context.ts";
 import { DOC_EXTENSIONS, documentProblem, formatOfPath, renderDocTemplate, type DocTemplates } from "../docs.ts";
 import type { AgentWorkspace, TaskWorkspace } from "../git.ts";
 import {
@@ -52,7 +55,7 @@ import {
   type Task,
   type TestRunInfo,
 } from "../types.ts";
-import { CancelledError, firstLine, nowIso, slugify, truncate } from "../util.ts";
+import { CancelledError, errorMessage, firstLine, nowIso, settledWithin, slugify, truncate } from "../util.ts";
 import {
   fallbackReview,
   fallbackTestRun,
@@ -91,15 +94,37 @@ export interface EngineOptions {
 
 interface ActiveAgent {
   role: AgentRole;
+  stageKind: StageKind | undefined;
+  workingDirectory: string;
   handle: AgentHandle;
+  /** Set while a turn is in flight: interrupts it so the manager can recover the agent. */
+  interrupt?: (reason: string) => void;
+  /** Rebuilds the current assignment with full context, for a fresh session that replaces a stuck one. */
+  restartPrompt?: () => Promise<string>;
 }
 
 const MAX_SUBMIT_NUDGES = 2;
+/** Recoveries per turn: interrupt and continue, then fresh sessions; after that the task fails (Retry resumes it). */
+export const MAX_RECOVERIES = 3;
+/** How long a stuck session gets to let go of its turn (abort, disconnect) before the manager moves on. */
+const STOP_GRACE_MS = 30_000;
 const MAX_ROUND_DIFF_BYTES = 60_000;
 const CO_AUTHOR = "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>";
 const COMMENT_PREFIX: Record<StageKind, string> = { design: "D", document: "W", coding: "C", testing: "T" };
 
 export const STAGE_LABELS: Record<StageKind, string> = { design: "Design", document: "Document", coding: "Coding", testing: "Execute & verify" };
+
+/** A sub-agent stayed stuck, or its session kept failing, through every recovery. */
+export class AgentUnrecoverableError extends Error {
+  readonly reason: string;
+  constructor(role: AgentRole, reason: string) {
+    super(
+      `${ROLE_LABELS[role]} could not be recovered after ${MAX_RECOVERIES} attempts; last problem: ${reason}. Retry the task to resume from the last completed step.`,
+    );
+    this.name = "AgentUnrecoverableError";
+    this.reason = reason;
+  }
+}
 
 export function modelFor(task: Pick<Task, "authorModel" | "reviewerModel" | "resolverModel" | "managerModel">, role: AgentRole): string {
   if (role === "planner") return task.managerModel || task.authorModel;
@@ -167,6 +192,18 @@ export class WorkflowEngine {
   }
 
   /**
+   * Called by the manager's monitor when a working agent shows no sign of life: interrupts its turn so
+   * `send` can recover it. False when the agent has no turn in flight.
+   */
+  recover(role: AgentRole, reason: string): boolean {
+    const agent = this.agents.get(role);
+    if (!agent?.interrupt || this.options.hooks.signal.aborted) return false;
+    agent.interrupt(reason);
+    agent.interrupt = undefined;
+    return true;
+  }
+
+  /**
    * The manager plans an Auto task: its planner reads the request and the repository and decides which
    * stages (and so which sub-agents) to create, with an assignment for each.
    */
@@ -189,21 +226,44 @@ export class WorkflowEngine {
       });
       hooks.comm({ from: "manager", to: role, kind: "assign", text: "Plan the task: choose the sub-agent teams to create and write their assignments" });
       this.pendingPlan = null;
-      let result = await this.send(agent, plannerPrompt(task, task.context));
-      for (let nudge = 0; !this.submittedPlan() && nudge < MAX_SUBMIT_NUDGES; nudge++) {
-        this.throwIfAborted();
-        hooks.emit({ type: "warning", role, text: "Planner ended its turn without calling submit_plan; asking it to submit." });
-        hooks.comm({ from: "manager", to: role, kind: "nudge", text: "Your turn ended without submit_plan - submit the plan" });
-        result = await this.send(agent, NUDGE_PLAN);
+      const prompt = plannerPrompt(task, task.context);
+      let result: TurnResult = {};
+      let lost: AgentUnrecoverableError | null = null;
+      try {
+        result = await this.send(agent, prompt, async () => prompt);
+        for (let nudge = 0; !this.submittedPlan() && nudge < MAX_SUBMIT_NUDGES; nudge++) {
+          this.throwIfAborted();
+          hooks.emit({ type: "warning", role, text: "Planner ended its turn without calling submit_plan; asking it to submit." });
+          hooks.comm({ from: "manager", to: role, kind: "nudge", text: "Your turn ended without submit_plan - submit the plan" });
+          result = await this.send(agent, NUDGE_PLAN);
+        }
+      } catch (error) {
+        // The manager can still plan without its planner: fall back to the stages the request names.
+        if (!(error instanceof AgentUnrecoverableError)) throw error;
+        lost = error;
+        status = "failed";
       }
       this.throwIfAborted();
       let plan = this.submittedPlan();
       const fallback = !plan;
       if (!plan) {
-        hooks.emit({ type: "warning", role, text: `Planner never called submit_plan (last message: ${truncate(firstLine(result.lastMessage ?? ""), 200) || "none"}); choosing stages from the request.` });
+        hooks.emit({
+          type: "warning",
+          role,
+          text: lost
+            ? `The planner could not be recovered (${lost.reason}); choosing stages from the request.`
+            : `Planner never called submit_plan (last message: ${truncate(firstLine(result.lastMessage ?? ""), 200) || "none"}); choosing stages from the request.`,
+        });
         plan = heuristicPlan(task.description);
       }
-      task.plan = { stages: plan.stages, rationale: plan.rationale, instructions: plan.instructions, fallback: fallback || undefined, plannedAt: nowIso() };
+      task.plan = {
+        stages: plan.stages,
+        rationale: plan.rationale,
+        instructions: plan.instructions,
+        briefing: plan.briefing,
+        fallback: fallback || undefined,
+        plannedAt: nowIso(),
+      };
       task.stages = plan.stages.map((kind) => ({ kind, status: "pending", rounds: [], nextCommentNumber: 1 }));
       const flow = plan.stages.map((kind) => STAGE_LABELS[kind]).join(" → ");
       hooks.emit({ type: "info", role, text: `Manager's plan: ${flow}. ${plan.rationale}`, data: { plan: task.plan } });
@@ -453,36 +513,39 @@ export class WorkflowEngine {
         : `${assignment} on ${ws.branch}${kind === "coding" && context.design ? ` following ${context.design.approved ? "the approved" : "the latest"} design` : ""}`,
     });
 
-    let previousWork: { summary: string; stat: string; diff: { text: string; truncated: boolean } } | undefined;
-    if (fresh && (role === "resolver" || role === "fixer") && startHead !== workspace.baseSha) {
-      // A fresh resolver/fixer did not see earlier rounds (or an earlier coding stage): give it the change so far.
-      const prior =
-        [...stage.rounds].reverse().find((candidate) => candidate !== round && candidate.author)?.author ??
-        this.task.stages.flatMap((candidate) => candidate.rounds).filter((candidate) => candidate.author).at(-1)?.author;
-      previousWork = {
-        summary: prior?.summary ?? "",
-        stat: await workspace.diffStat(workspace.baseSha, startHead),
-        diff: await workspace.diff(workspace.baseSha, startHead, MAX_INLINE_DIFF),
-      };
-    }
-    const prompt = authorPrompt({
-      task: this.task,
-      role,
-      stage: kind,
-      round: round.n,
-      docPath: stage.docPath,
-      docFormat: stage.docFormat,
-      seeded: this.seededDoc !== null,
-      design: context.design,
-      context: this.task.context,
-      includeContext: fresh,
-      resumed: context.resumed && fresh,
-      review: context.lastReview,
-      openComments: context.open,
-      previousWork,
-    });
+    const buildPrompt = async (includeContext: boolean): Promise<string> => {
+      let previousWork: { summary: string; stat: string; diff: { text: string; truncated: boolean } } | undefined;
+      if (includeContext && (role === "resolver" || role === "fixer") && startHead !== workspace.baseSha) {
+        // A fresh resolver/fixer did not see earlier rounds (or an earlier coding stage): give it the change so far.
+        const prior =
+          [...stage.rounds].reverse().find((candidate) => candidate !== round && candidate.author)?.author ??
+          this.task.stages.flatMap((candidate) => candidate.rounds).filter((candidate) => candidate.author).at(-1)?.author;
+        previousWork = {
+          summary: prior?.summary ?? "",
+          stat: await workspace.diffStat(workspace.baseSha, startHead),
+          diff: await workspace.diff(workspace.baseSha, startHead, MAX_INLINE_DIFF),
+        };
+      }
+      return authorPrompt({
+        task: this.task,
+        role,
+        stage: kind,
+        round: round.n,
+        docPath: stage.docPath,
+        docFormat: stage.docFormat,
+        seeded: this.seededDoc !== null,
+        design: context.design,
+        context: this.task.context,
+        includeContext,
+        resumed: context.resumed && includeContext,
+        review: context.lastReview,
+        openComments: context.open,
+        previousWork,
+      });
+    };
+    const prompt = await buildPrompt(fresh);
     this.currentAuthorWorkspace = ws;
-    const submission = await this.runAuthorTurn(agent, prompt, context.open);
+    const submission = await this.runAuthorTurn(agent, prompt, () => buildPrompt(true), context.open);
     hooks.agent(role, (info) => {
       info.status = "idle";
     });
@@ -522,9 +585,14 @@ export class WorkflowEngine {
           : `Run the test automation at ${sha} and verify the results`
         : `Review the ${ROLE_LABELS[authorRole].toLowerCase()}'s round ${round.n} at ${sha}${round.author?.shortStat ? ` (${round.author.shortStat})` : ""}`,
     });
+    const build = (includeContext: boolean) =>
+      executor
+        ? this.buildExecutionPrompt(stage, round, includeContext, design, reviewedSha)
+        : this.buildReviewPrompt(stage, round, includeContext, design, reviewedSha);
+    const prompt = await build(fresh);
     const review = executor
-      ? await this.runTestTurn(agent, await this.buildExecutionPrompt(stage, round, fresh, design, reviewedSha), stage, reviewedSha)
-      : await this.runReviewTurn(agent, await this.buildReviewPrompt(stage, round, fresh, design, reviewedSha), stage, reviewedSha);
+      ? await this.runTestTurn(agent, prompt, () => build(true), stage, reviewedSha)
+      : await this.runReviewTurn(agent, prompt, () => build(true), stage, reviewedSha);
     hooks.agent(role, (info) => {
       info.status = "idle";
     });
@@ -534,13 +602,20 @@ export class WorkflowEngine {
   private async agentFor(role: AgentRole, stageKind: StageKind | undefined, workingDirectory: string): Promise<ActiveAgent> {
     const existing = this.agents.get(role);
     if (existing) return existing;
+    const agent: ActiveAgent = { role, stageKind, workingDirectory, handle: await this.startSession(role, stageKind, workingDirectory) };
+    this.agents.set(role, agent);
+    return agent;
+  }
+
+  /** Starts a Copilot session for a sub-agent; `replacing` says why when it replaces a stuck session. */
+  private async startSession(role: AgentRole, stageKind: StageKind | undefined, workingDirectory: string, replacing?: string): Promise<AgentHandle> {
     const { driver, workspace, settings, hooks, hubSkills } = this.options;
     const task = this.task;
     const readOnly = isReviewerRole(role) || role === "planner";
     const executeOnly = role === "executor";
     const model = modelFor(task, role);
     const hubNames = (hubSkills?.skills ?? []).map((skill) => skill.name);
-    const roleSkills = hubNames.filter((name) => ROLE_SKILLS[role].includes(name));
+    const skills = skillsForRole(role, task.context).filter((name) => hubNames.includes(name));
     const handle = await driver.start({
       taskId: task.id,
       role,
@@ -550,7 +625,7 @@ export class WorkflowEngine {
       systemPrompt: systemPromptFor(
         role,
         { worktree: workingDirectory, branch: workspace.branchFor(role), taskBranch: workspace.taskBranch, baseSha: workspace.baseSha },
-        roleSkills,
+        skills,
         {
           docFormat:
             stageKind && isDocStage(stageKind) ? (this.task.stages.find((stage) => stage.kind === stageKind)?.docFormat ?? "markdown") : undefined,
@@ -562,29 +637,35 @@ export class WorkflowEngine {
         ...(task.context?.skillRoots ?? []).map((root) => path.join(workingDirectory, root)),
         ...(hubSkills?.dir ? [hubSkills.dir] : []),
       ],
-      disabledSkills: hubNames.filter((name) => !roleSkills.includes(name)),
+      disabledSkills: hubNames.filter((name) => !skills.includes(name)),
       submit: this.submitChannelFor(role, stageKind),
       observer: hooks.observer(role, stageKind),
       askUser: (question) => hooks.askUser(role, question),
       turnTimeoutMs: settings.turnTimeoutMinutes * 60_000,
     });
-    const agent: ActiveAgent = { role, handle };
-    this.agents.set(role, agent);
     hooks.trackSession(role, handle.sessionId);
     hooks.agent(role, (info) => {
       info.model = model;
       info.sessionId = handle.sessionId;
+      info.skills = skills;
     });
-    hooks.emit({ type: "info", role, stage: stageKind, text: `${ROLE_LABELS[role]} agent started on ${model}`, data: { sessionId: handle.sessionId } });
+    const label = ROLE_LABELS[role].toLowerCase();
+    hooks.emit({
+      type: replacing ? "warning" : "info",
+      role,
+      stage: stageKind,
+      text: replacing ? `Restarted the ${label} in a fresh session on ${model} (${replacing})` : `${ROLE_LABELS[role]} agent started on ${model}`,
+      data: { sessionId: handle.sessionId },
+    });
     const access = readOnly ? " (read-only)" : executeOnly ? " (runs commands, no file edits)" : "";
     hooks.comm({
       from: "manager",
       to: role,
       kind: "spawn",
       stage: stageKind,
-      text: `Started a ${ROLE_LABELS[role].toLowerCase()} session on ${model}${access}${roleSkills.length ? `; skills: ${roleSkills.join(", ")}` : ""}`,
+      text: `Started a ${replacing ? "fresh " : ""}${label} session on ${model}${access}${skills.length ? `; skills: ${skills.join(", ")}` : ""}${replacing ? "; it replaces the stuck session and gets the full assignment" : ""}`,
     });
-    return agent;
+    return handle;
   }
 
   /** The terminal tool through which each kind of agent hands back its structured result. */
@@ -608,11 +689,83 @@ export class WorkflowEngine {
     this.options.hooks.comm({ from: "manager", to: role, kind: "release", text: `Closed the session (${status})` });
   }
 
-  private send(agent: ActiveAgent, prompt: string): Promise<TurnResult> {
-    this.options.hooks.agent(agent.role, (info) => {
-      info.turns += 1;
-    });
-    return agent.handle.send(prompt);
+  /**
+   * Runs one agent turn under the manager's supervision. A turn the manager's monitor finds stuck, that
+   * runs past the turn timeout or whose session fails is recovered: first by interrupting it and asking
+   * the agent to carry on without repeating what hung, then by killing the session and starting a fresh
+   * one with the full assignment. After MAX_RECOVERIES the turn fails (Retry resumes the task).
+   */
+  private async send(agent: ActiveAgent, prompt: string, restartPrompt?: () => Promise<string>): Promise<TurnResult> {
+    const { hooks } = this.options;
+    const role = agent.role;
+    if (restartPrompt) agent.restartPrompt = restartPrompt;
+    let message = prompt;
+    for (let recovery = 0; ; recovery++) {
+      this.throwIfAborted();
+      hooks.agent(role, (info) => {
+        info.turns += 1;
+      });
+      const handle = agent.handle;
+      const interrupted = new Promise<string>((resolve) => {
+        agent.interrupt = resolve;
+      });
+      const turn = handle.send(message);
+      const outcome = await Promise.race([
+        turn.then(
+          (result) => ({ kind: "done" as const, result }),
+          (error: unknown) => ({ kind: "failed" as const, error }),
+        ),
+        interrupted.then((reason) => ({ kind: "stuck" as const, reason })),
+      ]);
+      agent.interrupt = undefined;
+      if (outcome.kind === "done") return outcome.result;
+      this.throwIfAborted();
+      const timedOut = outcome.kind === "failed" && outcome.error instanceof TurnTimeoutError;
+      // A stuck or timed-out turn may still be running in the session: stop it first.
+      const stopped = outcome.kind === "stuck" || timedOut ? await settledWithin(Promise.all([handle.abort(), turn]), STOP_GRACE_MS) : false;
+      this.throwIfAborted();
+      // The agent delivered its result before it got stuck: nothing to recover.
+      if (this.hasSubmission(role)) return {};
+      const problem =
+        outcome.kind === "stuck" ? outcome.reason : timedOut ? errorMessage(outcome.error) : `its session failed: ${truncate(errorMessage(outcome.error), 300)}`;
+      const label = ROLE_LABELS[role];
+      if (recovery >= MAX_RECOVERIES) {
+        hooks.comm({ from: "manager", to: role, kind: "recover", text: `Gave up: ${label} could not be recovered after ${MAX_RECOVERIES} attempts; last problem: ${problem}` });
+        throw new AgentUnrecoverableError(role, problem);
+      }
+      const restart = !stopped || recovery > 0;
+      const attempt = `recovery ${recovery + 1} of ${MAX_RECOVERIES}`;
+      hooks.agent(role, (info) => {
+        info.recoveries = (info.recoveries ?? 0) + 1;
+      });
+      hooks.emit({
+        type: "warning",
+        role,
+        text: `${label} stopped making progress (${problem}); ${restart ? "killing its session and restarting it with the full assignment" : "interrupted the turn and asked it to continue"} (${attempt}).`,
+      });
+      hooks.comm({
+        from: "manager",
+        to: role,
+        kind: "recover",
+        text: `No progress: ${problem}. ${restart ? "Killing the session and restarting the agent" : "Interrupted the turn; continue without repeating what hung"} (${attempt})`,
+      });
+      message = restart ? await this.restartAgent(agent, problem) : recoveryPrompt(role, problem);
+    }
+  }
+
+  /** Kills a stuck agent's session and starts a fresh one; returns the prompt that hands it the assignment again. */
+  private async restartAgent(agent: ActiveAgent, problem: string): Promise<string> {
+    const old = agent.handle;
+    await settledWithin(old.abort(), STOP_GRACE_MS);
+    await settledWithin(old.dispose(), STOP_GRACE_MS);
+    agent.handle = await this.startSession(agent.role, agent.stageKind, agent.workingDirectory, problem);
+    return restartNote(agent.role, problem) + (agent.restartPrompt ? await agent.restartPrompt() : "");
+  }
+
+  private hasSubmission(role: AgentRole): boolean {
+    if (role === "planner") return this.pendingPlan !== null;
+    if (role === "executor") return this.pendingTest !== null;
+    return isReviewerRole(role) ? this.pendingReview !== null : this.pendingWork !== null;
   }
 
   private async acceptWork(input: WorkSubmissionInput, stageKind: StageKind): Promise<void> {
@@ -628,11 +781,16 @@ export class WorkflowEngine {
     this.pendingWork = normalized;
   }
 
-  private async runAuthorTurn(agent: ActiveAgent, prompt: string, open: ReviewComment[]): Promise<{ input: WorkSubmissionInput; fallback: boolean }> {
+  private async runAuthorTurn(
+    agent: ActiveAgent,
+    prompt: string,
+    restartPrompt: () => Promise<string>,
+    open: ReviewComment[],
+  ): Promise<{ input: WorkSubmissionInput; fallback: boolean }> {
     const role = agent.role;
     this.pendingWork = null;
     this.expectedCommentIds = open.map((comment) => comment.id);
-    let result = await this.send(agent, prompt);
+    let result = await this.send(agent, prompt, restartPrompt);
     for (let nudge = 0; !this.submittedWork() && nudge < MAX_SUBMIT_NUDGES; nudge++) {
       this.throwIfAborted();
       this.options.hooks.emit({ type: "warning", role, text: "Agent ended its turn without calling submit_work; asking it to submit." });
@@ -663,11 +821,11 @@ export class WorkflowEngine {
   }
 
   /** The executor runs the test automation; its failures become comment-like items (T1, T2, ...) for the fixer. */
-  private async runTestTurn(agent: ActiveAgent, prompt: string, stage: Stage, testedSha: string): Promise<ReviewSubmission> {
+  private async runTestTurn(agent: ActiveAgent, prompt: string, restartPrompt: () => Promise<string>, stage: Stage, testedSha: string): Promise<ReviewSubmission> {
     const { hooks } = this.options;
     const role = agent.role;
     this.pendingTest = null;
-    let result = await this.send(agent, prompt);
+    let result = await this.send(agent, prompt, restartPrompt);
     for (let nudge = 0; !this.submittedTest() && nudge < MAX_SUBMIT_NUDGES; nudge++) {
       this.throwIfAborted();
       hooks.emit({ type: "warning", role, text: "Test executor ended its turn without calling submit_test_results; asking it to submit." });
@@ -709,10 +867,10 @@ export class WorkflowEngine {
     };
   }
 
-  private async runReviewTurn(agent: ActiveAgent, prompt: string, stage: Stage, reviewedSha: string): Promise<ReviewSubmission> {
+  private async runReviewTurn(agent: ActiveAgent, prompt: string, restartPrompt: () => Promise<string>, stage: Stage, reviewedSha: string): Promise<ReviewSubmission> {
     const role = agent.role;
     this.pendingReview = null;
-    let result = await this.send(agent, prompt);
+    let result = await this.send(agent, prompt, restartPrompt);
     for (let nudge = 0; !this.submittedReview() && nudge < MAX_SUBMIT_NUDGES; nudge++) {
       this.throwIfAborted();
       this.options.hooks.emit({ type: "warning", role, text: "Reviewer ended its turn without calling submit_review; asking it to submit." });

@@ -31,6 +31,7 @@ export function settingsView(root) {
   const docDir = h("input", { class: "input", type: "text", value: settings.designDocDir ?? "docs/designs", spellcheck: "false" });
   const documentDir = h("input", { class: "input", type: "text", value: settings.documentDir ?? "docs", spellcheck: "false" });
   const turnTimeout = h("input", { class: "input", type: "number", min: "5", max: "600", value: String(settings.turnTimeoutMinutes ?? 90) });
+  const stuckAfter = h("input", { class: "input", type: "number", min: "3", max: "240", value: String(settings.stuckAgentMinutes ?? 15) });
   const inputTimeout = h("input", { class: "input", type: "number", min: "1", max: "1440", value: String(settings.inputTimeoutMinutes ?? 30) });
   const saveButton = h("button", { class: "btn btn-primary", type: "submit" }, "Save settings");
   const refreshButton = h("button", { class: "btn btn-sm", type: "button", onclick: () => fillModels(true) }, "Refresh model list");
@@ -83,7 +84,12 @@ export function settingsView(root) {
         { class: "grid-3" },
         field("Max review rounds / test runs", rounds, "Default per task: author/review iterations (or test runs) before stopping."),
         field("Parallel tasks", concurrency, "How many tasks run at the same time (1-10). Tasks beyond this wait in the queue and start as soon as a slot frees up."),
-        field("Agent turn timeout (minutes)", turnTimeout, "Fails a turn that runs longer than this."),
+        field("Agent turn timeout (minutes)", turnTimeout, "A turn that runs longer than this is interrupted and recovered like a stuck one."),
+        field(
+          "Recover a stuck agent after (minutes)",
+          stuckAfter,
+          "With no sign of activity for this long, the manager interrupts the agent's turn and has it continue; if it is still stuck, it kills the session and restarts the agent with its full assignment.",
+        ),
         field("Question timeout (minutes)", inputTimeout, "When an agent asks you something and you don't answer in time, it proceeds on its own."),
         h(
           "label",
@@ -180,6 +186,7 @@ export function settingsView(root) {
         designDocDir: docDir.value,
         documentDir: documentDir.value,
         turnTimeoutMinutes: Number(turnTimeout.value),
+        stuckAgentMinutes: Number(stuckAfter.value),
         inputTimeoutMinutes: Number(inputTimeout.value),
       });
       notify("settings");

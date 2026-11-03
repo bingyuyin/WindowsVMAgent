@@ -2352,6 +2352,9 @@ details > summary {
 .org .msg-dot.k-monitor {
   fill: var(--warning);
 }
+.org .msg-dot.k-recover {
+  fill: var(--danger);
+}
 .org .msg-dot.k-question,
 .org .msg-dot.k-answer {
   fill: var(--attention);
@@ -2681,6 +2684,10 @@ details > summary {
 .feed-kind.k-monitor {
   background: var(--warning-muted);
   color: var(--warning);
+}
+.feed-kind.k-recover {
+  background: var(--danger-muted);
+  color: var(--danger);
 }
 .feed-kind.k-question,
 .feed-kind.k-answer {

@@ -61,6 +61,8 @@ export interface CopilotServiceOptions {
 }
 
 const rejectAllPermissions = () => ({ kind: "reject" as const, feedback: "Not allowed in this session" });
+/** How long the runtime gets to answer a health probe before it counts as unresponsive. */
+const PROBE_TIMEOUT_MS = 15_000;
 
 /**
  * Owns the single Copilot runtime (CopilotClient) used by the hub, the GitHub sign-in
@@ -70,6 +72,7 @@ export class CopilotService {
   private readonly options: CopilotServiceOptions;
   private client: CopilotClient | null = null;
   private starting: Promise<CopilotClient> | null = null;
+  private recovering: Promise<void> | null = null;
   private state: AuthState = { runtime: "stopped", authenticated: false };
   private flow: ActiveFlow | null = null;
   private models: ModelSummary[] | null = null;
@@ -178,12 +181,37 @@ export class CopilotService {
     return this.getState();
   }
 
-  /** Returns a started client with an authenticated user, or throws. */
+  /** Returns a started, responsive client with an authenticated user, or throws. A runtime that stopped answering is restarted. */
   async requireClient(): Promise<CopilotClient> {
-    const client = await this.start();
+    let client = await this.start();
+    if (!(await this.responds(client)) && !(await this.responds(client))) client = await this.restartUnresponsive(client);
     if (!this.state.authenticated) await this.refreshAuth();
     if (!this.state.authenticated) throw new Error("Not signed in to GitHub Copilot. Sign in from the hub UI first.");
     return client;
+  }
+
+  private async responds(client: CopilotClient): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), PROBE_TIMEOUT_MS);
+    });
+    try {
+      return await Promise.race([client.getStatus().then(() => true, () => false), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Agents that find the runtime unresponsive at the same time share one restart. */
+  private async restartUnresponsive(client: CopilotClient): Promise<CopilotClient> {
+    if (this.client === client && !this.recovering) {
+      console.warn("[copilot] The Copilot runtime stopped responding; restarting it.");
+      this.recovering = this.restart().finally(() => {
+        this.recovering = null;
+      });
+    }
+    await this.recovering;
+    return this.start();
   }
 
   async listModels(force = false): Promise<ModelSummary[]> {

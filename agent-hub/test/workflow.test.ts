@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
-import { loadHubSkills } from "../src/context.ts";
+import { TurnTimeoutError } from "../src/agents/driver.ts";
+import { discoverContext, loadHubSkills } from "../src/context.ts";
 import type { CopilotService } from "../src/copilot/service.ts";
 import { loadDocTemplates } from "../src/docs.ts";
 import { createApiRouter } from "../src/http/api.ts";
@@ -19,6 +21,7 @@ import {
   createHarness,
   designPathFrom,
   git,
+  hang,
   steps,
   submitReview,
   submitPlan,
@@ -375,6 +378,7 @@ describe("repository context", () => {
         hubSkills: loadHubSkills(skillsDir),
         files: {
           "AGENTS.md": "# Agent rules\n",
+          "src/AGENTS.md": "# Rules for src\n",
           "CONTRIBUTING.md": "# Contributing\n",
           "docs/adr/0001-use-node.md": "# ADR 1\n",
           ".github/skills/release-notes/SKILL.md": "---\nname: release-notes\ndescription: Write release notes for every change\n---\nBody\n",
@@ -386,16 +390,19 @@ describe("repository context", () => {
       const created = await h.runner.submit({ description: "F", kind: "coding", repoId: "sample" });
       await h.runner.idle();
       const task = h.store.getTask(created.id)!;
-      assert.deepEqual(task.context?.instructions, ["AGENTS.md"]);
+      assert.deepEqual(task.context?.instructions, ["AGENTS.md", "src/AGENTS.md"]);
       assert.deepEqual(task.context?.guides, ["CONTRIBUTING.md", "README.md"]);
       assert.deepEqual(task.context?.designDocs, ["docs/adr/0001-use-node.md"]);
       assert.deepEqual(task.context?.skills.map((skill) => [skill.name, skill.description]), [["release-notes", "Write release notes for every change"]]);
       assert.deepEqual(task.context?.skillRoots, [".github/skills"]);
       assert.deepEqual(task.context?.validation, ["npm run lint", "npm test"]);
+      assert.deepEqual(task.context?.stack, ["Node.js"]);
+      assert.deepEqual(task.context?.techSkills, ["typescript-best-practices"]);
 
       const prompt = h.driver.prompts.coder![0]!;
       assert.match(prompt, /## Repository context/);
-      assert.match(prompt, /`AGENTS\.md`/);
+      assert.match(prompt, /Instruction files \(loaded automatically; follow them\): `AGENTS\.md`\n/);
+      assert.match(prompt, /More instruction files \(not loaded automatically; .*\): `src\/AGENTS\.md`/);
       assert.match(prompt, /`release-notes` - Write release notes/);
       assert.match(prompt, /`npm test`/);
 
@@ -403,12 +410,42 @@ describe("repository context", () => {
       const [reviewer] = h.driver.specsFor("code-reviewer");
       assert.deepEqual(coder!.skillDirectories, [path.join(coder!.workingDirectory, ".github/skills"), skillsDir]);
       assert.ok(!coder!.disabledSkills.includes("coding-best-practices"));
+      assert.ok(!coder!.disabledSkills.includes("typescript-best-practices"));
       assert.ok(coder!.disabledSkills.includes("code-review"));
-      assert.match(coder!.systemPrompt, /load the `coding-best-practices` skill/);
-      assert.match(reviewer!.systemPrompt, /load the `code-review` skill/);
+      assert.ok(coder!.disabledSkills.includes("python-best-practices"), "skills for other technologies are off");
+      assert.match(coder!.systemPrompt, /load the `coding-best-practices` and `typescript-best-practices` skills/);
+      assert.match(coder!.systemPrompt, /The manager monitors your activity/);
+      assert.match(reviewer!.systemPrompt, /load the `code-review` and `typescript-best-practices` skills/);
       assert.ok(reviewer!.disabledSkills.includes("coding-best-practices"));
+      assert.deepEqual(task.agents?.find((agent) => agent.role === "coder")?.skills, ["coding-best-practices", "typescript-best-practices"]);
     } finally {
       h.cleanup();
+    }
+  });
+
+  test("detects the technologies, their best-practice skills and folder-level instructions", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-hub-context-"));
+    try {
+      git(root, "init", "-q", "-b", "main");
+      const files = {
+        "CMakeLists.txt": "project(native)\nenable_testing()\nadd_test(NAME unit COMMAND unit)\n",
+        "src/main.cpp": "int main() { return 0; }\n",
+        "src/AGENTS.md": "# Native code rules\n",
+        "tools/build.ps1": "Write-Output build\n",
+      };
+      for (const [file, content] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+        fs.writeFileSync(path.join(root, file), content);
+      }
+      git(root, "add", "-A");
+      git(root, "commit", "-q", "-m", "initial");
+      const context = await discoverContext(root, git(root, "rev-parse", "HEAD"));
+      assert.deepEqual(context.stack, ["C/C++", "PowerShell"]);
+      assert.deepEqual(context.techSkills, ["cpp-best-practices", "powershell-best-practices"]);
+      assert.deepEqual(context.validation, ["cmake -S . -B build", "cmake --build build", "ctest --test-dir build --output-on-failure"]);
+      assert.deepEqual(context.instructions, ["src/AGENTS.md"]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 });
@@ -728,12 +765,142 @@ describe("manager", () => {
       assert.equal(checkIns.length, 1, "one check-in per silent period");
       assert.equal(checkIns[0]!.to, "coder");
       assert.match(checkIns[0]!.text, /no new activity for 6 min/);
+      assert.match(checkIns[0]!.text, /recovers agents that stay silent for 15 min/);
       assert.ok(h.runner.overview().lastCheckAt);
       release();
       await h.runner.idle();
       assert.equal(h.store.getTask(created.id)!.status, "completed");
     } finally {
       release();
+      h.cleanup();
+    }
+  });
+
+  test("recovers a stuck agent: interrupts its turn and has it continue in the same session", async () => {
+    const h = createHarness({
+      coder: [
+        hang,
+        steps((_spec, prompt) => {
+          assert.match(prompt, /The manager interrupted your previous turn because it stopped making progress: no activity for 16 min\./);
+          assert.match(prompt, /Then finish by calling `submit_work`/);
+        }, writeFile("s.txt", "s\n"), submitWork("Finished after the interrupt")),
+      ],
+      "code-reviewer": [submitReview("approve")],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Gets stuck once", kind: "coding", repoId: "sample" });
+      await waitFor(() => h.driver.prompts.coder?.length === 1);
+      h.runner.checkOnAgents(Date.now() + 16 * 60_000);
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(h.driver.specsFor("coder").length, 1, "the same session continues");
+      assert.equal(h.driver.prompts.coder!.length, 2);
+      assert.equal(task.agents!.find((agent) => agent.role === "coder")!.recoveries, 1);
+      const recoveries = h.store.recentComm({ taskId: task.id }).filter((entry) => entry.kind === "recover");
+      assert.equal(recoveries.length, 1);
+      assert.equal(recoveries[0]!.from, "manager");
+      assert.equal(recoveries[0]!.to, "coder");
+      assert.match(recoveries[0]!.text, /^No progress: no activity for 16 min\. Interrupted the turn; continue without repeating what hung \(recovery 1 of 3\)$/);
+      const events = await h.store.readEvents(task.id);
+      assert.ok(events.some((event) => event.type === "warning" && /Coder stopped making progress/.test(event.text)));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("kills and restarts an agent that stays stuck; the fresh session gets the full assignment and keeps the work", async () => {
+    const h = createHarness({
+      coder: [
+        steps(writeFile("partial.txt", "half done\n"), hang),
+        hang,
+        steps((spec, prompt) => {
+          assert.match(prompt, /^## Note from the manager: you replace a stuck session/);
+          assert.match(prompt, /stopped making progress \(no activity for 16 min\)/);
+          assert.match(prompt, /run `git status` and `git diff` first/);
+          assert.match(prompt, /## Request\n\nRestart me/, "the replacement gets the full assignment");
+          assert.equal(fs.readFileSync(path.join(spec.workingDirectory, "partial.txt"), "utf8"), "half done\n", "the stuck session's changes are kept");
+        }, writeFile("done.txt", "done\n"), submitWork("Finished in a fresh session")),
+      ],
+      "code-reviewer": [submitReview("approve")],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Restart me", kind: "coding", repoId: "sample" });
+      await waitFor(() => h.driver.prompts.coder?.length === 1);
+      h.runner.checkOnAgents(Date.now() + 16 * 60_000);
+      await waitFor(() => h.driver.prompts.coder?.length === 2);
+      h.runner.checkOnAgents(Date.now() + 16 * 60_000);
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(h.driver.specsFor("coder").length, 2, "a fresh session replaced the stuck one");
+      const [stuck, fresh] = task.sessions.filter((session) => session.role === "coder");
+      assert.ok(h.driver.disposed.includes(stuck!.sessionId), "the stuck session was killed");
+      assert.equal(task.agents!.find((agent) => agent.role === "coder")!.sessionId, fresh!.sessionId);
+      assert.equal(task.agents!.find((agent) => agent.role === "coder")!.recoveries, 2);
+      assert.match(git(h.repoPath, "show", `${task.branch}:partial.txt`), /half done/);
+      assert.match(git(h.repoPath, "show", `${task.branch}:done.txt`), /done/);
+      const toCoder = h.store.recentComm({ taskId: task.id }).filter((entry) => entry.to === "coder").map((entry) => `${entry.kind}: ${entry.text}`);
+      assert.ok(toCoder.some((text) => /^recover: No progress: no activity for 16 min\. Killing the session and restarting the agent \(recovery 2 of 3\)$/.test(text)), toCoder.join("\n"));
+      assert.ok(toCoder.some((text) => /^spawn: Started a fresh coder session on fake-author.*replaces the stuck session/.test(text)), toCoder.join("\n"));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("restarts an agent whose session fails, and fails the task once the recoveries are used up", async () => {
+    const crash: Step = () => {
+      throw new Error("Session disconnected while waiting for a response");
+    };
+    const h = createHarness({
+      coder: [crash, steps(writeFile("c.txt", "c\n"), submitWork("Recovered from a crash")), crash, crash, crash, crash],
+      "code-reviewer": [submitReview("approve")],
+    });
+    try {
+      const first = await h.runner.submit({ description: "Crashes once", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      assert.equal(h.store.getTask(first.id)!.status, "completed");
+      assert.equal(h.driver.specsFor("coder").length, 2, "the failed session was replaced without waiting for the monitor");
+      assert.match(h.driver.prompts.coder![1]!, /stopped making progress \(its session failed: Session disconnected while waiting for a response\)/);
+
+      const second = await h.runner.submit({ description: "Keeps crashing", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(second.id)!;
+      assert.equal(task.status, "failed");
+      assert.match(task.error ?? "", /^Coder could not be recovered after 3 attempts; last problem: its session failed: Session disconnected/);
+      assert.match(task.error ?? "", /Retry the task to resume from the last completed step/);
+      assert.equal(h.driver.specsFor("coder").length, 2 + 4, "one session plus three replacements");
+      assert.ok(h.store.recentComm({ taskId: task.id }).some((entry) => entry.kind === "recover" && /^Gave up: Coder could not be recovered/.test(entry.text)));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a turn past the turn timeout is stopped and continued; an agent that already submitted is not re-prompted", async () => {
+    const h = createHarness({
+      coder: [
+        () => {
+          throw new TurnTimeoutError(90 * 60_000);
+        },
+        steps((_spec, prompt) => {
+          assert.match(prompt, /stopped making progress: the turn ran longer than the 90-minute turn timeout\./);
+        }, writeFile("t.txt", "t\n"), submitWork("Wrapped up")),
+      ],
+      "code-reviewer": [steps(submitReview("approve"), hang)],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Long turn", kind: "coding", repoId: "sample" });
+      await waitFor(() => h.driver.prompts["code-reviewer"]?.length === 1);
+      h.runner.checkOnAgents(Date.now() + 16 * 60_000);
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(task.result?.approved, true);
+      assert.equal(h.driver.specsFor("coder").length, 1, "a timed-out turn continues in the same session");
+      assert.equal(task.agents!.find((agent) => agent.role === "coder")!.recoveries, 1);
+      assert.equal(h.driver.prompts["code-reviewer"]!.length, 1, "the reviewer had submitted its verdict, so it is not prompted again");
+      assert.equal(task.agents!.find((agent) => agent.role === "code-reviewer")!.recoveries, undefined);
+    } finally {
       h.cleanup();
     }
   });
@@ -903,18 +1070,26 @@ describe("manager planning (auto tasks)", () => {
             assert.equal(spec.readOnly, true);
             assert.equal(spec.submit.kind, "plan");
             assert.match(spec.systemPrompt, /You are the MANAGER/);
+            assert.match(spec.systemPrompt, /Write a `briefing` that every sub-agent starts with/);
             assert.match(prompt, /## Plan this task/);
             assert.match(prompt, /`npm test`/, "the planner sees the detected test commands");
+            assert.match(prompt, /the technology skills `typescript-best-practices`/, "the planner knows which best practices the agents get");
           }, submitPlan(["tests", "implementation"], { coding: "Add mul(a, b) to calc.js with a unit test", testing: "Run `npm test`; all tests must pass" })),
         ],
         coder: [
           steps((_spec, prompt) => {
+            assert.match(prompt, /## Manager's briefing on the repository\n\ncalc\.js holds the math helpers/);
             assert.match(prompt, /## Manager's assignment for this stage\n\nAdd mul\(a, b\) to calc\.js/);
           }, writeFile("calc.js", "export const mul = (a, b) => a * b;\n"), submitWork("Added mul()")),
         ],
-        "code-reviewer": [submitReview("approve")],
+        "code-reviewer": [
+          steps((_spec, prompt) => {
+            assert.match(prompt, /## Manager's briefing on the repository/);
+          }, submitReview("approve")),
+        ],
         executor: [
           steps((_spec, prompt) => {
+            assert.match(prompt, /## Manager's briefing on the repository\n\ncalc\.js holds the math helpers/);
             assert.match(prompt, /## Manager's assignment for this stage\n\nRun `npm test`; all tests must pass/);
             assert.match(prompt, /calc\.js \| 1 \+/, "the executor knows what changed on the task branch");
           }, submitTests("passed", [], { total: 3 })),
@@ -929,6 +1104,7 @@ describe("manager planning (auto tasks)", () => {
       const task = h.store.getTask(created.id)!;
       assert.equal(task.status, "completed");
       assert.deepEqual(task.plan?.stages, ["coding", "testing"], "aliases are normalized and stages ordered");
+      assert.equal(task.plan?.briefing, "calc.js holds the math helpers; tests run with node --test.");
       assert.equal(task.plan?.fallback, undefined);
       assert.deepEqual(task.stages.map((stage) => [stage.kind, stage.status]), [["coding", "approved"], ["testing", "approved"]]);
       assert.deepEqual((task.agents ?? []).map((agent) => [agent.role, agent.status]), [
@@ -965,6 +1141,31 @@ describe("manager planning (auto tasks)", () => {
       assert.deepEqual(task.plan?.stages, ["document"]);
       assert.equal(task.plan?.fallback, true);
       assert.equal(task.result?.approved, true);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("plans from the request when the planner cannot be recovered", async () => {
+    const crash: Step = () => {
+      throw new Error("Session disconnected while waiting for a response");
+    };
+    const h = createHarness({
+      planner: [crash, crash, crash, crash],
+      writer: [steps((spec, prompt) => writeFile(designPathFrom(prompt), "# Guide\n")(spec, prompt), submitWork("Wrote the guide"))],
+      "doc-reviewer": [submitReview("approve")],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Write documentation for the CLI", kind: "auto", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(h.driver.specsFor("planner").length, 4, "the planner was restarted before the manager gave up on it");
+      assert.deepEqual(task.plan?.stages, ["document"]);
+      assert.equal(task.plan?.fallback, true);
+      assert.equal(task.agents?.find((agent) => agent.role === "planner")?.status, "failed");
+      const events = await h.store.readEvents(task.id);
+      assert.ok(events.some((event) => /The planner could not be recovered \(its session failed: Session disconnected/.test(event.text)));
     } finally {
       h.cleanup();
     }

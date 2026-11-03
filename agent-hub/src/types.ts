@@ -57,6 +57,8 @@ export interface Settings {
   documentDir: string;
   docFormat: DocFormat;
   turnTimeoutMinutes: number;
+  /** Minutes without any sign of activity after which the manager recovers a working agent (interrupt, then restart). */
+  stuckAgentMinutes: number;
   inputTimeoutMinutes: number;
   isolation: IsolationMode;
   /** Remove agent worktrees when a task completes (branches are always kept). */
@@ -239,7 +241,12 @@ export interface AgentInfo {
   assignment?: string;
   lastActivity?: string;
   lastMessage?: string;
+  /** Last sign of life (any session event, a new turn, an answer); the manager's monitor measures silence from it. */
   updatedAt?: string;
+  /** Hub best-practice skills the agent was asked to load: its role's plus those for the repository's technologies. */
+  skills?: string[];
+  /** How often the manager had to recover this agent (interrupted or restarted a stuck or failed turn). */
+  recoveries?: number;
   usage: Usage;
 }
 
@@ -261,6 +268,8 @@ export interface RepoContext {
   skillRoots: string[];
   validation: string[];
   stack: string[];
+  /** Hub best-practice skills for the detected technologies (given to agents that design, write, review or test code). */
+  techSkills?: string[];
   discoveredAt: string;
 }
 
@@ -270,6 +279,8 @@ export interface TaskPlan {
   rationale: string;
   /** The manager's assignment for each stage's agents (scope, acceptance criteria, commands to run). */
   instructions: Partial<Record<StageKind, string>>;
+  /** What the manager learned about the repository while planning; every sub-agent starts with it. */
+  briefing?: string;
   /** True when the planner never submitted a plan and the hub derived one from the request. */
   fallback?: boolean;
   plannedAt: string;
@@ -400,6 +411,7 @@ export type CommKind =
   | "verdict"
   | "nudge"
   | "monitor"
+  | "recover"
   | "question"
   | "answer"
   | "release";

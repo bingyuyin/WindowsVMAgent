@@ -2,8 +2,9 @@
 
 A local web service that runs **teams of sub-agents** on your repositories with the
 [GitHub Copilot SDK](https://docs.github.com/en/copilot/how-tos/copilot-sdk). A **manager agent** reads your
-request, decides which sub-agents to create, assigns their work and monitors them; the sub-agents iterate
-author ↔ reviewer (or execute ↔ fix) until the work is approved or the tests pass.
+request, decides which sub-agents to create, assigns their work and monitors them, and recovers agents that
+get stuck; the sub-agents iterate author ↔ reviewer (or execute ↔ fix) until the work is approved or the
+tests pass.
 
 | Task type | Sub-agents |
 | --- | --- |
@@ -16,11 +17,12 @@ author ↔ reviewer (or execute ↔ fix) until the work is approved or the tests
 
 Every sub-agent works on **its own branch** (reviewers and the test executor in their own worktree pinned
 to the commit under review/test), and every task has its own branches and worktrees, so **several tasks
-can run on the same repository at the same time** without touching your checkout. Agents use the
-repository's own guidance (instruction files, guides, CI pipelines, design docs, skills, build/test
-commands) and fall back to the hub's best-practice skills for coding, code review, test execution and
-fixing, system design and technical writing. Design and document deliverables are **light-themed HTML
-pages** with Mermaid diagrams, rendered in the UI.
+can run on the same repository at the same time** without touching your checkout. Every sub-agent starts
+with the repository's context already set up: its own guidance (instruction files, guides, CI pipelines,
+design docs, skills, build/test commands), the manager's briefing on the repository (Auto tasks), and the
+hub's best-practice skills for its role and for the technologies the repository uses (TypeScript/Node.js,
+.NET, Python, Go, Rust, Java/Kotlin, PowerShell, C/C++). Design and document deliverables are
+**light-themed HTML pages** with Mermaid diagrams, rendered in the UI.
 
 You sign in with GitHub in the browser, choose the LLMs, register repositories or folders, submit tasks,
 and watch each one live: which agent is working, what it is doing right now (planning, coding, reviewing,
@@ -56,7 +58,7 @@ npm start            # http://localhost:4600
 ```mermaid
 flowchart LR
   UI[Browser UI] -- REST + SSE --> API[HTTP API]
-  API --> Runner[Task runner = manager<br/>queue · parallel tasks · monitoring · resume]
+  API --> Runner[Task runner = manager<br/>queue · parallel tasks · monitoring · recovery · resume]
   Runner --> Ctx[Context discovery<br/>instructions · guides · CI · skills · build/test]
   Runner --> Engine[Workflow engine]
   Engine -- Auto tasks --> P[Planner<br/>read-only checkout]
@@ -73,16 +75,22 @@ flowchart LR
 
 0. **Plan** (Auto tasks): the manager's planner inspects the repository read-only and calls `submit_plan`
    with the stages to run (design, coding, testing, document; they always run in that order), its
-   rationale, and an assignment for each stage's team (scope, acceptance criteria, the exact test
-   commands). The hub creates the corresponding sub-agents and gives each its assignment. If the planner
-   does not submit a plan, the hub derives the stages from keywords in the request.
+   rationale, an assignment for each stage's team (scope, acceptance criteria, the exact test commands)
+   and a **briefing** on the repository (relevant modules and files, conventions, verified build/test
+   commands, pitfalls). The hub creates the corresponding sub-agents and gives each the briefing and its
+   assignment, so no agent has to rediscover the repository. If the planner does not submit a plan, the
+   hub derives the stages from keywords in the request.
 1. **Context**: at the task's base commit the hub looks for instruction files (`AGENTS.md`,
-   `.github/copilot-instructions.md`, `.github/instructions/*.instructions.md`, `CLAUDE.md`), guides
-   (`CONTRIBUTING.md`, `ARCHITECTURE.md`, `TESTING.md`, `README.md`, CI pipelines, …), design docs/ADRs,
-   repository skills (`.github/skills`, `.copilot/skills`, `.claude/skills`, `skills`) and build/test
-   commands (package scripts, .NET, Go, Rust, Python, Maven/Gradle, Makefile, Pester). Instruction files
-   are loaded by the runtime automatically; the rest is listed in each agent's first prompt, and
-   repository skills are passed to every agent. See the **Context** tab of a task.
+   `.github/copilot-instructions.md`, `.github/instructions/*.instructions.md`, `CLAUDE.md`, and
+   `AGENTS.md` files in subfolders), guides (`CONTRIBUTING.md`, `ARCHITECTURE.md`, `TESTING.md`,
+   `README.md`, CI pipelines, …), design docs/ADRs, repository skills (`.github/skills`,
+   `.copilot/skills`, `.claude/skills`, `skills`), the technologies in use and build/test commands
+   (package scripts, .NET, Go, Rust, Python, Maven/Gradle, CMake, Makefile, Pester). Root instruction
+   files are loaded by the runtime automatically; the rest is listed in each agent's first prompt (agents
+   are told to read folder-level instructions themselves), repository skills are passed to every agent,
+   and the agents that design, write, review or test code also get the hub's
+   [best-practice skill](#best-practice-skills) for each detected technology. See the **Context** tab of
+   a task.
 2. **Author turn**: the coder (round 1), the comment resolver (rounds with open code comments), the
    designer or the technical writer works on its own branch and finishes by calling the `submit_work`
    tool with a summary, the validation it ran, and a response (`addressed` or `declined` plus a note) for
@@ -113,7 +121,8 @@ fixer that starts fresh gets the request, the previous summary and the diff so f
 without calling its submit tool, the hub nudges it, and after two attempts derives the result from its
 last message (a test run without structured results counts as *blocked*, never as passed). If an agent
 asks a question (`ask_user`), the task shows **Needs your input**; answer in the UI, or after the
-configured timeout the agent proceeds on its own judgment.
+configured timeout the agent proceeds on its own judgment. Agents that get stuck are recovered by the
+manager (see [Monitoring and recovering stuck agents](#monitoring-and-recovering-stuck-agents)).
 
 ## Requesting changes after a task finishes
 
@@ -175,13 +184,36 @@ The **Agents** page shows the work from the agents' side, updated live over Serv
 - **Pipeline** mode: one row per task with its stage lanes (author → reviewer ↺ comment resolver;
   test executor ↺ test fixer), the current step highlighted and each round's outcome.
 - **Manager ↔ agents** feed: every message the manager exchanges — plans, session starts, assignments,
-  submissions, review requests, verdicts, test results, nudges, monitoring check-ins, questions/answers
-  and releases — filterable by task.
+  submissions, review requests, verdicts, test results, nudges, monitoring check-ins, recoveries,
+  questions/answers and releases — filterable by task.
 - **Sub-agents by role**: how many agents of each role are working, waiting or done, and which tasks
   each is handling.
 
-The manager also **monitors** its agents: every minute it checks each working agent and posts a
-check-in when one has been silent for 5 minutes (a turn still ends at the configured turn timeout).
+## Monitoring and recovering stuck agents
+
+The manager watches every working agent's **heartbeat**: any session event counts as a sign of life
+(streamed text and reasoning, tool calls, live shell output, its own sub-agents), as does the start of a
+turn or your answer to its question. Every minute it checks each working agent:
+
+- **Check-in**: after 5 minutes without a sign of life it posts a check-in to the feed.
+- **Stuck** (Settings → **Recover a stuck agent after**, default 15 minutes without a sign of life), a
+  turn that runs past the **agent turn timeout**, or a session that fails (for example a lost
+  connection) is recovered step by step:
+  1. **Interrupt and continue**: the manager aborts the stuck turn and tells the agent, in the same
+     session, what got stuck and to carry on without repeating it (timeouts, non-interactive flags, no
+     foreground servers or watchers, narrow a hanging run). The agent keeps its conversation and its work.
+  2. **Kill and restart**: if that does not help, or the session itself failed, the manager kills the
+     session and starts a fresh one for the same role with the **full assignment** (request, repository
+     context, briefing, round instructions) plus a note to build on the uncommitted changes the stuck
+     session left in the worktree. If the Copilot runtime itself stopped answering, the hub restarts the
+     runtime first.
+  3. **Give up**: after 3 recoveries in one turn the task fails with the reason; **Retry** resumes it from
+     the last completed step (uncommitted work in the author worktree is kept).
+
+  An agent that already submitted its result before it went quiet is not re-prompted; the workflow just
+  moves on. Recoveries appear in the feed (*recovery*), the task timeline and each agent card
+  ("recovered N×"). Agents are also told up front that they are monitored and to run commands
+  non-interactively and with timeouts, which prevents most hangs.
 
 ## Design and document deliverables (HTML)
 
@@ -256,8 +288,24 @@ repository instructions and skills always take precedence:
 | `technical-writing` | Technical writer |
 | `doc-review` | Doc reviewer |
 
-Each agent is asked to load its role's skills at the start; hub skills that don't belong to the role are
-disabled for its session. Edit the `SKILL.md` files to tune your team's standards.
+Technology skills apply to the agents that design, write, review or test code (designer, design reviewer,
+coder, comment resolver, code reviewer, test executor, test fixer), one per technology the hub detects
+in the repository:
+
+| Skill | Detected from |
+| --- | --- |
+| `typescript-best-practices` | `package.json`, `tsconfig.json` (TypeScript, JavaScript, Node.js) |
+| `dotnet-best-practices` | `*.sln`, `*.slnx`, `*.csproj`, `*.fsproj` |
+| `python-best-practices` | `pyproject.toml`, `setup.py`, `requirements.txt` |
+| `go-best-practices` | `go.mod` |
+| `rust-best-practices` | `Cargo.toml` |
+| `java-best-practices` | `pom.xml`, `build.gradle(.kts)` (Java, Kotlin) |
+| `powershell-best-practices` | `*.ps1`, `*.psm1`, `*.psd1` |
+| `cpp-best-practices` | `CMakeLists.txt`, `*.vcxproj` or `meson.build` with C/C++ sources |
+
+Each agent is asked to load its skills at the start; hub skills that don't apply to it are disabled for
+its session. The Context tab lists the technology skills and each agent card the skills it got. Edit the
+`SKILL.md` files to tune your team's standards.
 
 ## Sign-in options
 
@@ -304,7 +352,8 @@ Environment variables:
 Settings page: default manager, author, comment-resolver/test-fixer and reviewer/test-executor models,
 agent isolation (own branch per agent, or own worktree per agent), worktree cleanup on completion, pushing
 task branches when tasks complete (default on), max
-review rounds / test runs (default 3), parallel tasks (default and maximum 10; more tasks are queued; also adjustable live from the Tasks and Agents pages), agent turn timeout, question timeout,
+review rounds / test runs (default 3), parallel tasks (default and maximum 10; more tasks are queued; also adjustable live from the Tasks and Agents pages), agent turn timeout (default 90 minutes),
+how long an agent may go without a sign of life before the manager recovers it (default 15 minutes), question timeout,
 resuming interrupted tasks after a restart (default on), document format (HTML or Markdown) and the
 design (`docs/designs`) and document (`docs`) folders. The **Storage** section shows where each kind of
 data is saved.
@@ -361,7 +410,7 @@ Mutating requests must send `Content-Type: application/json`.
 ## Development
 
 ```powershell
-npm test             # node:test – workflow engine (scripted agents + real git), planning, test execution, concurrency, documents, manager log, storage, policy
+npm test             # node:test – workflow engine (scripted agents + real git), planning, test execution, concurrency, documents, manager log, stuck-agent recovery, skills, storage, policy
 npm run typecheck    # tsc for src and tests
 npm run dev          # restart on file changes
 ```
@@ -371,7 +420,7 @@ src/
   main.ts                 wiring and graceful shutdown
   copilot/service.ts      CopilotClient lifecycle, sign-in flows, model catalog
   agents/                 driver interface, Copilot SDK driver, prompts, submit tools, permission policy
-  workflow/               runner (manager: queue, workspaces, monitoring, resume), engine (planning + sub-agent loops), validation
+  workflow/               runner (manager: queue, workspaces, monitoring, resume), engine (planning, sub-agent loops, stuck-agent recovery), validation
   http/                   dependency-free router, SSE, API routes, sandboxed document viewer
   context.ts              repository context discovery and hub skills
   docs.ts                 HTML document templates, validation and viewer preparation

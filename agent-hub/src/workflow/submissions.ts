@@ -287,7 +287,13 @@ export function normalizePlan(input: unknown): PlanSubmissionInput {
     if (!text) throw new Error(`instructions.${stage} is required: write the assignment for the ${stage} agents (scope, acceptance criteria${stage === "testing" ? ", the commands or suites to run" : ""}).`);
     instructions[stage] = truncate(text, 4000);
   }
-  return { stages, rationale: truncate(rationale, 2000), instructions };
+  const briefing = typeof raw.briefing === "string" ? raw.briefing.trim() : "";
+  if (!briefing) {
+    throw new Error(
+      "`briefing` is required: tell the sub-agents what you learned about the repository (relevant modules/files, conventions, how to build and test, pitfalls).",
+    );
+  }
+  return { stages, rationale: truncate(rationale, 2000), instructions, briefing: truncate(briefing, 6000) };
 }
 
 /** Plan derived from keywords in the request, used when the planner never submits one. */

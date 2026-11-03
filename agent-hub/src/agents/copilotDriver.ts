@@ -2,8 +2,8 @@ import path from "node:path";
 import type { SessionEvent } from "@github/copilot-sdk";
 import type { CopilotService } from "../copilot/service.ts";
 import { ROLE_LABELS } from "../types.ts";
-import { firstLine, randomId, truncate } from "../util.ts";
-import type { AgentDriver, AgentHandle, AgentObserver, AgentSpec } from "./driver.ts";
+import { errorMessage, firstLine, randomId, truncate } from "../util.ts";
+import { TurnTimeoutError, type AgentDriver, type AgentHandle, type AgentObserver, type AgentSpec } from "./driver.ts";
 import { createPermissionPolicy } from "./policy.ts";
 import { buildSubmitTool } from "./tools.ts";
 
@@ -56,8 +56,14 @@ export class CopilotAgentDriver implements AgentDriver {
     return {
       sessionId,
       async send(prompt: string) {
-        const message = await session.sendAndWait({ prompt }, spec.turnTimeoutMs);
-        return { lastMessage: message?.data.content };
+        try {
+          const message = await session.sendAndWait({ prompt }, spec.turnTimeoutMs);
+          return { lastMessage: message?.data.content };
+        } catch (error) {
+          // sendAndWait stops waiting at the timeout but leaves the turn running in the session.
+          if (/^Timeout after \d+ms waiting/.test(errorMessage(error))) throw new TurnTimeoutError(spec.turnTimeoutMs);
+          throw error;
+        }
       },
       async abort() {
         await session.abort().catch(() => undefined);
@@ -70,6 +76,7 @@ export class CopilotAgentDriver implements AgentDriver {
 }
 
 function forwardEvent(event: SessionEvent, observer: AgentObserver, toolNames: Map<string, string>, cwd: string): void {
+  observer.onHeartbeat();
   const subAgent = Boolean((event as { agentId?: string }).agentId);
   switch (event.type) {
     case "assistant.message_delta":
