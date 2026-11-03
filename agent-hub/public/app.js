@@ -1,6 +1,7 @@
 import { get } from "./lib/api.js";
 import { clear, h, setContent, spinner } from "./lib/dom.js";
-import { needsModels, notify, state, subscribe } from "./lib/store.js";
+import { mergeComm, needsModels, notify, state, subscribe } from "./lib/store.js";
+import { agentsView } from "./views/agents.js";
 import { loginView } from "./views/login.js";
 import { modelsView, resetModelsCache } from "./views/models.js";
 import { newTaskView } from "./views/newTask.js";
@@ -19,6 +20,7 @@ const ROUTES = [
   { pattern: /^#\/tasks\/new$/, view: newTaskView, nav: "tasks" },
   { pattern: /^#\/tasks\/([\w-]+)$/, view: taskDetailView, nav: "tasks" },
   { pattern: /^#\/tasks$/, view: tasksView, nav: "tasks" },
+  { pattern: /^#\/agents$/, view: agentsView, nav: "agents", wide: true },
   { pattern: /^#\/repos$/, view: reposView, nav: "repos" },
   { pattern: /^#\/settings$/, view: settingsView, nav: "settings" },
 ];
@@ -43,6 +45,7 @@ function route() {
   if (!match) return location.replace("#/tasks");
   for (const link of nav.querySelectorAll("a")) link.classList.toggle("active", link.dataset.nav === match.candidate.nav);
   nav.hidden = !auth.authenticated;
+  app.classList.toggle("container-wide", Boolean(match.candidate.wide));
   show(hash, () => match.candidate.view(app, { params: match.result.slice(1) }));
 }
 
@@ -75,11 +78,16 @@ function renderAccount() {
 }
 
 async function refreshData() {
-  const [tasks, repos] = await Promise.all([get("/api/tasks"), get("/api/repos")]);
+  const [tasks, repos, overview] = await Promise.all([get("/api/tasks"), get("/api/repos"), get("/api/agents/overview?limit=400")]);
   state.tasks = new Map(tasks.map((task) => [task.id, task]));
   state.repos = repos;
+  state.comm = [];
+  mergeComm(overview.comm);
+  state.manager = { monitorIntervalSec: overview.monitorIntervalSec, lastCheckAt: overview.lastCheckAt, startedAt: overview.startedAt };
   notify("tasks");
   notify("repos");
+  notify("comm");
+  notify("manager");
 }
 
 function connect() {
@@ -124,11 +132,19 @@ function connect() {
         break;
       case "task-removed":
         state.tasks.delete(data.id);
+        state.comm = state.comm.filter((entry) => entry.taskId !== data.id);
         notify("tasks");
         break;
       case "repos":
         state.repos = data.repos;
         notify("repos");
+        break;
+      case "comm":
+        if (mergeComm([data.entry]).length) notify("comm", data.entry);
+        break;
+      case "manager":
+        state.manager = { ...state.manager, lastCheckAt: data.lastCheckAt };
+        notify("manager");
         break;
     }
   };

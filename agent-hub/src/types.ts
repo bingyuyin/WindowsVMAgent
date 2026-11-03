@@ -1,13 +1,15 @@
-export type TaskKind = "coding" | "design" | "design-coding";
+export type TaskKind = "coding" | "design" | "document" | "design-coding";
 export type TaskStatus = "queued" | "running" | "needs-input" | "completed" | "failed" | "cancelled" | "interrupted";
-export type StageKind = "design" | "coding";
-export type AgentRole = "designer" | "design-reviewer" | "coder" | "resolver" | "code-reviewer";
+export type StageKind = "design" | "document" | "coding";
+export type AgentRole = "designer" | "design-reviewer" | "writer" | "doc-reviewer" | "coder" | "resolver" | "code-reviewer";
 export type Phase = "queued" | "preparing" | "authoring" | "reviewing" | "revising" | "finalizing" | "done";
 export type Severity = "blocker" | "major" | "minor" | "nit";
 export type Verdict = "approve" | "request_changes";
 export type CommentStatus = "open" | "addressed" | "declined";
 export type StageStatus = "pending" | "running" | "approved" | "not-approved" | "failed" | "cancelled";
 export type AgentStatus = "idle" | "working" | "done" | "failed" | "cancelled";
+/** File format of design/document deliverables. HTML documents are light-themed and can embed Mermaid diagrams. */
+export type DocFormat = "html" | "markdown";
 /**
  * Workspace isolation inside a task. "branch": author agents share one author worktree but each
  * works on its own branch (dependencies/build output are reused); reviewers use a separate
@@ -15,9 +17,10 @@ export type AgentStatus = "idle" | "working" | "done" | "failed" | "cancelled";
  */
 export type IsolationMode = "branch" | "worktree";
 
-export const TASK_KINDS: readonly TaskKind[] = ["coding", "design", "design-coding"];
+export const TASK_KINDS: readonly TaskKind[] = ["coding", "design", "document", "design-coding"];
 export const SEVERITIES: readonly Severity[] = ["blocker", "major", "minor", "nit"];
 export const ISOLATION_MODES: readonly IsolationMode[] = ["branch", "worktree"];
+export const DOC_FORMATS: readonly DocFormat[] = ["html", "markdown"];
 
 export interface Settings {
   authorModel: string | null;
@@ -27,11 +30,16 @@ export interface Settings {
   maxRounds: number;
   maxConcurrency: number;
   designDocDir: string;
+  /** Folder for Document tasks' deliverables, relative to the repository root. */
+  documentDir: string;
+  docFormat: DocFormat;
   turnTimeoutMinutes: number;
   inputTimeoutMinutes: number;
   isolation: IsolationMode;
   /** Remove agent worktrees when a task completes (branches are always kept). */
   cleanupWorktrees: boolean;
+  /** Re-queue tasks that were running when the hub stopped, once it is signed in again. */
+  resumeInterruptedTasks: boolean;
 }
 
 export interface Repo {
@@ -100,6 +108,7 @@ export interface Stage {
   status: StageStatus;
   rounds: Round[];
   docPath?: string;
+  docFormat?: DocFormat;
   nextCommentNumber: number;
   startedAt?: string;
   finishedAt?: string;
@@ -128,6 +137,9 @@ export interface TaskResult {
   shortStat?: string;
   commits?: number;
   designDocPath?: string;
+  /** Deliverable document of the task's document stage (design doc or documentation). */
+  docPath?: string;
+  docFormat?: DocFormat;
   openComments: number;
 }
 
@@ -226,6 +238,8 @@ export interface Task {
   attempt: number;
   /** Review rounds allowed for the current attempt (set on continue/retry). */
   roundsBudget?: number;
+  /** Consecutive automatic resumes after hub restarts (reset when the task finishes). */
+  autoResumes?: number;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
@@ -261,32 +275,71 @@ export interface TaskEvent {
 
 export type NewTaskEvent = Omit<TaskEvent, "seq" | "ts">;
 
+/** Kind of message in the manager's communication log with its sub-agents and the user. */
+export type CommKind =
+  | "lifecycle"
+  | "spawn"
+  | "assign"
+  | "submit"
+  | "relay"
+  | "verdict"
+  | "nudge"
+  | "monitor"
+  | "question"
+  | "answer"
+  | "release";
+
+/** A participant in manager communication: the manager itself, the user, or a sub-agent role. */
+export type CommParty = AgentRole | "manager" | "user";
+
+export interface CommEntry {
+  seq: number;
+  ts: string;
+  taskId: string;
+  taskTitle: string;
+  from: CommParty;
+  to: CommParty;
+  kind: CommKind;
+  text: string;
+  stage?: StageKind;
+  round?: number;
+}
+
+export type NewCommEntry = Omit<CommEntry, "seq" | "ts" | "taskId" | "taskTitle">;
+
 export function stagesFor(kind: TaskKind): StageKind[] {
   switch (kind) {
     case "coding":
       return ["coding"];
     case "design":
       return ["design"];
+    case "document":
+      return ["document"];
     case "design-coding":
       return ["design", "coding"];
   }
 }
 
-export function authorRoleFor(stage: StageKind): AgentRole {
-  return stage === "design" ? "designer" : "coder";
+/** Stages whose deliverable is a document (design doc or other documentation) rather than code. */
+export function isDocStage(kind: StageKind): boolean {
+  return kind === "design" || kind === "document";
 }
 
-/** Agent that addresses review comments: a dedicated resolver for code, the designer for designs. */
+export function authorRoleFor(stage: StageKind): AgentRole {
+  return stage === "design" ? "designer" : stage === "document" ? "writer" : "coder";
+}
+
+/** Agent that addresses review comments: a dedicated resolver for code, the document's author otherwise. */
 export function resolverRoleFor(stage: StageKind): AgentRole {
-  return stage === "design" ? "designer" : "resolver";
+  return stage === "coding" ? "resolver" : authorRoleFor(stage);
 }
 
 export function reviewerRoleFor(stage: StageKind): AgentRole {
-  return stage === "design" ? "design-reviewer" : "code-reviewer";
+  return stage === "design" ? "design-reviewer" : stage === "document" ? "doc-reviewer" : "code-reviewer";
 }
 
 export function isReviewerRole(role: AgentRole): boolean {
-  return role === "design-reviewer" || role === "code-reviewer";
+  return role === "design-reviewer" || role === "code-reviewer" || role === "doc-reviewer";
 }
 
 /** Sub-agents a task of the given kind uses, in workflow order. */
@@ -303,6 +356,8 @@ export function rolesFor(kind: TaskKind): AgentRole[] {
 export const ROLE_LABELS: Record<AgentRole, string> = {
   designer: "Designer",
   "design-reviewer": "Design reviewer",
+  writer: "Technical writer",
+  "doc-reviewer": "Doc reviewer",
   coder: "Coder",
   resolver: "Comment resolver",
   "code-reviewer": "Code reviewer",

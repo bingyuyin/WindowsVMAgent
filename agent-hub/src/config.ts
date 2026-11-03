@@ -8,6 +8,10 @@ export interface AppConfig {
   publicDir: string;
   /** Best-practice skills bundled with the hub (fallback when a repository has no guidance). */
   skillsDir: string;
+  /** Light-themed HTML templates for design and document deliverables. */
+  templatesDir: string;
+  /** Browser bundles served from node_modules (URL path -> file). */
+  vendorFiles: Record<string, string>;
   dataDir: string;
   worktreesDir: string;
   reposDir: string;
@@ -32,6 +36,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     projectRoot,
     publicDir: path.join(projectRoot, "public"),
     skillsDir: path.join(projectRoot, "skills"),
+    templatesDir: path.join(projectRoot, "templates"),
+    vendorFiles: { "/vendor/mermaid.min.js": path.join(projectRoot, "node_modules", "mermaid", "dist", "mermaid.min.js") },
     dataDir,
     worktreesDir: path.join(dataDir, "worktrees"),
     reposDir: path.join(dataDir, "repos"),

@@ -87,6 +87,8 @@ export interface ServerOptions {
   port: number;
   publicDir: string;
   router: Router;
+  /** Extra static files outside `publicDir` (URL path -> absolute file), e.g. vendored browser bundles. */
+  vendor?: Record<string, string>;
 }
 
 export function createHttpServer(options: ServerOptions): http.Server {
@@ -127,7 +129,9 @@ export function createHttpServer(options: ServerOptions): http.Server {
 
     const url = new URL(req.url ?? "/", `http://${host}`);
     if (!url.pathname.startsWith("/api/")) {
-      serveStatic(options.publicDir, url.pathname, method, res);
+      const vendorFile = options.vendor?.[url.pathname];
+      if (vendorFile) serveFile(vendorFile, method, res, "public, max-age=86400");
+      else serveStatic(options.publicDir, url.pathname, method, res);
       return;
     }
 
@@ -193,13 +197,25 @@ function serveStatic(publicDir: string, pathname: string, method: string, res: h
   if (relative === "/" || !path.extname(relative)) relative = "/index.html";
   const file = path.resolve(publicDir, `.${relative}`);
   const rel = path.relative(publicDir, file);
-  if (rel.startsWith("..") || path.isAbsolute(rel) || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    sendJson(res, 404, { error: "Not found" });
+    return;
+  }
+  serveFile(file, method, res, "no-cache");
+}
+
+function serveFile(file: string, method: string, res: http.ServerResponse, cacheControl: string): void {
+  if (method !== "GET" && method !== "HEAD") {
+    sendJson(res, 405, { error: "Method not allowed" });
+    return;
+  }
+  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
     sendJson(res, 404, { error: "Not found" });
     return;
   }
   res.writeHead(200, {
     "Content-Type": MIME[path.extname(file).toLowerCase()] ?? "application/octet-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": cacheControl,
   });
   if (method === "HEAD") {
     res.end();

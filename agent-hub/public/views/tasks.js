@@ -64,7 +64,7 @@ export function tasksView(root) {
         "div",
         {},
         h("h1", {}, "Tasks"),
-        h("p", { class: "muted" }, "Coding tasks run a coder, a code reviewer and a comment resolver; design tasks run a designer and a design reviewer. Each agent works on its own branch."),
+        h("p", { class: "muted" }, "Coding tasks run a coder, a code reviewer and a comment resolver; design tasks a designer and a design reviewer; document tasks a technical writer and a doc reviewer. Each agent works on its own branch."),
       ),
       h("a", { class: "btn btn-primary", href: "#/tasks/new" }, "+ New task"),
     ),

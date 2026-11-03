@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+  :root {
+    --bg: #f5f7fb; --paper: #ffffff; --ink: #1f2937; --muted: #64748b; --line: #e2e8f0; --soft: #f8fafc;
+    --blue: #2563eb; --blue-soft: #eaf1ff; --green: #15803d; --green-soft: #e8f7ee; --amber: #b45309; --amber-soft: #fff6e5;
+    --red: #b91c1c; --red-soft: #fdecec; --violet: #6d28d9; --violet-soft: #f2edff; --teal: #0f766e; --teal-soft: #e6f6f4;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.65 "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
+  .doc { max-width: 1000px; margin: 28px auto; padding: 40px 52px 32px; background: var(--paper); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 8px 24px rgba(15, 23, 42, .05); }
+  .doc-header { padding-bottom: 18px; margin-bottom: 8px; border-bottom: 1px solid var(--line); }
+  .eyebrow { margin: 0; color: var(--blue); font-size: 12px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
+  h1 { margin: 6px 0 10px; font-size: 30px; line-height: 1.25; letter-spacing: -.01em; }
+  h2 { margin: 38px 0 12px; padding-bottom: 6px; font-size: 21px; border-bottom: 2px solid var(--blue-soft); }
+  h3 { margin: 26px 0 8px; font-size: 17px; }
+  h4 { margin: 0 0 6px; font-size: 15px; }
+  p, ul, ol { margin: 10px 0; }
+  li { margin: 4px 0; }
+  a { color: var(--blue); }
+  .meta { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--muted); font-size: 13px; }
+  .lead { font-size: 16.5px; color: #334155; }
+  .muted { color: var(--muted); }
+  .badge { display: inline-block; padding: 1px 10px; border-radius: 999px; background: var(--blue-soft); color: var(--blue); font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .badge.green { background: var(--green-soft); color: var(--green); }
+  .badge.amber { background: var(--amber-soft); color: var(--amber); }
+  .badge.red { background: var(--red-soft); color: var(--red); }
+  .badge.violet { background: var(--violet-soft); color: var(--violet); }
+  .badge.gray { background: #eef2f6; color: #475569; }
+  .callout { margin: 16px 0; padding: 12px 16px; border-left: 4px solid var(--blue); border-radius: 8px; background: var(--blue-soft); }
+  .callout > :first-child { margin-top: 0; }
+  .callout > :last-child { margin-bottom: 0; }
+  .callout.tip { border-color: var(--green); background: var(--green-soft); }
+  .callout.warn { border-color: var(--amber); background: var(--amber-soft); }
+  .callout.risk { border-color: var(--red); background: var(--red-soft); }
+  .callout.decision { border-color: var(--violet); background: var(--violet-soft); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin: 16px 0; }
+  .card { padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); }
+  .card.blue { background: var(--blue-soft); border-color: #cfdcfb; }
+  .card.green { background: var(--green-soft); border-color: #c9ead5; }
+  .card.amber { background: var(--amber-soft); border-color: #f5dfb5; }
+  .card.violet { background: var(--violet-soft); border-color: #ddd0fb; }
+  .card > :last-child { margin-bottom: 0; }
+  .pros-cons { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 16px 0; }
+  .pros-cons > div { padding: 12px 16px; border-radius: 12px; }
+  .pros-cons .pros { background: var(--green-soft); }
+  .pros-cons .cons { background: var(--red-soft); }
+  table { width: 100%; margin: 16px 0; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 8px 11px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { background: #f1f5fb; font-weight: 600; }
+  tbody tr:nth-child(even) td { background: var(--soft); }
+  code { padding: 1px 5px; border-radius: 4px; background: #f1f4f9; font: 13px/1.5 "Cascadia Code", Consolas, "SFMono-Regular", Menlo, monospace; }
+  pre { overflow: auto; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: #f7f9fc; }
+  pre code { padding: 0; background: none; }
+  figure.diagram { margin: 18px 0; padding: 16px; overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; background: #fbfcff; text-align: center; }
+  figure.diagram figcaption { margin-top: 8px; color: var(--muted); font-size: 13px; }
+  pre.mermaid { margin: 0; padding: 0; border: 0; background: transparent; text-align: center; }
+  ol.steps { padding-left: 0; list-style: none; counter-reset: step; }
+  ol.steps > li { position: relative; margin: 10px 0; padding-left: 42px; }
+  ol.steps > li::before { position: absolute; top: 1px; left: 0; width: 28px; height: 28px; border-radius: 50%; background: var(--blue-soft); color: var(--blue); font-weight: 700; line-height: 28px; text-align: center; counter-increment: step; content: counter(step); }
+  dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; }
+  dl.facts dt { color: var(--muted); }
+  dl.facts dd { margin: 0; }
+  .doc-footer { margin-top: 40px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+  @media (max-width: 720px) { .doc { margin: 0; padding: 24px 18px; border-radius: 0; } .pros-cons { grid-template-columns: 1fr; } }
+  @media print { body { background: #fff; } .doc { margin: 0; border: 0; box-shadow: none; } }
+</style>
+</head>
+<body>
+<!--
+  Authoring guide (keep this file self-contained and light-themed):
+  - Replace every element that has a data-placeholder attribute with real content and remove the attribute.
+    The request decides scope and length: delete sections it does not need; add sections when needed.
+  - Components: .callout (+ .tip .warn .risk .decision), .cards > .card (+ .blue .green .amber .violet),
+    .badge (+ .green .amber .red .violet .gray), .pros-cons > .pros/.cons, ol.steps, dl.facts, tables.
+  - Diagrams: <figure class="diagram"><pre class="mermaid">flowchart LR ...</pre><figcaption>...</figcaption></figure>
+    (flowchart, sequenceDiagram, classDiagram, erDiagram, stateDiagram-v2, gantt). Write "<" as &lt; inside diagrams.
+  - Do not add external stylesheets, fonts, images or scripts. Keep the Mermaid loader script at the end
+    (data-hub-mermaid): it renders diagrams when this file is opened directly.
+-->
+<main class="doc">
+  <header class="doc-header">
+    <p class="eyebrow">{{EYEBROW}}</p>
+    <h1>{{TITLE}}</h1>
+    <div class="meta">
+      <span><span class="badge amber">Draft</span></span>
+      <span>Task {{TASK_ID}}</span>
+      <span>Repository: {{REPO}}</span>
+      <span>{{DATE}}</span>
+    </div>
+  </header>
+{{BODY}}
+  <footer class="doc-footer">Prepared with Copilot Agent Hub &middot; {{AUTHOR}} agent, reviewed by the {{REVIEWER}} agent &middot; task {{TASK_ID}}</footer>
+</main>
+<script type="module" data-hub-mermaid>
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@12/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: true, theme: "base", themeVariables: { primaryColor: "#eaf1ff", primaryBorderColor: "#93b4f5", primaryTextColor: "#1f2937", lineColor: "#64748b", secondaryColor: "#e8f7ee", tertiaryColor: "#fff6e5", fontFamily: "Segoe UI, system-ui, sans-serif" } });
+</script>
+</body>
+</html>

@@ -17,7 +17,7 @@ const GUIDE_PATTERNS = [
   /^(\.github\/)?SECURITY\.md$/i,
   /^README\.md$/i,
 ];
-const DESIGN_DOCS = /^(docs\/)?(design|designs|adr|adrs|rfc|rfcs|decisions|architecture|specs?)\/.+\.md$/i;
+const DESIGN_DOCS = /^(docs\/)?(design|designs|adr|adrs|rfc|rfcs|decisions|architecture|specs?)\/.+\.(md|html?)$/i;
 const SKILL_ROOTS = [".github/skills", ".copilot/skills", ".claude/skills", "skills"];
 const MAX_LISTED = 25;
 
@@ -25,6 +25,8 @@ const MAX_LISTED = 25;
 export const ROLE_SKILLS: Record<AgentRole, string[]> = {
   designer: ["system-design"],
   "design-reviewer": ["design-review"],
+  writer: ["technical-writing"],
+  "doc-reviewer": ["doc-review"],
   coder: ["coding-best-practices"],
   resolver: ["review-comment-resolution", "coding-best-practices"],
   "code-reviewer": ["code-review"],

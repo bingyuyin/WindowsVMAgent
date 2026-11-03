@@ -211,6 +211,7 @@ export interface AgentWorkspace {
   commitAll(subject: string, body?: string): Promise<string | null>;
   readFile(relativePath: string): Promise<string | null>;
   ensureDir(relativeDir: string): Promise<void>;
+  writeFile(relativePath: string, content: string): Promise<void>;
 }
 
 /** Git state of one task: the task branch plus each sub-agent's own branch and worktree. */
@@ -423,6 +424,13 @@ export class GitAgentWorkspace implements AgentWorkspace {
     const full = path.resolve(this.path, relativeDir);
     if (!isInside(this.path, full)) throw new Error(`Directory is outside the worktree: ${relativeDir}`);
     await fsp.mkdir(full, { recursive: true });
+  }
+
+  async writeFile(relativePath: string, content: string): Promise<void> {
+    const full = path.resolve(this.path, relativePath);
+    if (!isInside(this.path, full)) throw new Error(`File is outside the worktree: ${relativePath}`);
+    await fsp.mkdir(path.dirname(full), { recursive: true });
+    await fsp.writeFile(full, content, "utf8");
   }
 }
 

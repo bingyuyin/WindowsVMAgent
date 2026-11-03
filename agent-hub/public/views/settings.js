@@ -1,10 +1,11 @@
-import { post, put } from "../lib/api.js";
-import { confirmDialog, h, setContent, spinner, toast } from "../lib/dom.js";
+import { get, post, put } from "../lib/api.js";
+import { confirmDialog, copyButton, h, setContent, spinner, toast } from "../lib/dom.js";
 import { notify, state, subscribe } from "../lib/store.js";
 import { loadModels, modelOptions, resetModelsCache } from "./models.js";
 
 export function settingsView(root) {
   const account = h("div", { class: "card" });
+  const storage = h("div", { class: "card" }, spinner("Loading…"));
   const authorSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const reviewerSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const resolverSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
@@ -16,9 +17,17 @@ export function settingsView(root) {
     h("option", { value: "worktree", selected: settings.isolation === "worktree" }, "Own worktree and branch per agent (most isolation, more disk)"),
   );
   const cleanup = h("input", { type: "checkbox", checked: settings.cleanupWorktrees ?? true });
+  const resume = h("input", { type: "checkbox", checked: settings.resumeInterruptedTasks ?? true });
   const rounds = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(settings.maxRounds ?? 3) });
   const concurrency = h("input", { class: "input", type: "number", min: "1", max: "8", value: String(settings.maxConcurrency ?? 2) });
+  const docFormat = h(
+    "select",
+    { class: "input" },
+    h("option", { value: "html", selected: (settings.docFormat ?? "html") === "html" }, "HTML – light-themed page with diagrams (recommended)"),
+    h("option", { value: "markdown", selected: settings.docFormat === "markdown" }, "Markdown"),
+  );
   const docDir = h("input", { class: "input", type: "text", value: settings.designDocDir ?? "docs/designs", spellcheck: "false" });
+  const documentDir = h("input", { class: "input", type: "text", value: settings.documentDir ?? "docs", spellcheck: "false" });
   const turnTimeout = h("input", { class: "input", type: "number", min: "5", max: "600", value: String(settings.turnTimeoutMinutes ?? 90) });
   const inputTimeout = h("input", { class: "input", type: "number", min: "1", max: "1440", value: String(settings.inputTimeoutMinutes ?? 30) });
   const saveButton = h("button", { class: "btn btn-primary", type: "submit" }, "Save settings");
@@ -37,9 +46,9 @@ export function settingsView(root) {
       h(
         "div",
         { class: "grid-3" },
-        field("Author model (designer, coder)", authorSelect),
+        field("Author model (designer, writer, coder)", authorSelect),
         field("Comment resolver model", resolverSelect, "Resolves code review comments; defaults to the author model."),
-        field("Reviewer model (design and code reviewers)", reviewerSelect, "A different model for reviews gives a second opinion."),
+        field("Reviewer model (all reviewers)", reviewerSelect, "A different model for reviews gives a second opinion."),
       ),
       h("h2", { class: "section-title" }, "Workspaces"),
       h(
@@ -60,13 +69,49 @@ export function settingsView(root) {
         { class: "grid-3" },
         field("Max review rounds", rounds, "Default per task: author/review iterations before stopping."),
         field("Parallel tasks", concurrency, "How many tasks run at the same time."),
-        field("Design document folder", docDir, "Relative to the repository root."),
         field("Agent turn timeout (minutes)", turnTimeout, "Fails a turn that runs longer than this."),
         field("Question timeout (minutes)", inputTimeout, "When an agent asks you something and you don't answer in time, it proceeds on its own."),
+        h(
+          "label",
+          { class: "field" },
+          h("span", { class: "field-label" }, "After a restart"),
+          h("span", { class: "row small" }, resume, "Resume tasks that were running when the hub stopped"),
+          h("small", { class: "muted" }, "They continue from their last completed step once the hub is signed in."),
+        ),
+      ),
+      h("h2", { class: "section-title" }, "Documents"),
+      h(
+        "div",
+        { class: "grid-3" },
+        field("Format for design and document tasks", docFormat, "HTML documents start from the hub's light-themed template and render Mermaid diagrams."),
+        field("Design document folder", docDir, "Relative to the repository root."),
+        field("Document folder", documentDir, "Where Document tasks write, relative to the repository root."),
       ),
       h("div", { class: "row end" }, saveButton),
     ),
+    h("h2", { class: "section-title" }, "Storage"),
+    storage,
   );
+
+  async function renderStorage() {
+    try {
+      const info = await get("/api/storage");
+      setContent(
+        storage,
+        h("p", { class: "muted small" }, `Everything the hub knows is saved on this machine under ${info.dataDir}: ${info.repos} repositories, ${info.tasks} tasks and ${info.commEntries} manager messages. Tasks keep their last state across restarts.`),
+        h(
+          "dl",
+          { class: "storage-list" },
+          info.files.map((file) => [
+            h("dt", {}, file.label),
+            h("dd", {}, h("span", { class: "mono small break" }, file.path), " ", copyButton(file.path), h("div", { class: "muted small" }, file.description)),
+          ]),
+        ),
+      );
+    } catch (error) {
+      setContent(storage, h("div", { class: "callout callout-danger" }, error.message));
+    }
+  }
 
   function renderAccount() {
     const auth = state.auth ?? {};
@@ -111,9 +156,12 @@ export function settingsView(root) {
         resolverModel: resolverSelect.value || null,
         isolation: isolation.value,
         cleanupWorktrees: cleanup.checked,
+        resumeInterruptedTasks: resume.checked,
         maxRounds: Number(rounds.value),
         maxConcurrency: Number(concurrency.value),
+        docFormat: docFormat.value,
         designDocDir: docDir.value,
+        documentDir: documentDir.value,
         turnTimeoutMinutes: Number(turnTimeout.value),
         inputTimeoutMinutes: Number(inputTimeout.value),
       });
@@ -145,6 +193,7 @@ export function settingsView(root) {
   }
 
   renderAccount();
+  renderStorage();
   fillModels(false);
   return subscribe((kind) => kind === "auth" && renderAccount());
 }

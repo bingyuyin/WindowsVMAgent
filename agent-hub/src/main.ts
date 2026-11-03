@@ -5,6 +5,7 @@ import { Bus } from "./bus.ts";
 import { loadConfig } from "./config.ts";
 import { loadHubSkills } from "./context.ts";
 import { CopilotService } from "./copilot/service.ts";
+import { loadDocTemplates } from "./docs.ts";
 import { createApiRouter } from "./http/api.ts";
 import { createHttpServer } from "./http/server.ts";
 import { RepoService } from "./repos.ts";
@@ -23,6 +24,11 @@ const copilot = new CopilotService({
   workingDirectory: config.dataDir,
   logLevel: config.runtimeLogLevel,
 });
+const docTemplates = loadDocTemplates(config.templatesDir);
+if (!docTemplates) console.warn(`[hub] No document templates found in ${config.templatesDir}; HTML documents start from scratch.`);
+for (const [route, file] of Object.entries(config.vendorFiles)) {
+  if (!fs.existsSync(file)) console.warn(`[hub] ${file} is missing (run npm install); ${route} will not be served.`);
+}
 const runner = new TaskRunner({
   store,
   bus,
@@ -30,6 +36,7 @@ const runner = new TaskRunner({
   driver: new CopilotAgentDriver(copilot),
   worktreesDir: config.worktreesDir,
   hubSkills: loadHubSkills(config.skillsDir),
+  docTemplates,
 });
 const repos = new RepoService(store, bus, config.reposDir);
 runner.init();
@@ -44,6 +51,7 @@ const server = createHttpServer({
   port: config.port,
   publicDir: config.publicDir,
   router: createApiRouter({ store, bus, copilot, runner, repos, version }),
+  vendor: config.vendorFiles,
 });
 
 server.on("error", (error) => {

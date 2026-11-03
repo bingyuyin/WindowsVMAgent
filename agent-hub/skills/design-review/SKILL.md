@@ -19,6 +19,10 @@ and constraints exist and are described accurately.
 - **Risks** - failure modes, migration and backward compatibility, rollback.
 - **Testability** - the testing plan covers the risky parts.
 - **Actionability** - the implementation plan is ordered and specific enough to execute.
+- **Presentation** (HTML designs) - no leftover template placeholders (`data-placeholder`), summary
+  first, diagrams for architecture and flows with valid Mermaid syntax, tables for comparisons; no
+  external resources besides the template's Mermaid loader (`<script data-hub-mermaid>`), which is
+  expected and must stay. Do not nitpick styling.
 
 ## Severity
 - **blocker** - wrong, unsafe or infeasible; contradicts the request or the codebase.

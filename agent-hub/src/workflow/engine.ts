@@ -18,9 +18,11 @@ import {
   type DesignContext,
 } from "../agents/prompts.ts";
 import { ROLE_SKILLS, type HubSkills } from "../context.ts";
+import { DOC_EXTENSIONS, documentProblem, formatOfPath, renderDocTemplate, type DocTemplates } from "../docs.ts";
 import type { AgentWorkspace, TaskWorkspace } from "../git.ts";
 import {
   authorRoleFor,
+  isDocStage,
   isReviewerRole,
   resolverRoleFor,
   reviewerRoleFor,
@@ -30,6 +32,7 @@ import {
   type AgentRole,
   type AgentStatus,
   type AuthorSubmission,
+  type NewCommEntry,
   type NewTaskEvent,
   type Phase,
   type ReviewComment,
@@ -55,14 +58,17 @@ export interface EngineHooks {
   trackSession(role: AgentRole, sessionId: string): void;
   /** Mutates the live state of a sub-agent (created on first use) and publishes it. */
   agent(role: AgentRole, mutate: (agent: AgentInfo) => void): void;
+  /** Records a message between the manager and a sub-agent (assignments, submissions, verdicts...). */
+  comm(entry: NewCommEntry): void;
 }
 
 export interface EngineOptions {
   driver: AgentDriver;
   workspace: TaskWorkspace;
-  settings: Pick<Settings, "designDocDir" | "turnTimeoutMinutes" | "cleanupWorktrees">;
+  settings: Pick<Settings, "designDocDir" | "documentDir" | "docFormat" | "turnTimeoutMinutes" | "cleanupWorktrees">;
   hooks: EngineHooks;
   hubSkills?: HubSkills;
+  docTemplates?: DocTemplates | null;
 }
 
 interface ActiveAgent {
@@ -73,8 +79,9 @@ interface ActiveAgent {
 const MAX_SUBMIT_NUDGES = 2;
 const MAX_ROUND_DIFF_BYTES = 60_000;
 const CO_AUTHOR = "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>";
+const COMMENT_PREFIX: Record<StageKind, string> = { design: "D", document: "W", coding: "C" };
 
-export const STAGE_LABELS: Record<StageKind, string> = { design: "Design", coding: "Coding" };
+export const STAGE_LABELS: Record<StageKind, string> = { design: "Design", document: "Document", coding: "Coding" };
 
 export function modelFor(task: Pick<Task, "authorModel" | "reviewerModel" | "resolverModel">, role: AgentRole): string {
   if (isReviewerRole(role)) return task.reviewerModel;
@@ -96,6 +103,8 @@ export class WorkflowEngine {
   private pendingReview: ReviewSubmissionInput | null = null;
   private expectedCommentIds: string[] = [];
   private currentAuthorWorkspace: AgentWorkspace | null = null;
+  /** Template content the current document was seeded with (to detect an unmodified template). */
+  private seededDoc: string | null = null;
 
   constructor(task: Task, options: EngineOptions) {
     this.task = task;
@@ -163,9 +172,19 @@ export class WorkflowEngine {
     stage.status = "running";
     stage.startedAt ??= nowIso();
     stage.finishedAt = undefined;
-    if (kind === "design") stage.docPath ??= this.designDocPath();
+    if (isDocStage(kind)) {
+      stage.docFormat ??= stage.docPath ? formatOfPath(stage.docPath) : this.options.settings.docFormat;
+      stage.docPath ??= this.docPathFor(kind, stage.docFormat);
+    }
     task.currentStage = kind;
     hooks.emit({ type: "info", stage: kind, text: `${STAGE_LABELS[kind]} stage started` });
+    hooks.comm({
+      from: "manager",
+      to: "manager",
+      kind: "lifecycle",
+      stage: kind,
+      text: `${STAGE_LABELS[kind]} stage started: ${ROLE_LABELS[authorRoleFor(kind)]} writes, ${ROLE_LABELS[reviewerRoleFor(kind)]} reviews${stage.docPath ? ` (${stage.docPath})` : ""}`,
+    });
     hooks.update();
 
     const budget = Math.max(1, task.roundsBudget ?? task.maxRounds);
@@ -217,6 +236,14 @@ export class WorkflowEngine {
           text: `${verdictText}: ${truncate(review.summary, 600)}`,
           data: { verdict: review.verdict, comments: review.comments.length, fallback: review.fallback ?? false },
         });
+        hooks.comm({
+          from: reviewerRole,
+          to: "manager",
+          kind: "verdict",
+          stage: kind,
+          round: round.n,
+          text: `${review.verdict === "approve" ? "Approved" : `Requested changes: ${describeComments(review.comments)}`} - ${truncate(firstLine(review.summary), 200)}`,
+        });
         hooks.update();
 
         if (review.verdict === "approve") {
@@ -245,14 +272,12 @@ export class WorkflowEngine {
       hooks.update();
     }
     const finalRound = stage.rounds.at(-1)?.n ?? 0;
-    hooks.emit({
-      type: "info",
-      stage: kind,
-      text:
-        stage.status === "approved"
-          ? `${STAGE_LABELS[kind]} approved in round ${finalRound}`
-          : `${STAGE_LABELS[kind]} finished without approval after round ${finalRound}`,
-    });
+    const outcome =
+      stage.status === "approved"
+        ? `${STAGE_LABELS[kind]} approved in round ${finalRound}`
+        : `${STAGE_LABELS[kind]} finished without approval after round ${finalRound}`;
+    hooks.emit({ type: "info", stage: kind, text: outcome });
+    hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", stage: kind, round: finalRound, text: outcome });
   }
 
   private async authorTurn(
@@ -265,7 +290,18 @@ export class WorkflowEngine {
     const kind = stage.kind;
     const ws = await workspace.prepareAuthor(role);
     if (ws.notice) hooks.emit({ type: "warning", role, stage: kind, text: ws.notice });
-    if (kind === "design" && stage.docPath) await ws.ensureDir(path.posix.dirname(stage.docPath));
+    this.seededDoc = null;
+    if (isDocStage(kind) && stage.docPath) {
+      await ws.ensureDir(path.posix.dirname(stage.docPath));
+      if (stage.docFormat === "html" && !(await ws.readFile(stage.docPath))?.trim()) {
+        const seeded = this.renderTemplate(stage);
+        if (seeded) {
+          await ws.writeFile(stage.docPath, seeded);
+          this.seededDoc = seeded;
+          hooks.emit({ type: "info", role, stage: kind, text: `Seeded ${stage.docPath} with the light-themed HTML document template` });
+        }
+      }
+    }
     const startHead = await ws.head();
     const fresh = !this.agents.has(role);
     const agent = await this.agentFor(role, kind, ws.path);
@@ -279,6 +315,16 @@ export class WorkflowEngine {
       if (!info.rounds.includes(round.n)) info.rounds.push(round.n);
     });
     hooks.emit({ type: "info", role, stage: kind, text: `${assignment} on branch ${ws.branch}` });
+    hooks.comm({
+      from: "manager",
+      to: role,
+      kind: "assign",
+      stage: kind,
+      round: round.n,
+      text: context.open.length
+        ? `${assignment}: ${context.open.map((comment) => comment.id).join(", ")} on ${ws.branch}`
+        : `${assignment} on ${ws.branch}${kind === "coding" && context.design ? ` following ${context.design.approved ? "the approved" : "the latest"} design` : ""}`,
+    });
 
     let previousWork: { summary: string; stat: string; diff: { text: string; truncated: boolean } } | undefined;
     if (fresh && role === "resolver") {
@@ -295,6 +341,8 @@ export class WorkflowEngine {
       stage: kind,
       round: round.n,
       docPath: stage.docPath,
+      docFormat: stage.docFormat,
+      seeded: this.seededDoc !== null,
       design: context.design,
       context: this.task.context,
       includeContext: fresh,
@@ -317,6 +365,7 @@ export class WorkflowEngine {
     const ws = await workspace.prepareReviewer(role, reviewedSha);
     const fresh = !this.agents.has(role);
     const agent = await this.agentFor(role, stage.kind, ws.path);
+    const authorRole = round.author?.role ?? authorRoleFor(stage.kind);
     hooks.agent(role, (info) => {
       info.status = "working";
       info.workspace = ws.path;
@@ -324,6 +373,14 @@ export class WorkflowEngine {
       info.branch = null;
       info.assignment = `Reviewing round ${round.n} at ${reviewedSha.slice(0, 10)}`;
       if (!info.rounds.includes(round.n)) info.rounds.push(round.n);
+    });
+    hooks.comm({
+      from: "manager",
+      to: role,
+      kind: "relay",
+      stage: stage.kind,
+      round: round.n,
+      text: `Review the ${ROLE_LABELS[authorRole].toLowerCase()}'s round ${round.n} at ${reviewedSha.slice(0, 10)}${round.author?.shortStat ? ` (${round.author.shortStat})` : ""}`,
     });
     const prompt = await this.buildReviewPrompt(stage, round, fresh, design, reviewedSha);
     const review = await this.runReviewTurn(agent, prompt, stage, reviewedSha);
@@ -352,6 +409,7 @@ export class WorkflowEngine {
         role,
         { worktree: workingDirectory, branch: workspace.branchFor(role), taskBranch: workspace.taskBranch, baseSha: workspace.baseSha },
         roleSkills,
+        { docFormat: isDocStage(stageKind) ? (this.task.stages.find((stage) => stage.kind === stageKind)?.docFormat ?? "markdown") : undefined },
       ),
       readOnly: reviewer,
       skillDirectories: [
@@ -374,6 +432,13 @@ export class WorkflowEngine {
       info.sessionId = handle.sessionId;
     });
     hooks.emit({ type: "info", role, stage: stageKind, text: `${ROLE_LABELS[role]} agent started on ${model}`, data: { sessionId: handle.sessionId } });
+    hooks.comm({
+      from: "manager",
+      to: role,
+      kind: "spawn",
+      stage: stageKind,
+      text: `Started a ${ROLE_LABELS[role].toLowerCase()} session on ${model}${reviewer ? " (read-only)" : ""}${roleSkills.length ? `; skills: ${roleSkills.join(", ")}` : ""}`,
+    });
     return agent;
   }
 
@@ -386,6 +451,7 @@ export class WorkflowEngine {
       info.status = status;
       info.assignment = undefined;
     });
+    this.options.hooks.comm({ from: "manager", to: role, kind: "release", text: `Closed the session (${status})` });
   }
 
   private send(agent: ActiveAgent, prompt: string): Promise<TurnResult> {
@@ -397,11 +463,12 @@ export class WorkflowEngine {
 
   private async acceptWork(input: WorkSubmissionInput, stageKind: StageKind): Promise<void> {
     const normalized = normalizeWork(input, this.expectedCommentIds);
-    if (stageKind === "design") {
-      const docPath = this.stage("design").docPath!;
-      const content = await this.currentAuthorWorkspace?.readFile(docPath);
-      if (!content?.trim()) {
-        throw new Error(`The design document was not found at '${docPath}'. Write the document to that exact path, then call submit_work again.`);
+    if (isDocStage(stageKind)) {
+      const stage = this.stage(stageKind);
+      const content = await this.currentAuthorWorkspace?.readFile(stage.docPath!);
+      const problem = documentProblem(content, stage.docFormat ?? "markdown", this.seededDoc);
+      if (problem) {
+        throw new Error(`The document '${stage.docPath}' ${problem}. Fix the file at that exact path, then call submit_work again.`);
       }
     }
     this.pendingWork = normalized;
@@ -415,6 +482,7 @@ export class WorkflowEngine {
     for (let nudge = 0; !this.submittedWork() && nudge < MAX_SUBMIT_NUDGES; nudge++) {
       this.throwIfAborted();
       this.options.hooks.emit({ type: "warning", role, text: "Agent ended its turn without calling submit_work; asking it to submit." });
+      this.options.hooks.comm({ from: "manager", to: role, kind: "nudge", text: "Your turn ended without submit_work - finish the round and submit" });
       result = await this.send(agent, NUDGE_WORK);
     }
     const submitted = this.submittedWork();
@@ -439,6 +507,7 @@ export class WorkflowEngine {
     for (let nudge = 0; !this.submittedReview() && nudge < MAX_SUBMIT_NUDGES; nudge++) {
       this.throwIfAborted();
       this.options.hooks.emit({ type: "warning", role, text: "Reviewer ended its turn without calling submit_review; asking it to submit." });
+      this.options.hooks.comm({ from: "manager", to: role, kind: "nudge", text: "Your turn ended without submit_review - submit your verdict" });
       result = await this.send(agent, NUDGE_REVIEW);
     }
     let input = this.submittedReview();
@@ -447,7 +516,7 @@ export class WorkflowEngine {
       this.options.hooks.emit({ type: "warning", role, text: "Reviewer never called submit_review; deriving the verdict from its last message." });
       input = fallbackReview(result.lastMessage);
     }
-    const prefix = stage.kind === "design" ? "D" : "C";
+    const prefix = COMMENT_PREFIX[stage.kind];
     return {
       verdict: input.verdict,
       summary: input.summary,
@@ -479,17 +548,17 @@ export class WorkflowEngine {
     }
 
     let docSnapshot: string | undefined;
-    if (stage.kind === "design" && stage.docPath) {
+    if (isDocStage(stage.kind) && stage.docPath) {
       const content = await ws.readFile(stage.docPath);
       if (content !== null) {
-        docSnapshot = `design-r${round.n}.md`;
+        docSnapshot = `doc-r${round.n}${DOC_EXTENSIONS[stage.docFormat ?? formatOfPath(stage.docPath)]}`;
         await hooks.saveArtifact(docSnapshot, content);
       } else {
-        hooks.emit({ type: "warning", role, text: `Design document ${stage.docPath} was not found after round ${round.n}.` });
+        hooks.emit({ type: "warning", role, text: `Document ${stage.docPath} was not found after round ${round.n}.` });
       }
     }
 
-    const label = stage.kind === "design" ? "design" : role === "resolver" ? "review fixes" : "code";
+    const label = stage.kind === "coding" ? (role === "resolver" ? "review fixes" : "code") : stage.kind;
     const subject = `[agent-hub] ${task.id} ${label} round ${round.n}: ${truncate(firstLine(input.summary), 72)}`;
     await ws.commitAll(subject, `${task.title}\n\nAuthor agent: ${ROLE_LABELS[role]}\n\n${CO_AUTHOR}`);
     // Also picks up commits an agent made itself despite the instructions.
@@ -513,6 +582,23 @@ export class WorkflowEngine {
       role,
       text: truncate(input.summary, 4000),
       data: { responses: input.comment_responses?.length ?? 0, fallback },
+    });
+    const addressed = input.comment_responses?.filter((response) => response.status === "addressed").length ?? 0;
+    const declined = (input.comment_responses?.length ?? 0) - addressed;
+    hooks.comm({
+      from: role,
+      to: "manager",
+      kind: "submit",
+      stage: stage.kind,
+      round: round.n,
+      text: [
+        `Submitted round ${round.n}`,
+        commit ? `commit ${commit.slice(0, 10)}${shortStat ? ` (${shortStat})` : ""}` : "no file changes",
+        open.length ? `${addressed} addressed, ${declined} declined` : "",
+        fallback ? "no submit_work call (summary derived)" : "",
+      ]
+        .filter(Boolean)
+        .join("; ") + ` - ${truncate(firstLine(input.summary), 160)}`,
     });
     return {
       role,
@@ -546,7 +632,7 @@ export class WorkflowEngine {
     const totalStat = await workspace.diffStat(workspace.baseSha, headSha);
     let docContent: string | undefined;
     let roundDiff: { text: string; truncated: boolean } | undefined;
-    if (stage.kind === "design") {
+    if (isDocStage(stage.kind)) {
       docContent =
         (stage.docPath ? await workspace.readAt(headSha, stage.docPath) : null) ??
         (submission.docSnapshot ? await hooks.readArtifact(submission.docSnapshot) : null) ??
@@ -565,6 +651,7 @@ export class WorkflowEngine {
       design,
       context: this.task.context,
       docPath: stage.docPath,
+      docFormat: stage.docFormat,
       docContent,
       submission,
       authorLabel: ROLE_LABELS[submission.role ?? authorRoleFor(stage.kind)],
@@ -577,9 +664,25 @@ export class WorkflowEngine {
     });
   }
 
-  private designDocPath(): string {
-    const dir = this.options.settings.designDocDir.replaceAll("\\", "/").replace(/\/+$/, "") || "docs/designs";
-    return `${dir}/${this.task.id.toLowerCase()}-${slugify(this.task.title, 48)}.md`;
+  private docPathFor(kind: StageKind, format: "html" | "markdown"): string {
+    const { settings } = this.options;
+    const fallback = kind === "design" ? "docs/designs" : "docs";
+    const configured = kind === "design" ? settings.designDocDir : settings.documentDir;
+    const dir = (configured ?? fallback).replaceAll("\\", "/").replace(/\/+$/, "") || fallback;
+    return `${dir}/${this.task.id.toLowerCase()}-${slugify(this.task.title, 48)}${DOC_EXTENSIONS[format]}`;
+  }
+
+  private renderTemplate(stage: Stage): string | null {
+    const templates = this.options.docTemplates;
+    if (!templates) return null;
+    return renderDocTemplate(templates, stage.kind, {
+      title: this.task.title,
+      taskId: this.task.id,
+      repo: this.task.repoName,
+      date: new Date().toISOString().slice(0, 10),
+      author: authorRoleFor(stage.kind),
+      reviewer: reviewerRoleFor(stage.kind),
+    });
   }
 
   private async designContext(): Promise<DesignContext | undefined> {
@@ -595,6 +698,7 @@ export class WorkflowEngine {
     const lastReview = [...designStage.rounds].reverse().find((round) => round.review)?.review;
     return {
       path: designStage.docPath,
+      format: designStage.docFormat ?? formatOfPath(designStage.docPath),
       content,
       approved,
       openComments: approved ? [] : (lastReview?.comments.filter((comment) => comment.status === "open") ?? []),
@@ -610,6 +714,7 @@ export class WorkflowEngine {
     const head = await workspace.taskHead();
     const lastAuthor = [...lastStage.rounds].reverse().find((round) => round.author)?.author;
     const lastReview = [...lastStage.rounds].reverse().find((round) => round.review)?.review;
+    const docStage = task.stages.find((stage) => isDocStage(stage.kind));
     task.result = {
       approved: lastStage.status === "approved",
       summary: lastAuthor?.summary ?? "",
@@ -618,6 +723,8 @@ export class WorkflowEngine {
       shortStat: await workspace.shortStat(workspace.baseSha, head),
       commits: await workspace.commitCount(workspace.baseSha, head),
       designDocPath: task.stages.find((stage) => stage.kind === "design")?.docPath,
+      docPath: docStage?.docPath,
+      docFormat: docStage?.docFormat,
       openComments: lastReview?.comments.filter((comment) => comment.status === "open").length ?? 0,
     };
     if (settings.cleanupWorktrees) {
@@ -639,26 +746,35 @@ export class WorkflowEngine {
 }
 
 export function assignmentFor(role: AgentRole, round: number, openComments: number): string {
+  const comments = `${openComments} review comment${openComments === 1 ? "" : "s"}`;
   switch (role) {
     case "coder":
       return `Implementing the request (round ${round})`;
     case "resolver":
-      return `Resolving ${openComments} review comment${openComments === 1 ? "" : "s"} (round ${round})`;
+      return `Resolving ${comments} (round ${round})`;
     case "designer":
-      return openComments
-        ? `Revising the design for ${openComments} review comment${openComments === 1 ? "" : "s"} (round ${round})`
-        : `Writing the design (round ${round})`;
+      return openComments ? `Revising the design for ${comments} (round ${round})` : `Writing the design (round ${round})`;
+    case "writer":
+      return openComments ? `Revising the document for ${comments} (round ${round})` : `Writing the document (round ${round})`;
     default:
       return `Reviewing round ${round}`;
   }
 }
 
 export function phaseLabel(stage: StageKind | undefined, phase: Phase): string {
-  if (phase === "authoring") return stage === "design" ? "Designing" : "Coding";
-  if (phase === "reviewing") return stage === "design" ? "Reviewing design" : "Reviewing code";
-  if (phase === "revising") return stage === "design" ? "Revising design" : "Resolving review comments";
+  const noun = stage === "design" ? "design" : stage === "document" ? "document" : "code";
+  if (phase === "authoring") return stage === "design" ? "Designing" : stage === "document" ? "Writing" : "Coding";
+  if (phase === "reviewing") return `Reviewing ${noun}`;
+  if (phase === "revising") return stage === "coding" || !stage ? "Resolving review comments" : `Revising ${noun}`;
   if (phase === "preparing") return "Preparing workspace";
   if (phase === "finalizing") return "Finalizing";
   if (phase === "done") return "Done";
   return "Queued";
+}
+
+function describeComments(comments: readonly ReviewComment[]): string {
+  if (!comments.length) return "no specific comments";
+  const counts = new Map<string, number>();
+  for (const comment of comments) counts.set(comment.severity, (counts.get(comment.severity) ?? 0) + 1);
+  return `${comments.length} comment${comments.length === 1 ? "" : "s"} (${[...counts].map(([severity, count]) => `${count} ${severity}`).join(", ")})`;
 }

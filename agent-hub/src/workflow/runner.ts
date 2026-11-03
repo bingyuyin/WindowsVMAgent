@@ -3,6 +3,7 @@ import path from "node:path";
 import type { AgentDriver, AgentObserver, UserQuestion } from "../agents/driver.ts";
 import type { Bus } from "../bus.ts";
 import { describeContext, discoverContext, type HubSkills } from "../context.ts";
+import { formatOfPath, type DocTemplates } from "../docs.ts";
 import {
   deleteBranch,
   deleteBranchesWithPrefix,
@@ -17,10 +18,15 @@ import {
 import type { Store } from "../store.ts";
 import {
   ACTIVE_STATUSES,
+  isDocStage,
+  ROLE_LABELS,
   stagesFor,
   TASK_KINDS,
   type AgentInfo,
   type AgentRole,
+  type CommEntry,
+  type DocFormat,
+  type NewCommEntry,
   type NewTaskEvent,
   type Repo,
   type StageKind,
@@ -56,6 +62,11 @@ export interface RunnerDeps {
   driver: AgentDriver;
   worktreesDir: string;
   hubSkills?: HubSkills;
+  docTemplates?: DocTemplates | null;
+  /** How often the manager checks on working agents (default 60 s). */
+  monitorIntervalMs?: number;
+  /** Silence after which the manager posts a check-in about a working agent (default 5 min). */
+  stallAfterMs?: number;
 }
 
 interface RunningTask {
@@ -69,13 +80,29 @@ interface InputWaiter {
   resolve: (answer: string) => void;
 }
 
+/** What the manager is doing right now (for the Agents view). */
+export interface ManagerOverview {
+  online: boolean;
+  startedAt: string;
+  capacity: number;
+  running: number;
+  queued: number;
+  needsInput: number;
+  workingAgents: number;
+  monitorIntervalSec: number;
+  lastCheckAt: string | null;
+  comm: CommEntry[];
+}
+
 const NO_ANSWER =
   "The user did not answer in time. Proceed using your best judgment and state your assumptions explicitly in your summary.";
 const SHA = /^[0-9a-f]{7,40}$/i;
+const MAX_AUTO_RESUMES = 3;
 
 export const KIND_LABELS: Record<TaskKind, string> = {
   coding: "Coding",
   design: "Design",
+  document: "Document",
   "design-coding": "Design → Coding",
 };
 
@@ -86,23 +113,46 @@ export class TaskRunner {
   private readonly waiters = new Map<string, InputWaiter>();
   private readonly repoLocks = new KeyedMutex();
   private readonly updateTimers = new Map<string, NodeJS.Timeout>();
+  /** Tasks interrupted by the last hub stop that resume once the runtime is signed in. */
+  private readonly resumeQueue = new Set<string>();
+  private readonly checkIns = new Set<string>();
+  private readonly startedAt = nowIso();
+  private monitorTimer: NodeJS.Timeout | null = null;
+  private lastCheckAt: string | null = null;
   private shuttingDown = false;
 
   constructor(deps: RunnerDeps) {
     this.deps = deps;
   }
 
-  /** Marks tasks that were running when the hub stopped as interrupted. */
+  /** Restores tasks from the last run: running ones become interrupted (and are queued to resume if enabled). */
   init(): void {
-    for (const task of this.deps.store.tasks) {
-      if (task.status === "running" || task.status === "needs-input") {
-        task.status = "interrupted";
-        task.activity = undefined;
-        task.pendingInput = undefined;
-        this.deps.store.appendEvent(task, { type: "status", text: "Interrupted: the hub stopped while this task was running. Use Retry to resume." });
+    const { store } = this.deps;
+    for (const task of store.tasks) {
+      if (task.status !== "running" && task.status !== "needs-input") continue;
+      task.status = "interrupted";
+      task.activity = undefined;
+      task.pendingInput = undefined;
+      for (const agent of task.agents ?? []) {
+        if (agent.status === "working" || agent.status === "idle") agent.status = "cancelled";
       }
+      const resume = store.settings.resumeInterruptedTasks && (task.autoResumes ?? 0) < MAX_AUTO_RESUMES;
+      if (resume) this.resumeQueue.add(task.id);
+      this.emit(task, {
+        type: "status",
+        text: resume
+          ? "Interrupted: the hub stopped while this task was running. It resumes automatically once the hub is signed in."
+          : "Interrupted: the hub stopped while this task was running. Use Retry to resume.",
+      });
+      this.comm(task, {
+        from: "manager",
+        to: "user",
+        kind: "lifecycle",
+        text: resume ? "Interrupted by a hub restart; will resume automatically" : "Interrupted by a hub restart; waiting for Retry",
+      });
+      store.saveTask(task);
     }
-    this.deps.store.save();
+    this.startMonitor();
   }
 
   get(id: string): Task {
@@ -172,6 +222,12 @@ export class TaskRunner {
     };
     store.addTask(task);
     this.emit(task, { type: "status", text: `Queued ${KIND_LABELS[task.kind]} task on ${repo.name} @ ${baseRef} (${baseSha.slice(0, 10)})` });
+    this.comm(task, {
+      from: "user",
+      to: "manager",
+      kind: "lifecycle",
+      text: `New ${KIND_LABELS[task.kind]} task on ${repo.name} @ ${baseRef}: ${truncate(firstLine(description), 140)}`,
+    });
     this.publish(task);
     this.pump();
     return task;
@@ -183,12 +239,14 @@ export class TaskRunner {
       task.status = "cancelled";
       task.finishedAt = nowIso();
       this.emit(task, { type: "status", text: "Cancelled before it started" });
+      this.comm(task, { from: "user", to: "manager", kind: "lifecycle", text: "Cancelled before it started" });
       this.publish(task);
       return task;
     }
     const run = this.running.get(id);
     if (!run) throw new HttpError(409, `Task ${id} is not running`);
     this.emit(task, { type: "status", text: "Cancellation requested" });
+    this.comm(task, { from: "user", to: "manager", kind: "lifecycle", text: "Cancel requested; stopping the agents" });
     run.controller.abort();
     void run.engine?.abortAgents();
     return task;
@@ -200,20 +258,38 @@ export class TaskRunner {
     if (!["failed", "cancelled", "interrupted"].includes(task.status) && !unapproved) {
       throw new HttpError(409, "Only failed, cancelled, interrupted or unapproved tasks can be retried");
     }
+    this.resumeQueue.delete(id);
+    task.autoResumes = 0;
+    const verb = unapproved ? "Continuing" : "Retrying";
+    this.requeue(task, extraRounds ?? task.maxRounds, verb);
+    this.comm(task, { from: "user", to: "manager", kind: "lifecycle", text: `${verb} (attempt ${task.attempt}, up to ${task.roundsBudget} more review round(s))` });
+    this.publish(task);
+    this.pump();
+    return task;
+  }
+
+  private requeue(task: Task, rounds: number, verb: string): void {
     task.attempt += 1;
-    task.roundsBudget = clampInt(extraRounds ?? task.maxRounds, 1, 10);
+    task.roundsBudget = clampInt(rounds, 1, 10);
     task.status = "queued";
     task.phase = "queued";
     task.error = undefined;
     task.finishedAt = undefined;
     task.result = undefined;
-    this.emit(task, {
-      type: "status",
-      text: `${unapproved ? "Continuing" : "Retrying"} (attempt ${task.attempt}, up to ${task.roundsBudget} more review round(s))`,
-    });
-    this.publish(task);
-    this.pump();
-    return task;
+    this.emit(task, { type: "status", text: `${verb} (attempt ${task.attempt}, up to ${task.roundsBudget} more review round(s))` });
+  }
+
+  /** Re-queues tasks interrupted by the last hub stop (once the runtime is signed in). */
+  private resumeInterrupted(): void {
+    for (const id of [...this.resumeQueue]) {
+      this.resumeQueue.delete(id);
+      const task = this.deps.store.getTask(id);
+      if (task?.status !== "interrupted") continue;
+      task.autoResumes = (task.autoResumes ?? 0) + 1;
+      this.requeue(task, task.roundsBudget ?? task.maxRounds, "Resuming after the hub restart");
+      this.comm(task, { from: "manager", to: "user", kind: "lifecycle", text: `Resuming after the hub restart (attempt ${task.attempt})` });
+      this.publish(task);
+    }
   }
 
   answer(id: string, inputId: string, answer: string): void {
@@ -250,6 +326,7 @@ export class TaskRunner {
   /** Starts queued tasks while there is capacity and the Copilot runtime is signed in. */
   pump(): void {
     if (this.shuttingDown || !this.deps.runtime.isReady()) return;
+    this.resumeInterrupted();
     const limit = Math.max(1, this.deps.store.settings.maxConcurrency);
     const queued = this.deps.store.tasks
       .filter((task) => task.status === "queued" && !this.running.has(task.id))
@@ -269,10 +346,29 @@ export class TaskRunner {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    this.stopMonitor();
     const entries = [...this.running.values()];
     for (const entry of entries) entry.controller.abort();
     await Promise.all(entries.map((entry) => entry.engine?.abortAgents()));
     await Promise.race([Promise.all(entries.map((entry) => entry.done)), new Promise((resolve) => setTimeout(resolve, 5000))]);
+  }
+
+  /** The manager's state plus its recent communication with sub-agents. */
+  overview(options: { limit?: number; taskId?: string } = {}): ManagerOverview {
+    const { store, runtime } = this.deps;
+    const tasks = store.tasks;
+    return {
+      online: runtime.isReady(),
+      startedAt: this.startedAt,
+      capacity: Math.max(1, store.settings.maxConcurrency),
+      running: this.running.size,
+      queued: tasks.filter((task) => task.status === "queued").length,
+      needsInput: tasks.filter((task) => task.status === "needs-input").length,
+      workingAgents: tasks.reduce((count, task) => count + (task.agents ?? []).filter((agent) => agent.status === "working").length, 0),
+      monitorIntervalSec: Math.round((this.deps.monitorIntervalMs ?? 60_000) / 1000),
+      lastCheckAt: this.lastCheckAt,
+      comm: store.recentComm({ limit: options.limit ?? 300, taskId: options.taskId }),
+    };
   }
 
   async diff(id: string, from?: string, to?: string): Promise<{ from: string; to: string; stat: string; text: string; truncated: boolean }> {
@@ -285,15 +381,21 @@ export class TaskRunner {
     return { from: fromRef, to: toRef, stat, ...diff };
   }
 
-  async design(id: string, round?: number): Promise<{ path: string | null; round: number | null; content: string | null }> {
+  /** The task's design/document deliverable as of a review round (default: the latest). */
+  async document(
+    id: string,
+    round?: number,
+  ): Promise<{ stage: StageKind; path: string | null; format: DocFormat; round: number | null; rounds: number[]; content: string | null }> {
     const task = this.get(id);
-    const stage = task.stages.find((candidate) => candidate.kind === "design");
-    if (!stage) throw new HttpError(404, "This task has no design stage");
+    const stage = task.stages.find((candidate) => isDocStage(candidate.kind));
+    if (!stage) throw new HttpError(404, "This task has no design or document stage");
+    const format = stage.docFormat ?? (stage.docPath ? formatOfPath(stage.docPath) : "markdown");
     const rounds = stage.rounds.filter((candidate) => candidate.author?.docSnapshot);
     const target = round ? rounds.find((candidate) => candidate.n === round) : rounds.at(-1);
-    if (!target?.author?.docSnapshot) return { path: stage.docPath ?? null, round: null, content: null };
+    const base = { stage: stage.kind, path: stage.docPath ?? null, format, rounds: rounds.map((candidate) => candidate.n) };
+    if (!target?.author?.docSnapshot) return { ...base, round: null, content: null };
     const content = await this.deps.store.readArtifact(task.id, target.author.docSnapshot);
-    return { path: stage.docPath ?? null, round: target.n, content };
+    return { ...base, round: target.n, content };
   }
 
   private async execute(task: Task, entry: RunningTask): Promise<void> {
@@ -306,6 +408,12 @@ export class TaskRunner {
       task.finishedAt = undefined;
       task.error = undefined;
       this.emit(task, { type: "status", text: `Started (attempt ${task.attempt})` });
+      this.comm(task, {
+        from: "manager",
+        to: "manager",
+        kind: "lifecycle",
+        text: `Picked up the task (attempt ${task.attempt}; ${this.running.size} of ${Math.max(1, store.settings.maxConcurrency)} slots in use); preparing workspaces`,
+      });
       this.publish(task);
       const repo = store.getRepo(task.repoId);
       if (!repo) throw new Error("The repository is no longer registered");
@@ -314,7 +422,14 @@ export class TaskRunner {
       task.context = await discoverContext(repo.path, task.baseSha!);
       this.emit(task, { type: "info", text: `Repository context: ${describeContext(task.context)}`, data: { context: true } });
       this.publish(task);
-      const engine = new WorkflowEngine(task, { driver, workspace, settings: store.settings, hooks, hubSkills: this.deps.hubSkills });
+      const engine = new WorkflowEngine(task, {
+        driver,
+        workspace,
+        settings: store.settings,
+        hooks,
+        hubSkills: this.deps.hubSkills,
+        docTemplates: this.deps.docTemplates,
+      });
       entry.engine = engine;
       await engine.run();
       task.status = "completed";
@@ -339,15 +454,33 @@ export class TaskRunner {
       task.finishedAt = nowIso();
       task.activity = undefined;
       task.pendingInput = undefined;
+      if (task.status !== "interrupted") task.autoResumes = undefined;
       for (const agent of task.agents ?? []) {
         if (agent.status === "working" || agent.status === "idle") {
           agent.status = task.status === "completed" ? "done" : task.status === "failed" ? "failed" : "cancelled";
         }
       }
+      this.comm(task, { from: "manager", to: "user", kind: "lifecycle", text: this.outcomeText(task) });
       this.running.delete(task.id);
       this.waiters.delete(task.id);
       this.publish(task);
       this.pump();
+    }
+  }
+
+  private outcomeText(task: Task): string {
+    switch (task.status) {
+      case "completed": {
+        const result = task.result;
+        const detail = [result?.shortStat, result?.docPath ? `document ${result.docPath}` : ""].filter(Boolean).join("; ");
+        return `${result?.approved ? "Completed: approved by the reviewer" : `Completed without approval (${result?.openComments ?? 0} open comment(s))`}${detail ? ` - ${detail}` : ""}`;
+      }
+      case "failed":
+        return `Failed: ${truncate(task.error ?? "unknown error", 200)}`;
+      case "interrupted":
+        return "Interrupted by hub shutdown";
+      default:
+        return "Cancelled";
     }
   }
 
@@ -411,6 +544,7 @@ export class TaskRunner {
         mutate(this.agentInfo(task, role));
         this.publish(task);
       },
+      comm: (entry) => this.comm(task, entry),
     };
   }
 
@@ -488,6 +622,7 @@ export class TaskRunner {
     };
     task.status = "needs-input";
     this.emit(task, { type: "input.request", role, text: question.question, data: { choices: question.choices } });
+    this.comm(task, { from: role, to: "user", kind: "question", text: truncate(question.question, 300) });
     this.publish(task);
     return new Promise<string>((resolve, reject) => {
       const finish = (answer: string | null, error?: Error) => {
@@ -496,7 +631,15 @@ export class TaskRunner {
         this.waiters.delete(task.id);
         task.pendingInput = undefined;
         if (task.status === "needs-input") task.status = "running";
-        if (answer !== null) this.emit(task, { type: "input.answer", role, text: answer });
+        if (answer !== null) {
+          this.emit(task, { type: "input.answer", role, text: answer });
+          this.comm(task, {
+            from: answer === NO_ANSWER ? "manager" : "user",
+            to: role,
+            kind: "answer",
+            text: answer === NO_ANSWER ? "No answer in time - proceed with your best judgment" : truncate(answer, 300),
+          });
+        }
         this.publish(task);
         if (error) reject(error);
         else resolve(answer ?? NO_ANSWER);
@@ -520,6 +663,19 @@ export class TaskRunner {
     this.deps.bus.publishTask(task.id, { type: "event", event: full });
   }
 
+  /** Records a manager <-> agent message in the manager log and streams it to the Agents view. */
+  private comm(task: Task, entry: NewCommEntry): void {
+    if (!this.deps.store.getTask(task.id)) return;
+    const full = this.deps.store.appendComm({
+      ...entry,
+      taskId: task.id,
+      taskTitle: task.title,
+      stage: entry.stage ?? task.currentStage,
+      round: entry.round ?? (task.currentRound || undefined),
+    });
+    this.deps.bus.publishGlobal({ type: "comm", entry: full });
+  }
+
   private publish(task: Task): void {
     const timer = this.updateTimers.get(task.id);
     if (timer) {
@@ -528,7 +684,7 @@ export class TaskRunner {
     }
     if (!this.deps.store.getTask(task.id)) return;
     task.updatedAt = nowIso();
-    this.deps.store.save();
+    this.deps.store.saveTask(task);
     this.deps.bus.publishGlobal({ type: "task", task: summarizeTask(task) });
     this.deps.bus.publishTask(task.id, { type: "task", task });
   }
@@ -542,6 +698,43 @@ export class TaskRunner {
         this.publish(task);
       }, 1000),
     );
+  }
+
+  private startMonitor(): void {
+    if (this.monitorTimer) return;
+    this.monitorTimer = setInterval(() => this.checkOnAgents(), this.deps.monitorIntervalMs ?? 60_000);
+    this.monitorTimer.unref();
+  }
+
+  private stopMonitor(): void {
+    if (this.monitorTimer) clearInterval(this.monitorTimer);
+    this.monitorTimer = null;
+  }
+
+  /** The manager's periodic check: posts a check-in for agents that have been silent for a while. */
+  checkOnAgents(now = Date.now()): void {
+    this.lastCheckAt = new Date(now).toISOString();
+    const stallAfter = this.deps.stallAfterMs ?? 5 * 60_000;
+    for (const id of this.running.keys()) {
+      const task = this.deps.store.getTask(id);
+      if (!task || task.status !== "running") continue;
+      for (const agent of task.agents ?? []) {
+        if (agent.status !== "working" || !agent.updatedAt) continue;
+        const silentMs = now - Date.parse(agent.updatedAt);
+        const key = `${task.id}:${agent.role}:${agent.updatedAt}`;
+        if (silentMs < stallAfter || this.checkIns.has(key)) continue;
+        this.checkIns.add(key);
+        const minutes = Math.round(silentMs / 60_000);
+        this.comm(task, {
+          from: "manager",
+          to: agent.role,
+          kind: "monitor",
+          text: `Check-in: no new activity for ${minutes} min${agent.lastActivity ? ` (last: ${truncate(agent.lastActivity, 80)})` : ""}; the turn times out after ${this.deps.store.settings.turnTimeoutMinutes} min`,
+        });
+      }
+    }
+    if (this.checkIns.size > 1000) this.checkIns.clear();
+    this.deps.bus.publishGlobal({ type: "manager", lastCheckAt: this.lastCheckAt });
   }
 }
 

@@ -72,19 +72,37 @@ export function compactNumber(value) {
 
 export const shortSha = (sha) => (sha ? sha.slice(0, 10) : "");
 
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/** SVG counterpart of h(): attributes are set as presentation attributes (CSP-safe, no inline styles). */
+export function s(tag, attrs, ...children) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs ?? {})) {
+    if (value === undefined || value === null || value === false) continue;
+    if (key.startsWith("on") && typeof value === "function") el.addEventListener(key.slice(2).toLowerCase(), value);
+    else el.setAttribute(key, String(value));
+  }
+  append(el, children);
+  return el;
+}
+
 export const ROLE_LABELS = {
   designer: "Designer",
   "design-reviewer": "Design reviewer",
+  writer: "Technical writer",
+  "doc-reviewer": "Doc reviewer",
   coder: "Coder",
   resolver: "Comment resolver",
   "code-reviewer": "Code reviewer",
 };
 
-export const ROLE_ICONS = { designer: "✎", "design-reviewer": "◎", coder: "⌨", resolver: "⚒", "code-reviewer": "◎" };
+export const ROLE_ICONS = { designer: "✎", "design-reviewer": "◎", writer: "¶", "doc-reviewer": "◎", coder: "⌨", resolver: "⚒", "code-reviewer": "◎" };
 
 export const ROLE_DESCRIPTIONS = {
   designer: "Writes the design document and revises it for review comments",
   "design-reviewer": "Reviews the design in a read-only worktree",
+  writer: "Writes the document and revises it for review comments",
+  "doc-reviewer": "Reviews the document in a read-only worktree",
   coder: "Implements the request on its own branch",
   resolver: "Resolves code review comments on its own branch",
   "code-reviewer": "Reviews each commit in a read-only worktree pinned to it",
@@ -94,17 +112,26 @@ export const ROLE_DESCRIPTIONS = {
 export const ROLE_SKILLS = {
   designer: ["system-design"],
   "design-reviewer": ["design-review"],
+  writer: ["technical-writing"],
+  "doc-reviewer": ["doc-review"],
   coder: ["coding-best-practices"],
   resolver: ["review-comment-resolution", "coding-best-practices"],
   "code-reviewer": ["code-review"],
 };
 
+export const isReviewerRole = (role) => role === "design-reviewer" || role === "code-reviewer" || role === "doc-reviewer";
+
 /** Sub-agents a task kind uses, in workflow order. */
 export function rolesFor(kind) {
   if (kind === "design") return ["designer", "design-reviewer"];
+  if (kind === "document") return ["writer", "doc-reviewer"];
   if (kind === "design-coding") return ["designer", "design-reviewer", "coder", "code-reviewer", "resolver"];
   return ["coder", "code-reviewer", "resolver"];
 }
+
+/** Stage a role works in. */
+export const stageOfRole = (role) =>
+  role === "designer" || role === "design-reviewer" ? "design" : role === "writer" || role === "doc-reviewer" ? "document" : "coding";
 
 export function agentStatusInfo(agent) {
   if (!agent) return { label: "Not started", cls: "neutral" };
@@ -124,17 +151,19 @@ export function agentStatusInfo(agent) {
   }
 }
 
-export const KIND_LABELS = { coding: "Coding", design: "Design", "design-coding": "Design → Coding" };
-export const STAGE_LABELS = { design: "Design", coding: "Coding" };
+export const KIND_LABELS = { coding: "Coding", design: "Design", document: "Document", "design-coding": "Design → Coding" };
+export const STAGE_LABELS = { design: "Design", document: "Document", coding: "Coding" };
+export const isDocStage = (stage) => stage === "design" || stage === "document";
 
 export function phaseLabel(stage, phase) {
+  const noun = stage === "design" ? "design" : stage === "document" ? "document" : "code";
   switch (phase) {
     case "authoring":
-      return stage === "design" ? "Designing" : "Coding";
+      return stage === "design" ? "Designing" : stage === "document" ? "Writing" : "Coding";
     case "reviewing":
-      return stage === "design" ? "Reviewing design" : "Reviewing code";
+      return `Reviewing ${noun}`;
     case "revising":
-      return stage === "design" ? "Revising design" : "Resolving review comments";
+      return isDocStage(stage) ? `Revising ${noun}` : "Resolving review comments";
     case "preparing":
       return "Preparing workspace";
     case "finalizing":

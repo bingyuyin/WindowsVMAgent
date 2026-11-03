@@ -13,8 +13,14 @@ const TYPES = [
   {
     id: "design",
     title: "Design",
-    text: "Agents: a designer writes the design document and revises it; a design reviewer critiques it until a finalized version is approved.",
+    text: "Agents: a designer writes the design as a light-themed HTML document (with diagrams) and revises it; a design reviewer critiques it until a finalized version is approved.",
     placeholder: "Describe the problem to design for: goals, requirements, constraints, open questions…",
+  },
+  {
+    id: "document",
+    title: "Document",
+    text: "Agents: a technical writer writes the documentation as a light-themed HTML page (with diagrams) grounded in the repository; a doc reviewer checks accuracy and clarity until it is approved.",
+    placeholder: "Describe the document: audience, purpose, topics to cover (e.g. onboarding guide, API reference, runbook, architecture overview)…",
   },
   {
     id: "design-coding",
@@ -58,7 +64,7 @@ export function newTaskView(root) {
       h(
         "div",
         { class: "grid-2" },
-        h("label", { class: "field" }, h("span", { class: "field-label" }, "Author model (designer / coder)"), authorSelect),
+        h("label", { class: "field" }, h("span", { class: "field-label" }, "Author model (designer / writer / coder)"), authorSelect),
         resolverField,
         h("label", { class: "field" }, h("span", { class: "field-label" }, "Reviewer model"), reviewerSelect),
         h("label", { class: "field" }, h("span", { class: "field-label" }, "Max review rounds"), roundsInput),
@@ -96,7 +102,7 @@ export function newTaskView(root) {
     const type = TYPES.find((candidate) => candidate.id === kind);
     typeHelp.textContent = type.text;
     description.placeholder = type.placeholder;
-    resolverField.hidden = kind === "design";
+    resolverField.hidden = kind === "design" || kind === "document";
   }
 
   function renderRepos() {
@@ -156,7 +162,7 @@ export function newTaskView(root) {
         description: description.value,
         authorModel: authorSelect.value || undefined,
         reviewerModel: reviewerSelect.value || undefined,
-        resolverModel: kind === "design" ? undefined : resolverSelect.value || undefined,
+        resolverModel: kind === "design" || kind === "document" ? undefined : resolverSelect.value || undefined,
         maxRounds: Number(roundsInput.value) || undefined,
       });
       toast(`Created ${task.id}`, "success");

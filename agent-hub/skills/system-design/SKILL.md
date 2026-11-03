@@ -31,3 +31,19 @@ patterns. If the repository has a design-doc or ADR template, follow it instead 
 - Choose the simplest design that meets the requirements; justify any added complexity.
 - Make trade-offs explicit (consistency vs. availability, latency vs. cost, build vs. buy).
 - Keep it reviewable: short sections, tables for comparisons, diagrams for flows.
+
+## HTML design documents (light theme)
+- The request sets the scope and length: the template's sections are a menu, not a checklist. For a
+  short design keep only what the request needs (summary, proposed design with diagram, key risks).
+- Keep the hub template's `<head>`/`<style>` and section skeleton; fill every `data-placeholder`
+  element and remove the attribute; delete sections that do not apply.
+- Put the summary and key decision first (`.callout`, `dl.facts`); goals vs. non-goals in `.pros-cons`;
+  requirements, components, alternatives and risks in tables; `.badge` for status (New, Modified,
+  Rejected, High risk); `ol.steps` for the implementation plan; `.callout.risk` / `.callout.decision`
+  to highlight risks and decisions.
+- Draw the architecture (flowchart) and the main flows (sequenceDiagram) with Mermaid inside
+  `<figure class="diagram"><pre class="mermaid">...</pre><figcaption>...</figcaption></figure>`; add
+  `erDiagram` / `stateDiagram-v2` for data models and lifecycles. Keep the syntax valid and write `<`
+  as `&lt;` inside diagrams.
+- No external stylesheets, fonts, images or scripts; keep the light color palette. The template's
+  Mermaid loader (`<script data-hub-mermaid>`) is the one allowed script - keep it unchanged.

@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { describe, test } from "node:test";
 import { loadHubSkills } from "../src/context.ts";
+import type { CopilotService } from "../src/copilot/service.ts";
+import { loadDocTemplates } from "../src/docs.ts";
+import { createApiRouter } from "../src/http/api.ts";
+import { createHttpServer } from "../src/http/server.ts";
+import type { RepoService } from "../src/repos.ts";
 import {
   branchExists,
   branchHead,
@@ -12,6 +18,7 @@ import {
   steps,
   submitReview,
   submitWork,
+  TEMPLATES_DIR,
   waitFor,
   writeFile,
   type Step,
@@ -386,8 +393,8 @@ describe("design workflows", () => {
       assert.match(git(h.repoPath, "show", `${task.branch}:${docPath}`), /## Risks/);
       assert.equal(branchHead(h.repoPath, `${task.branch}--designer`), branchHead(h.repoPath, task.branch!));
       assert.deepEqual(task.stages[0]!.rounds.map((round) => round.author!.role), ["designer", "designer"]);
-      assert.equal((await h.runner.design(task.id, 1)).content, "# Design v1\n");
-      assert.match((await h.runner.design(task.id)).content ?? "", /Design v2/);
+      assert.equal((await h.runner.document(task.id, 1)).content, "# Design v1\n");
+      assert.match((await h.runner.document(task.id)).content ?? "", /Design v2/);
       // The re-review shows the document diff between rounds.
       assert.match(h.driver.prompts["design-reviewer"]![1]!, /\+## Risks/);
     } finally {
@@ -448,8 +455,271 @@ describe("design workflows", () => {
     try {
       await h.runner.submit({ description: "Doc", kind: "design", repoId: "sample" });
       await h.runner.idle();
-      assert.match(rejection?.message ?? "", /design document was not found/);
+      assert.match(rejection?.message ?? "", /is missing or empty/);
       assert.equal(h.store.tasks[0]!.result?.approved, true);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("HTML documents", () => {
+  const templates = loadDocTemplates(TEMPLATES_DIR);
+
+  test("design: the hub seeds the light HTML template and rejects it until every placeholder is filled", async () => {
+    let docPath = "";
+    const rejections: string[] = [];
+    const h = createHarness(
+      {
+        designer: [
+          async (spec, prompt) => {
+            if (spec.submit.kind !== "work") throw new Error("unexpected");
+            docPath = designPathFrom(prompt);
+            const file = path.join(spec.workingDirectory, docPath);
+            const seeded = fs.readFileSync(file, "utf8");
+            assert.match(seeded, /<h1>Cache &amp; queue design<\/h1>/);
+            assert.match(seeded, /data-placeholder/);
+            assert.match(prompt, /light-themed HTML template/);
+            for (const content of [seeded, seeded.replace("<p data-placeholder>", "<p>")]) {
+              fs.writeFileSync(file, content);
+              await Promise.resolve(spec.submit.onSubmit({ summary: "too early" })).catch((error: Error) => rejections.push(error.message));
+            }
+            fs.writeFileSync(file, seeded.replaceAll(" data-placeholder", "").replace("</h1>", "</h1>\n<p>Filled in.</p>"));
+            await spec.submit.onSubmit({ summary: "Filled in the design" });
+          },
+        ],
+        "design-reviewer": [submitReview("approve")],
+      },
+      { settings: { docFormat: "html" }, docTemplates: templates },
+    );
+    try {
+      const created = await h.runner.submit({ description: "Design it", kind: "design", repoId: "sample", title: "Cache & queue design" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(docPath, "docs/designs/t-001-cache-queue-design.html");
+      assert.match(rejections[0]!, /unmodified template/);
+      assert.match(rejections[1]!, /template placeholder elements/);
+      assert.equal(rejections.length, 2);
+      assert.equal(task.stages[0]!.docFormat, "html");
+      assert.equal(task.result?.docPath, docPath);
+      assert.equal(task.result?.docFormat, "html");
+      const doc = await h.runner.document(task.id);
+      assert.equal(doc.format, "html");
+      assert.deepEqual(doc.rounds, [1]);
+      assert.match(doc.content ?? "", /Filled in\./);
+      assert.ok(fs.existsSync(path.join(h.store.taskDir(task.id), "doc-r1.html")));
+      assert.match(git(h.repoPath, "show", `${task.branch}:${docPath}`), /Filled in\./);
+      const reviewerPrompt = h.driver.prompts["design-reviewer"]![0]!;
+      assert.match(reviewerPrompt, /light-themed HTML page/);
+      assert.match(reviewerPrompt, /template styles omitted/);
+      assert.doesNotMatch(reviewerPrompt, /--blue-soft/);
+      assert.match(h.driver.specsFor("designer")[0]!.systemPrompt, /data-placeholder/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("document task: technical writer and doc reviewer iterate on an HTML document", async () => {
+    let docPath = "";
+    const fill = (extra: string): Step => (spec) => {
+      const file = path.join(spec.workingDirectory, docPath);
+      fs.writeFileSync(file, fs.readFileSync(file, "utf8").replaceAll(" data-placeholder", "").replace("</h1>", `</h1>\n${extra}`));
+    };
+    const h = createHarness(
+      {
+        writer: [
+          steps((_spec, prompt) => {
+            docPath = designPathFrom(prompt);
+          }, fill("<p>Quick start</p>"), submitWork("Wrote the guide")),
+          steps(fill("<p>Troubleshooting</p>"), submitWork("Added troubleshooting", [{ comment_id: "W1", status: "addressed", note: "Added" }])),
+        ],
+        "doc-reviewer": [submitReview("request_changes", [{ severity: "major", body: "Add troubleshooting" }]), submitReview("approve")],
+      },
+      { settings: { docFormat: "html", documentDir: "docs/guides" }, docTemplates: templates },
+    );
+    try {
+      const created = await h.runner.submit({ description: "Write an onboarding guide", kind: "document", repoId: "sample", title: "Onboarding guide" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(task.result?.approved, true);
+      assert.equal(docPath, "docs/guides/t-001-onboarding-guide.html");
+      assert.deepEqual(task.stages.map((stage) => stage.kind), ["document"]);
+      assert.deepEqual((task.agents ?? []).map((agent) => agent.role), ["writer", "doc-reviewer"]);
+      assert.equal(task.stages[0]!.rounds[0]!.review!.comments[0]!.id, "W1");
+      assert.equal(task.stages[0]!.rounds[0]!.review!.comments[0]!.status, "addressed");
+      assert.equal(branchHead(h.repoPath, `${task.branch}--writer`), branchHead(h.repoPath, task.branch!));
+      const shown = git(h.repoPath, "show", `${task.branch}:${docPath}`);
+      assert.match(shown, /Quick start/);
+      assert.match(shown, /Troubleshooting<\/p>/);
+      assert.match(h.driver.specsFor("writer")[0]!.systemPrompt, /TECHNICAL WRITER/);
+      assert.match(h.driver.specsFor("doc-reviewer")[0]!.systemPrompt, /DOCUMENTATION REVIEWER/);
+      assert.match(h.driver.prompts.writer![1]!, /Update the document `docs\/guides\/t-001-onboarding-guide\.html`/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("the document viewer serves a sandboxed page that loads only the hub's local Mermaid scripts", async () => {
+    const h = createHarness(
+      {
+        designer: [
+          steps((spec, prompt) => {
+            const file = path.join(spec.workingDirectory, designPathFrom(prompt));
+            fs.writeFileSync(file, fs.readFileSync(file, "utf8").replaceAll(" data-placeholder", ""));
+          }, submitWork("done")),
+        ],
+        "design-reviewer": [submitReview("approve")],
+      },
+      { settings: { docFormat: "html" }, docTemplates: templates },
+    );
+    const port = await new Promise<number>((resolve) => {
+      const probe = net.createServer().listen(0, "127.0.0.1", () => {
+        const { port: free } = probe.address() as net.AddressInfo;
+        probe.close(() => resolve(free));
+      });
+    });
+    const server = createHttpServer({
+      host: "127.0.0.1",
+      port,
+      publicDir: path.join(import.meta.dirname, "..", "public"),
+      router: createApiRouter({
+        store: h.store,
+        bus: h.bus,
+        runner: h.runner,
+        copilot: {} as CopilotService,
+        repos: {} as RepoService,
+        version: "test",
+      }),
+    });
+    try {
+      const created = await h.runner.submit({ description: "Design", kind: "design", repoId: "sample" });
+      await h.runner.idle();
+      await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+      const origin = `http://127.0.0.1:${port}`;
+      const response = await fetch(`${origin}/api/tasks/${created.id}/doc/view`);
+      assert.equal(response.status, 200);
+      const csp = response.headers.get("content-security-policy") ?? "";
+      assert.match(csp, /sandbox allow-scripts/);
+      assert.ok(csp.includes(`script-src ${origin};`), csp);
+      assert.ok(csp.includes(`frame-ancestors ${origin};`), csp);
+      assert.equal(response.headers.get("x-frame-options"), null);
+      const html = await response.text();
+      assert.doesNotMatch(html, /cdn\.jsdelivr/);
+      assert.match(html, /<script src="\/vendor\/mermaid\.min\.js"><\/script>\n<script src="\/lib\/doc-viewer\.js"><\/script>\n<\/body>/);
+      const vendor = await fetch(`${origin}/lib/doc-viewer.js`);
+      assert.equal(vendor.status, 200);
+    } finally {
+      server.close();
+      h.cleanup();
+    }
+  });
+});
+
+describe("manager", () => {
+  test("logs its communication with sub-agents: spawn, assign, submit, relay, verdict, release", async () => {
+    const h = createHarness({
+      coder: [steps(writeFile("a.txt", "a\n"), submitWork("Add a"))],
+      resolver: [steps(writeFile("a.txt", "b\n"), submitWork("Use b", [{ comment_id: "C1", status: "addressed", note: "Done" }]))],
+      "code-reviewer": [submitReview("request_changes", [{ severity: "minor", body: "Use b" }]), submitReview("approve")],
+    });
+    const streamed: string[] = [];
+    h.bus.onGlobal((message) => {
+      if (message.type === "comm") streamed.push(message.entry.kind);
+    });
+    try {
+      const created = await h.runner.submit({ description: "Add a", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const log = h.store.recentComm({ taskId: created.id });
+      const flow = log.map((entry) => `${entry.from}>${entry.to}:${entry.kind}`);
+      assert.deepEqual(flow.filter((step) => !step.endsWith(":lifecycle")), [
+        "manager>coder:spawn",
+        "manager>coder:assign",
+        "coder>manager:submit",
+        "manager>code-reviewer:spawn",
+        "manager>code-reviewer:relay",
+        "code-reviewer>manager:verdict",
+        "manager>resolver:spawn",
+        "manager>resolver:assign",
+        "resolver>manager:submit",
+        "manager>code-reviewer:relay",
+        "code-reviewer>manager:verdict",
+        "manager>coder:release",
+        "manager>code-reviewer:release",
+        "manager>resolver:release",
+      ]);
+      assert.equal(flow[0], "user>manager:lifecycle");
+      assert.equal(flow.at(-1), "manager>user:lifecycle");
+      assert.match(log.at(-1)!.text, /Completed: approved/);
+      assert.match(log.find((entry) => entry.kind === "verdict")!.text, /Requested changes: 1 comment \(1 minor\)/);
+      assert.match(log.find((entry) => entry.from === "resolver")!.text, /1 addressed, 0 declined/);
+      assert.deepEqual(log.map((entry) => entry.seq), [...log.map((entry) => entry.seq)].sort((a, b) => a - b));
+      assert.equal(streamed.length, log.length);
+      const overview = h.runner.overview();
+      assert.equal(overview.online, true);
+      assert.equal(overview.running, 0);
+      assert.equal(overview.comm.length, log.length);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("checks in on an agent that has been silent for too long", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const h = createHarness({
+      coder: [steps(async () => gate, writeFile("x.txt", "x\n"), submitWork("x"))],
+      "code-reviewer": [submitReview("approve")],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Slow work", kind: "coding", repoId: "sample" });
+      await waitFor(() => h.store.getTask(created.id)?.agents?.some((agent) => agent.role === "coder" && agent.status === "working") ?? false);
+      h.runner.checkOnAgents(Date.now() + 6 * 60_000);
+      h.runner.checkOnAgents(Date.now() + 7 * 60_000);
+      const checkIns = h.store.recentComm({ taskId: created.id }).filter((entry) => entry.kind === "monitor");
+      assert.equal(checkIns.length, 1, "one check-in per silent period");
+      assert.equal(checkIns[0]!.to, "coder");
+      assert.match(checkIns[0]!.text, /no new activity for 6 min/);
+      assert.ok(h.runner.overview().lastCheckAt);
+      release();
+      await h.runner.idle();
+      assert.equal(h.store.getTask(created.id)!.status, "completed");
+    } finally {
+      release();
+      h.cleanup();
+    }
+  });
+
+  test("resumes tasks interrupted by a hub restart once signed in", async () => {
+    const h = createHarness(
+      {
+        coder: [steps(writeFile("r.txt", "r\n"), submitWork("resumed work"))],
+        "code-reviewer": [submitReview("approve")],
+      },
+      { ready: false },
+    );
+    try {
+      const created = await h.runner.submit({ description: "Resume me", kind: "coding", repoId: "sample" });
+      const disabled = await h.runner.submit({ description: "Leave me", kind: "coding", repoId: "sample" });
+      // Simulate a hub that stopped while both tasks were running.
+      for (const id of [created.id, disabled.id]) h.store.getTask(id)!.status = "running";
+      h.store.getTask(disabled.id)!.autoResumes = 3;
+      const restarted = h.newRunner();
+      restarted.init();
+      assert.equal(h.store.getTask(created.id)!.status, "interrupted");
+      restarted.pump();
+      assert.equal(h.store.getTask(created.id)!.status, "interrupted", "waits until the runtime is signed in");
+      h.setReady(true);
+      restarted.pump();
+      await restarted.idle();
+      await restarted.shutdown();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(task.attempt, 2);
+      assert.equal(task.autoResumes, undefined);
+      assert.equal(h.store.getTask(disabled.id)!.status, "interrupted", "gives up after repeated automatic resumes");
+      assert.ok(h.store.recentComm({ taskId: created.id }).some((entry) => /Resuming after the hub restart/.test(entry.text)));
     } finally {
       h.cleanup();
     }

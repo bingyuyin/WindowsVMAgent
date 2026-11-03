@@ -1,0 +1,100 @@
+  <section id="summary">
+    <h2>Summary</h2>
+    <div class="callout" data-placeholder>
+      <p>The problem and the proposed solution in 3-5 sentences, plus the single most important decision.</p>
+    </div>
+    <dl class="facts" data-placeholder>
+      <dt>Status</dt><dd>Draft</dd>
+      <dt>Scope</dt><dd>Components and repositories affected</dd>
+      <dt>Key decision</dt><dd>One line</dd>
+    </dl>
+  </section>
+
+  <section id="context">
+    <h2>Context and problem</h2>
+    <p data-placeholder>Who is affected and why it matters. Describe the current behavior with references to real files, modules and symbols (use &lt;code&gt;).</p>
+  </section>
+
+  <section id="goals">
+    <h2>Goals and non-goals</h2>
+    <div class="pros-cons" data-placeholder>
+      <div class="pros"><h4>Goals</h4><ul><li>Measurable goal</li></ul></div>
+      <div class="cons"><h4>Non-goals</h4><ul><li>Explicitly out of scope</li></ul></div>
+    </div>
+    <h3>Requirements</h3>
+    <table data-placeholder>
+      <thead><tr><th>Type</th><th>Requirement</th><th>Target</th></tr></thead>
+      <tbody>
+        <tr><td><span class="badge">Functional</span></td><td>What the system must do</td><td>-</td></tr>
+        <tr><td><span class="badge violet">Non-functional</span></td><td>Latency, scale, availability, security, privacy</td><td>Concrete number</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="design">
+    <h2>Proposed design</h2>
+    <h3>Architecture overview</h3>
+    <figure class="diagram" data-placeholder>
+      <pre class="mermaid">
+flowchart LR
+  Client --> API[API layer]
+  API --> Service[Domain service]
+  Service --> Store[(Data store)]
+      </pre>
+      <figcaption>Components and data flow (replace with the real architecture)</figcaption>
+    </figure>
+    <h3>Components and responsibilities</h3>
+    <table data-placeholder>
+      <thead><tr><th>Component</th><th>Responsibility</th><th>Location</th><th>Change</th></tr></thead>
+      <tbody><tr><td>Name</td><td>What it owns</td><td><code>path/to/module</code></td><td><span class="badge green">New</span> / <span class="badge amber">Modified</span></td></tr></tbody>
+    </table>
+    <h3>Key flows</h3>
+    <figure class="diagram" data-placeholder>
+      <pre class="mermaid">
+sequenceDiagram
+  participant U as User
+  participant S as Service
+  U->>S: request
+  S-->>U: response
+      </pre>
+      <figcaption>Main request flow, including the error path</figcaption>
+    </figure>
+    <h3>Interfaces, data model and configuration</h3>
+    <div data-placeholder>
+      <p>API signatures, schemas and data model changes (tables or code blocks), error handling and retries, concurrency and configuration.</p>
+    </div>
+  </section>
+
+  <section id="alternatives">
+    <h2>Alternatives considered</h2>
+    <table data-placeholder>
+      <thead><tr><th>Option</th><th>Pros</th><th>Cons</th><th>Decision</th></tr></thead>
+      <tbody><tr><td>Alternative</td><td>Benefits</td><td>Costs</td><td><span class="badge gray">Rejected</span> because ...</td></tr></tbody>
+    </table>
+  </section>
+
+  <section id="risks">
+    <h2>Risks, security and operations</h2>
+    <table data-placeholder>
+      <thead><tr><th>Risk</th><th>Impact</th><th>Mitigation</th></tr></thead>
+      <tbody><tr><td>Failure mode, compatibility or migration risk</td><td><span class="badge red">High</span></td><td>How it is prevented or detected; rollback</td></tr></tbody>
+    </table>
+    <div class="cards" data-placeholder>
+      <div class="card"><h4>Security and privacy</h4><p>Threats, authentication/authorization, data handling.</p></div>
+      <div class="card"><h4>Observability</h4><p>Logs, metrics, traces and alerts.</p></div>
+      <div class="card"><h4>Performance</h4><p>Expected load and limits.</p></div>
+    </div>
+  </section>
+
+  <section id="plan">
+    <h2>Testing, rollout and implementation plan</h2>
+    <ol class="steps" data-placeholder>
+      <li><strong>Step</strong> - an independently shippable change with its tests.</li>
+    </ol>
+    <div class="callout tip" data-placeholder><p>Testing strategy (unit, integration, end-to-end) and rollout/rollback criteria.</p></div>
+  </section>
+
+  <section id="open-questions">
+    <h2>Open questions</h2>
+    <ul data-placeholder><li>Question, owner and how it will be resolved (or "None").</li></ul>
+  </section>

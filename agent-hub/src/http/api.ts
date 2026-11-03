@@ -1,13 +1,17 @@
 import path from "node:path";
 import type { Bus, TaskMessage } from "../bus.ts";
 import type { CopilotService, LoginProvider } from "../copilot/service.ts";
+import { docForViewer, escapeHtml } from "../docs.ts";
 import type { RepoService } from "../repos.ts";
 import type { Store } from "../store.ts";
-import { ISOLATION_MODES, type IsolationMode, type Settings, type TaskKind } from "../types.ts";
+import { DOC_FORMATS, ISOLATION_MODES, type DocFormat, type IsolationMode, type Settings, type TaskKind } from "../types.ts";
 import { HttpError } from "../util.ts";
 import type { TaskRunner } from "../workflow/runner.ts";
 import { summarizeTask } from "../workflow/summary.ts";
 import { openSse, Router } from "./server.ts";
+
+/** Scripts injected into HTML documents shown in the sandboxed viewer (Mermaid + diagram rendering). */
+export const DOC_VIEWER_SCRIPTS = ["/vendor/mermaid.min.js", "/lib/doc-viewer.js"];
 
 export interface ApiDeps {
   store: Store;
@@ -78,6 +82,17 @@ export function createApiRouter(deps: ApiDeps): Router {
     return settings;
   });
 
+  router.get("/api/storage", () => store.storageInfo());
+
+  // ---- Manager & agents ------------------------------------------------------------------
+  router.get("/api/agents/overview", ({ url }) => {
+    const limit = Number(url.searchParams.get("limit"));
+    return runner.overview({
+      limit: Number.isInteger(limit) && limit > 0 ? Math.min(limit, 1000) : undefined,
+      taskId: url.searchParams.get("taskId") ?? undefined,
+    });
+  });
+
   // ---- Repositories ----------------------------------------------------------------------
   router.get("/api/repos", () => repos.list());
   router.post("/api/repos", ({ body }) =>
@@ -140,10 +155,37 @@ export function createApiRouter(deps: ApiDeps): Router {
     runner.diff(params.id!, url.searchParams.get("from") ?? undefined, url.searchParams.get("to") ?? undefined),
   );
 
-  router.get("/api/tasks/:id/design", ({ params, url }) => {
+  const documentRound = (url: URL) => {
     const round = Number(url.searchParams.get("round"));
-    return runner.design(params.id!, Number.isInteger(round) && round > 0 ? round : undefined);
-  });
+    return Number.isInteger(round) && round > 0 ? round : undefined;
+  };
+  router.get("/api/tasks/:id/doc", ({ params, url }) => runner.document(params.id!, documentRound(url)));
+  router.get("/api/tasks/:id/design", ({ params, url }) => runner.document(params.id!, documentRound(url)));
+
+  // Serves the document as a standalone page for the UI's sandboxed iframe (or a new tab). The page runs
+  // in an opaque origin (CSP sandbox) and may only load the hub's local Mermaid scripts.
+  router.get(
+    "/api/tasks/:id/doc/view",
+    async ({ req, res, params, url }) => {
+      const doc = await runner.document(params.id!, documentRound(url));
+      if (doc.content === null) throw new HttpError(404, "No document has been written yet");
+      const origin = `http://${req.headers.host ?? ""}`;
+      const html =
+        doc.format === "html"
+          ? docForViewer(doc.content, DOC_VIEWER_SCRIPTS)
+          : `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${escapeHtml(doc.path ?? "Document")}</title></head>` +
+            `<body><pre style="white-space: pre-wrap; font: 14px/1.6 Consolas, monospace; padding: 24px">${escapeHtml(doc.content)}</pre></body></html>`;
+      res.removeHeader("X-Frame-Options");
+      res.setHeader(
+        "Content-Security-Policy",
+        `default-src 'none'; script-src ${origin}; style-src 'unsafe-inline'; img-src data: ${origin}; font-src data:; ` +
+          `frame-ancestors ${origin}; base-uri 'none'; form-action 'none'; sandbox allow-scripts allow-popups`,
+      );
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(html);
+    },
+    { raw: true },
+  );
 
   // ---- Live updates (Server-Sent Events) ---------------------------------------------------
   router.get(
@@ -222,16 +264,27 @@ export function parseSettingsPatch(body: Record<string, unknown>): Partial<Setti
     if (typeof body.cleanupWorktrees !== "boolean") throw new HttpError(400, "'cleanupWorktrees' must be a boolean");
     patch.cleanupWorktrees = body.cleanupWorktrees;
   }
+  if ("resumeInterruptedTasks" in body) {
+    if (typeof body.resumeInterruptedTasks !== "boolean") throw new HttpError(400, "'resumeInterruptedTasks' must be a boolean");
+    patch.resumeInterruptedTasks = body.resumeInterruptedTasks;
+  }
+  if ("docFormat" in body) {
+    if (!DOC_FORMATS.includes(body.docFormat as DocFormat)) throw new HttpError(400, `'docFormat' must be one of: ${DOC_FORMATS.join(", ")}`);
+    patch.docFormat = body.docFormat as DocFormat;
+  }
   if ("maxRounds" in body) patch.maxRounds = intIn(body.maxRounds, 1, 10, "maxRounds");
   if ("maxConcurrency" in body) patch.maxConcurrency = intIn(body.maxConcurrency, 1, 8, "maxConcurrency");
   if ("turnTimeoutMinutes" in body) patch.turnTimeoutMinutes = intIn(body.turnTimeoutMinutes, 5, 600, "turnTimeoutMinutes");
   if ("inputTimeoutMinutes" in body) patch.inputTimeoutMinutes = intIn(body.inputTimeoutMinutes, 1, 1440, "inputTimeoutMinutes");
-  if ("designDocDir" in body) {
-    const raw = String(body.designDocDir ?? "").trim().replaceAll("\\", "/").replace(/^(\.\/)+/, "").replace(/\/+$/, "");
-    if (!raw || path.isAbsolute(raw) || /^[a-z]:/i.test(raw) || raw.split("/").includes("..")) {
-      throw new HttpError(400, "'designDocDir' must be a relative folder inside the repository");
-    }
-    patch.designDocDir = raw;
-  }
+  if ("designDocDir" in body) patch.designDocDir = repoFolder(body.designDocDir, "designDocDir");
+  if ("documentDir" in body) patch.documentDir = repoFolder(body.documentDir, "documentDir");
   return patch;
+}
+
+function repoFolder(value: unknown, key: string): string {
+  const raw = String(value ?? "").trim().replaceAll("\\", "/").replace(/^(\.\/)+/, "").replace(/\/+$/, "");
+  if (!raw || path.isAbsolute(raw) || /^[a-z]:/i.test(raw) || raw.split("/").includes("..")) {
+    throw new HttpError(400, `'${key}' must be a relative folder inside the repository`);
+  }
+  return raw;
 }

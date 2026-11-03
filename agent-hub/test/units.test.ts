@@ -3,6 +3,9 @@ import path from "node:path";
 import { describe, test } from "node:test";
 import { evaluatePermission, parseGitCommand, splitCommandText } from "../src/agents/policy.ts";
 import { describeTool } from "../src/agents/copilotDriver.ts";
+import { systemPromptFor } from "../src/agents/prompts.ts";
+import { docForPrompt, docForViewer, documentProblem, formatOfPath, loadDocTemplates, renderDocTemplate } from "../src/docs.ts";
+import { parseSettingsPatch } from "../src/http/api.ts";
 import { fallbackReview, normalizeReview, normalizeWork } from "../src/workflow/submissions.ts";
 
 const cwd = path.resolve("/work/tree");
@@ -132,5 +135,71 @@ describe("tool labels", () => {
     assert.equal(describeTool("submit_review", { verdict: "request_changes" }, cwd), "Submitting review (request changes)");
     assert.equal(describeTool("skill", { skill: "code-review" }, cwd), "Loading skill: code-review");
     assert.equal(describeTool("skill", {}, cwd), "Loading a skill");
+  });
+});
+
+describe("HTML documents", () => {
+  const templates = loadDocTemplates(path.join(import.meta.dirname, "..", "templates"))!;
+  const vars = { title: "A <b> & c", taskId: "T-042", repo: "calc", date: "2025-01-02", author: "writer", reviewer: "doc-reviewer" } as const;
+
+  test("templates are light-themed, escaped and full of placeholders to fill", () => {
+    const html = renderDocTemplate(templates, "document", vars)!;
+    assert.match(html, /<h1>A &lt;b&gt; &amp; c<\/h1>/);
+    assert.match(html, /Documentation/);
+    assert.match(html, /Technical writer agent, reviewed by the doc reviewer agent/);
+    assert.match(html, /--bg: #f5f7fb/);
+    assert.doesNotMatch(html, /\{\{\w+\}\}/);
+    assert.match(renderDocTemplate(templates, "design", { ...vars, author: "designer", reviewer: "design-reviewer" })!, /sequenceDiagram/);
+    assert.equal(renderDocTemplate(templates, "coding", vars), null);
+  });
+
+  test("documentProblem explains what blocks a submission", () => {
+    const seeded = renderDocTemplate(templates, "document", vars)!;
+    assert.match(documentProblem(null, "html") ?? "", /missing or empty/);
+    assert.match(documentProblem(seeded, "html", seeded) ?? "", /unmodified template/);
+    assert.match(documentProblem(seeded.replace("</h1>", "</h1><p>x</p>"), "html", seeded) ?? "", /template placeholder elements/);
+    assert.match(documentProblem("<p>no title</p>", "html") ?? "", /no <h1> title/);
+    assert.equal(documentProblem("<h1 class='t'>Doc</h1><p>Ok</p>", "html"), null);
+    assert.equal(documentProblem("# Markdown is fine", "markdown"), null);
+    assert.equal(documentProblem('<h1>Doc</h1><p>Mentions data-placeholder in prose</p><p class="x">ok</p>', "html"), null);
+  });
+
+  test("prompts get the content without styles; the viewer swaps the CDN loader for local scripts", () => {
+    const seeded = renderDocTemplate(templates, "design", { ...vars, author: "designer", reviewer: "design-reviewer" })!;
+    const compact = docForPrompt(seeded, "html");
+    assert.doesNotMatch(compact, /--blue-soft|<script|Authoring guide/);
+    assert.match(compact, /template styles omitted/);
+    assert.equal(docForPrompt("# Title\n\n\n\nText", "markdown"), "# Title\n\n\n\nText");
+    const viewed = docForViewer(seeded, ["/vendor/mermaid.min.js", "/lib/doc-viewer.js"]);
+    assert.doesNotMatch(viewed, /cdn\.jsdelivr|<script[^>]*data-hub-mermaid/);
+    assert.match(viewed, /<script src="\/lib\/doc-viewer\.js"><\/script>\n<\/body>/);
+    assert.match(docForViewer("<p>fragment</p>", ["/x.js"]), /<p>fragment<\/p>\n<script src="\/x\.js"><\/script>$/);
+    assert.equal(formatOfPath("docs/a.HTML"), "html");
+    assert.equal(formatOfPath("docs/a.md"), "markdown");
+  });
+
+  test("system prompts tell document authors and reviewers how to work with HTML", () => {
+    const env = { worktree: cwd, branch: "t--writer", taskBranch: "t", baseSha: "abc1234567" };
+    const writer = systemPromptFor("writer", env, ["technical-writing"], { docFormat: "html" });
+    assert.match(writer, /ROLE: TECHNICAL WRITER/);
+    assert.match(writer, /data-placeholder/);
+    assert.match(writer, /<pre class="mermaid">/);
+    assert.match(writer, /load the `technical-writing` skill/);
+    assert.match(systemPromptFor("writer", env, [], { docFormat: "markdown" }), /GitHub-flavored Markdown/);
+    const reviewer = systemPromptFor("doc-reviewer", { ...env, branch: null }, ["doc-review"], { docFormat: "html" });
+    assert.match(reviewer, /strictly read-only/);
+    assert.match(reviewer, /leftover template placeholders/);
+    assert.match(reviewer, /pinned \(detached HEAD\)/);
+  });
+
+  test("settings accept the document options", () => {
+    assert.deepEqual(parseSettingsPatch({ docFormat: "markdown", documentDir: ".\\docs\\guides\\", resumeInterruptedTasks: false }), {
+      docFormat: "markdown",
+      documentDir: "docs/guides",
+      resumeInterruptedTasks: false,
+    });
+    assert.throws(() => parseSettingsPatch({ docFormat: "pdf" }), /docFormat/);
+    assert.throws(() => parseSettingsPatch({ documentDir: "../outside" }), /documentDir/);
+    assert.throws(() => parseSettingsPatch({ resumeInterruptedTasks: "yes" }), /resumeInterruptedTasks/);
   });
 });

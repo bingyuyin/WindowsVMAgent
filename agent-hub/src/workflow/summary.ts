@@ -18,10 +18,13 @@ export interface TaskSummary {
   activity?: Activity;
   authorModel: string;
   reviewerModel: string;
-  agents: Array<Pick<AgentInfo, "role" | "status" | "model" | "assignment" | "lastActivity" | "branch">>;
+  agents: Array<
+    Pick<AgentInfo, "role" | "status" | "model" | "assignment" | "lastActivity" | "branch" | "updatedAt" | "turns" | "rounds" | "usage">
+  >;
   approved: boolean | null;
   shortStat?: string;
   openComments?: number;
+  docPath?: string;
   needsInput: boolean;
   error?: string;
   stages: Array<{
@@ -56,17 +59,22 @@ export function summarizeTask(task: Task): TaskSummary {
     activity: task.activity,
     authorModel: task.authorModel,
     reviewerModel: task.reviewerModel,
-    agents: (task.agents ?? []).map(({ role, status, model, assignment, lastActivity, branch }) => ({
+    agents: (task.agents ?? []).map(({ role, status, model, assignment, lastActivity, branch, updatedAt, turns, rounds, usage }) => ({
       role,
       status,
       model,
       assignment,
       lastActivity,
       branch,
+      updatedAt,
+      turns,
+      rounds,
+      usage,
     })),
     approved: task.result ? task.result.approved : null,
     shortStat: task.result?.shortStat,
     openComments: task.result?.openComments,
+    docPath: task.result?.docPath ?? task.stages.find((stage) => stage.docPath)?.docPath,
     needsInput: Boolean(task.pendingInput),
     error: task.error,
     stages: task.stages.map((stage) => ({

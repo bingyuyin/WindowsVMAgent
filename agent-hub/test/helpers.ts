@@ -5,6 +5,7 @@ import path from "node:path";
 import type { AgentDriver, AgentHandle, AgentSpec, ReviewSubmissionInput, WorkSubmissionInput } from "../src/agents/driver.ts";
 import { Bus } from "../src/bus.ts";
 import type { HubSkills } from "../src/context.ts";
+import type { DocTemplates } from "../src/docs.ts";
 import { Store } from "../src/store.ts";
 import type { AgentRole, Settings } from "../src/types.ts";
 import { TaskRunner } from "../src/workflow/runner.ts";
@@ -79,9 +80,9 @@ export const submitReview =
     await spec.submit.onSubmit({ verdict, summary: `${verdict} summary`, comments });
   };
 
-/** Extracts the design document path the hub asked the designer to write. */
+/** Extracts the design/document path the hub asked the author to write. */
 export const designPathFrom = (prompt: string): string => {
-  const match = /`([^`]+\.md)` \(relative/.exec(prompt) ?? /document `([^`]+\.md)`/.exec(prompt);
+  const match = /`([^`]+\.(?:md|html))` \(relative/.exec(prompt) ?? /document `([^`]+\.(?:md|html))`/.exec(prompt);
   if (!match?.[1]) throw new Error("design path not found in prompt");
   return match[1];
 };
@@ -101,6 +102,10 @@ export interface Harness {
   driver: ScriptedDriver;
   repoPath: string;
   worktreesDir: string;
+  /** Simulates signing the Copilot runtime in or out. */
+  setReady(ready: boolean): void;
+  /** Creates a runner as a restarted hub would (same store and driver). */
+  newRunner(): TaskRunner;
   cleanup(): void;
 }
 
@@ -108,7 +113,11 @@ export interface HarnessOptions {
   settings?: Partial<Settings>;
   files?: Record<string, string>;
   hubSkills?: HubSkills;
+  docTemplates?: DocTemplates | null;
+  ready?: boolean;
 }
+
+export const TEMPLATES_DIR = path.join(import.meta.dirname, "..", "templates");
 
 export function createHarness(script: Partial<Record<AgentRole, Step[]>>, options: HarnessOptions = {}): Harness {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-hub-test-"));
@@ -125,19 +134,30 @@ export function createHarness(script: Partial<Record<AgentRole, Step[]>>, option
 
   const store = new Store(path.join(root, "data"));
   store.load();
-  store.updateSettings({ authorModel: "fake-author", reviewerModel: "fake-reviewer", maxRounds: 3, inputTimeoutMinutes: 1, ...options.settings });
+  store.updateSettings({
+    authorModel: "fake-author",
+    reviewerModel: "fake-reviewer",
+    maxRounds: 3,
+    inputTimeoutMinutes: 1,
+    docFormat: "markdown",
+    ...options.settings,
+  });
   store.addRepo({ id: "sample", name: "sample", path: repoPath, defaultBranch: "main", remoteUrl: null, addedAt: new Date().toISOString() });
   const bus = new Bus();
   const driver = new ScriptedDriver(script);
   const worktreesDir = path.join(root, "data", "worktrees");
-  const runner = new TaskRunner({
-    store,
-    bus,
-    runtime: { isReady: () => true, deleteSessions: async () => {} },
-    driver,
-    worktreesDir,
-    hubSkills: options.hubSkills,
-  });
+  let ready = options.ready ?? true;
+  const newRunner = () =>
+    new TaskRunner({
+      store,
+      bus,
+      runtime: { isReady: () => ready, deleteSessions: async () => {} },
+      driver,
+      worktreesDir,
+      hubSkills: options.hubSkills,
+      docTemplates: options.docTemplates,
+    });
+  const runner = newRunner();
   return {
     root,
     store,
@@ -146,6 +166,10 @@ export function createHarness(script: Partial<Record<AgentRole, Step[]>>, option
     driver,
     repoPath,
     worktreesDir,
+    setReady: (value) => {
+      ready = value;
+    },
+    newRunner,
     cleanup: () => {
       store.flushAllSync();
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

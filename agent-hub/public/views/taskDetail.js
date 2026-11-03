@@ -8,6 +8,8 @@ import {
   copyButton,
   duration,
   h,
+  isDocStage,
+  isReviewerRole,
   KIND_LABELS,
   phaseLabel,
   ROLE_DESCRIPTIONS,
@@ -27,7 +29,8 @@ import { renderDiff, renderMarkdown } from "../lib/markdown.js";
 import { state } from "../lib/store.js";
 
 const ACTIVE = ["queued", "running", "needs-input"];
-const REVIEWER_ROLE = { design: "design-reviewer", coding: "code-reviewer" };
+const REVIEWER_ROLE = { design: "design-reviewer", document: "doc-reviewer", coding: "code-reviewer" };
+const AUTHOR_ROLE = { design: "designer", document: "writer", coding: "coder" };
 const STAGE_STATUS = {
   pending: ["Pending", "neutral"],
   running: ["In progress", "running"],
@@ -68,7 +71,9 @@ export function taskDetailView(root, { params }) {
   let disposed = false;
   let activeTab = "conversation";
   let showTools = true;
-  let designRound = null;
+  let docRound = null;
+  let docMode = "rendered";
+  let docFrame = null;
   let diffSelection = null;
   let renderedInputId = null;
   const signatures = {};
@@ -122,6 +127,13 @@ export function taskDetailView(root, { params }) {
       heroElapsed.textContent = `${duration(task.phaseStartedAt)} in this step`;
     }
   }, 1000);
+  // The sandboxed document viewer reports its content height so the iframe can fit it.
+  const onFrameMessage = (event) => {
+    if (!docFrame || event.source !== docFrame.contentWindow || event.data?.type !== "hub-doc-height") return;
+    const height = Number(event.data.height);
+    if (Number.isFinite(height)) docFrame.height = String(Math.min(Math.max(Math.ceil(height) + 4, 320), 40000));
+  };
+  window.addEventListener("message", onFrameMessage);
 
   async function load() {
     try {
@@ -233,7 +245,7 @@ export function taskDetailView(root, { params }) {
 
   function renderMeta() {
     const usage = task.usage ?? {};
-    const resolver = task.kind !== "design" && task.resolverModel && task.resolverModel !== task.authorModel ? ` · resolver ${task.resolverModel}` : "";
+    const resolver = task.kind === "coding" || task.kind === "design-coding" ? (task.resolverModel && task.resolverModel !== task.authorModel ? ` · resolver ${task.resolverModel}` : "") : "";
     setContent(
       metaBox,
       meta("Repository", task.repoName),
@@ -312,6 +324,8 @@ export function taskDetailView(root, { params }) {
       const lastStage = task.stages.at(-1);
       const approvedRound = lastStage?.rounds.find((round) => round.review?.verdict === "approve");
       const reviewer = lastStage ? ROLE_LABELS[REVIEWER_ROLE[lastStage.kind]] : "reviewer";
+      const docPath = result.docPath ?? result.designDocPath;
+      const docStage = task.stages.find((stage) => isDocStage(stage.kind));
       setContent(
         heroBox,
         h(
@@ -330,13 +344,14 @@ export function taskDetailView(root, { params }) {
             { class: "result-stats" },
             h("span", {}, h("strong", {}, String(result.commits ?? 0)), " commit(s)"),
             result.shortStat ? h("span", {}, result.shortStat) : null,
-            result.designDocPath ? h("span", {}, "design ", h("span", { class: "mono" }, result.designDocPath)) : null,
+            docPath ? h("span", {}, docStage?.kind === "document" ? "document " : "design ", h("span", { class: "mono" }, docPath)) : null,
             task.branch ? h("span", {}, "branch ", h("span", { class: "mono" }, task.branch), " ", copyButton(task.branch)) : null,
           ),
           result.summary ? h("div", { class: "hero-summary" }, renderMarkdown(result.summary)) : null,
           h(
             "div",
             { class: "row wrap" },
+            docStage ? h("button", { class: "btn btn-sm btn-primary", onclick: () => selectTab("document") }, docStage.kind === "document" ? "View document" : "View design") : null,
             h("button", { class: "btn btn-sm", onclick: () => selectTab("changes") }, "View changes"),
             h("button", { class: "btn btn-sm", onclick: () => selectTab("conversation") }, "Review rounds"),
             h("button", { class: "btn btn-sm", onclick: () => selectTab("result") }, "Merge instructions"),
@@ -381,7 +396,7 @@ export function taskDetailView(root, { params }) {
           const agent = byRole.get(role);
           const notNeeded = !agent && !ACTIVE.includes(task.status) && task.status === "completed";
           const info = notNeeded ? { label: "Not needed", cls: "neutral" } : agentStatusInfo(agent);
-          const reviewer = role === "code-reviewer" || role === "design-reviewer";
+          const reviewer = isReviewerRole(role);
           const tokens = agent ? (agent.usage?.inputTokens ?? 0) + (agent.usage?.outputTokens ?? 0) : 0;
           const workspace = agent?.workspace
             ? agent.workspaceRemoved
@@ -437,7 +452,7 @@ export function taskDetailView(root, { params }) {
   }
 
   function modelForRole(role) {
-    if (role === "code-reviewer" || role === "design-reviewer") return task.reviewerModel;
+    if (isReviewerRole(role)) return task.reviewerModel;
     if (role === "resolver") return task.resolverModel || task.authorModel;
     return task.authorModel;
   }
@@ -516,7 +531,7 @@ export function taskDetailView(root, { params }) {
                         h(
                           "div",
                           { class: "rn-steps" },
-                          h("span", { class: `rn-step rn-${authorState}` }, authorState === "active" ? `${stage.kind === "design" ? "Writing" : "Coding"}…` : stage.kind === "design" ? "✎ Draft" : "✎ Code"),
+                          h("span", { class: `rn-step rn-${authorState}` }, authorState === "active" ? `${isDocStage(stage.kind) ? "Writing" : "Coding"}…` : isDocStage(stage.kind) ? "✎ Draft" : "✎ Code"),
                           h("span", { class: "rn-sep" }, "→"),
                           h("span", { class: `rn-step rn-${reviewState}` }, reviewLabel),
                         ),
@@ -572,11 +587,11 @@ export function taskDetailView(root, { params }) {
   }
 
   function renderTabs() {
-    const hasDesign = task.stages.some((stage) => stage.kind === "design");
+    const docStage = task.stages.find((stage) => isDocStage(stage.kind));
     const tabs = [
       ["conversation", "Review rounds"],
       ["timeline", "Timeline"],
-      hasDesign ? ["design", "Design doc"] : null,
+      docStage ? ["document", docStage.kind === "document" ? "Document" : "Design doc"] : null,
       ["changes", "Changes"],
       ["context", "Context"],
       ["result", "Result"],
@@ -612,7 +627,7 @@ export function taskDetailView(root, { params }) {
     const renderers = {
       conversation: renderConversation,
       timeline: renderTimeline,
-      design: renderDesign,
+      document: renderDocument,
       changes: renderChanges,
       context: renderContext,
       result: renderResult,
@@ -716,7 +731,7 @@ export function taskDetailView(root, { params }) {
     const current = ["running", "needs-input"].includes(task.status) && task.currentStage === stage.kind && task.currentRound === round.n;
     const author = round.author;
     const review = round.review;
-    const authorRole = author?.role ?? (stage.kind === "design" ? "designer" : round.n > 1 || (current && task.phase === "revising") ? "resolver" : "coder");
+    const authorRole = author?.role ?? (isDocStage(stage.kind) ? AUTHOR_ROLE[stage.kind] : round.n > 1 || (current && task.phase === "revising") ? "resolver" : "coder");
     const reviewerRole = REVIEWER_ROLE[stage.kind];
     return h(
       "div",
@@ -859,54 +874,93 @@ export function taskDetailView(root, { params }) {
     el.title = status && !status.success ? status.error || "failed" : "";
   }
 
-  async function renderDesign(force) {
-    const stage = task.stages.find((candidate) => candidate.kind === "design");
+  async function renderDocument(force) {
+    const stage = task.stages.find((candidate) => isDocStage(candidate.kind));
     const versions = (stage?.rounds ?? []).filter((round) => round.author?.docSnapshot).map((round) => round.n);
-    const signature = JSON.stringify([versions, stage?.status, designRound]);
-    if (!force && signatures.design === signature) return;
-    signatures.design = signature;
+    const signature = JSON.stringify([versions, stage?.status, docRound, docMode]);
+    if (!force && signatures.document === signature) return;
+    signatures.document = signature;
+    docFrame = null;
+    const author = ROLE_LABELS[AUTHOR_ROLE[stage?.kind ?? "design"]].toLowerCase();
     if (!versions.length) {
-      setContent(tabBody, h("div", { class: "empty card muted" }, ACTIVE.includes(task.status) ? spinner("The designer is writing the first draft…") : "No design document was submitted."));
+      setContent(tabBody, h("div", { class: "empty card muted" }, ACTIVE.includes(task.status) ? spinner(`The ${author} is writing the first draft…`) : "No document was submitted."));
       return;
     }
-    const selected = designRound && versions.includes(designRound) ? designRound : versions.at(-1);
+    const selected = docRound && versions.includes(docRound) ? docRound : versions.at(-1);
     const latest = versions.at(-1);
     const final = stage.status === "approved" || stage.status === "not-approved";
-    const content = h("div", { class: "card doc" }, spinner("Loading document…"));
+    const format = stage.docFormat ?? (/\.html?$/i.test(stage.docPath ?? "") ? "html" : "markdown");
+    const viewUrl = `/api/tasks/${encodeURIComponent(task.id)}/doc/view?round=${selected}`;
+    const modeButton = (mode, label) =>
+      h(
+        "button",
+        {
+          class: `seg-item ${docMode === mode ? "active" : ""}`,
+          onclick: () => {
+            docMode = mode;
+            renderDocument(true);
+          },
+        },
+        label,
+      );
+    const content = h("div", { class: `doc-host ${format === "html" && docMode === "rendered" ? "doc-host-frame" : "card doc"}` });
     setContent(
       tabBody,
       h(
         "div",
-        { class: "row between wrap" },
+        { class: "row between wrap doc-toolbar" },
         h(
           "div",
-          { class: "seg" },
-          versions.map((n) =>
-            h(
-              "button",
-              {
-                class: `seg-item ${n === selected ? "active" : ""}`,
-                onclick: () => {
-                  designRound = n;
-                  renderDesign(true);
+          { class: "row wrap" },
+          h(
+            "div",
+            { class: "seg" },
+            versions.map((n) =>
+              h(
+                "button",
+                {
+                  class: `seg-item ${n === selected ? "active" : ""}`,
+                  title: `Version written in review round ${n}`,
+                  onclick: () => {
+                    docRound = n;
+                    renderDocument(true);
+                  },
                 },
-              },
-              n === latest && final ? `v${n} · final` : `v${n}`,
+                n === latest && final ? `v${n} · final` : `v${n}`,
+              ),
             ),
           ),
+          format === "html" ? h("div", { class: "seg" }, modeButton("rendered", "Rendered"), modeButton("source", "HTML source")) : null,
         ),
         h(
           "div",
           { class: "row" },
           h("span", { class: "mono small" }, stage.docPath ?? ""),
           stage.status === "approved" && selected === latest ? chip("Approved", "success") : selected === latest && final ? chip("Final (not approved)", "warning") : chip("Draft", "neutral"),
+          h("a", { class: "btn btn-xs", href: viewUrl, target: "_blank", rel: "noopener noreferrer", title: "Open the document in a new tab" }, "Open ↗"),
         ),
       ),
       content,
     );
+    if (format === "html" && docMode === "rendered") {
+      // Sandboxed (no same-origin): the document's scripts cannot reach the hub UI or its API.
+      docFrame = h("iframe", {
+        class: "doc-frame",
+        sandbox: "allow-scripts allow-popups",
+        referrerpolicy: "no-referrer",
+        title: `${stage.docPath ?? "Document"} (version ${selected})`,
+        height: "720",
+        src: viewUrl,
+      });
+      setContent(content, docFrame);
+      return;
+    }
+    setContent(content, spinner("Loading document…"));
     try {
-      const doc = await get(`/api/tasks/${encodeURIComponent(task.id)}/design?round=${selected}`);
-      setContent(content, doc.content ? renderMarkdown(doc.content) : h("div", { class: "muted" }, "Document not available."));
+      const doc = await get(`/api/tasks/${encodeURIComponent(task.id)}/doc?round=${selected}`);
+      if (!doc.content) setContent(content, h("div", { class: "muted" }, "Document not available."));
+      else if (format === "html") setContent(content, h("div", { class: "code-block" }, h("pre", { class: "doc-source" }, doc.content), copyButton(doc.content, "Copy HTML")));
+      else setContent(content, renderMarkdown(doc.content));
     } catch (error) {
       setContent(content, h("div", { class: "callout callout-danger" }, error.message));
     }
@@ -1003,7 +1057,7 @@ export function taskDetailView(root, { params }) {
           meta("Head commit", h("span", { class: "mono" }, shortSha(result.headSha))),
           meta("Commits", String(result.commits ?? 0)),
           meta("Changes", result.shortStat || "—"),
-          result.designDocPath ? meta("Design document", h("span", { class: "mono" }, result.designDocPath)) : null,
+          (result.docPath ?? result.designDocPath) ? meta(task.kind === "document" ? "Document" : "Design document", h("span", { class: "mono" }, result.docPath ?? result.designDocPath)) : null,
         ),
         h("h3", {}, "Final summary"),
         result.summary ? renderMarkdown(result.summary) : h("p", { class: "muted" }, "No summary."),
@@ -1074,6 +1128,7 @@ export function taskDetailView(root, { params }) {
     clearInterval(ticker);
     clearInterval(heroTicker);
     clearTimeout(reconnectTimer);
+    window.removeEventListener("message", onFrameMessage);
     stream?.close();
   };
 }
