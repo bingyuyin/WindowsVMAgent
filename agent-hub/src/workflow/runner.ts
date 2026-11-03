@@ -19,6 +19,7 @@ import type { Store } from "../store.ts";
 import {
   ACTIVE_STATUSES,
   isDocStage,
+  MAX_PARALLEL_TASKS,
   ROLE_LABELS,
   stageKindsOf,
   stagesFor,
@@ -329,11 +330,11 @@ export class TaskRunner {
     bus.publishGlobal({ type: "task-removed", id });
   }
 
-  /** Starts queued tasks while there is capacity and the Copilot runtime is signed in. */
+  /** Starts queued tasks while there is capacity and the Copilot runtime is signed in; the rest stay queued. */
   pump(): void {
     if (this.shuttingDown || !this.deps.runtime.isReady()) return;
     this.resumeInterrupted();
-    const limit = Math.max(1, this.deps.store.settings.maxConcurrency);
+    const limit = this.capacity();
     const queued = this.deps.store.tasks
       .filter((task) => task.status === "queued" && !this.running.has(task.id))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -359,6 +360,11 @@ export class TaskRunner {
     await Promise.race([Promise.all(entries.map((entry) => entry.done)), new Promise((resolve) => setTimeout(resolve, 5000))]);
   }
 
+  /** How many tasks may run at once: the Parallel tasks setting, never more than MAX_PARALLEL_TASKS. */
+  capacity(): number {
+    return clampInt(this.deps.store.settings.maxConcurrency, 1, MAX_PARALLEL_TASKS);
+  }
+
   /** The manager's state plus its recent communication with sub-agents. */
   overview(options: { limit?: number; taskId?: string } = {}): ManagerOverview {
     const { store, runtime } = this.deps;
@@ -366,7 +372,7 @@ export class TaskRunner {
     return {
       online: runtime.isReady(),
       startedAt: this.startedAt,
-      capacity: Math.max(1, store.settings.maxConcurrency),
+      capacity: this.capacity(),
       running: this.running.size,
       queued: tasks.filter((task) => task.status === "queued").length,
       needsInput: tasks.filter((task) => task.status === "needs-input").length,
@@ -418,7 +424,7 @@ export class TaskRunner {
         from: "manager",
         to: "manager",
         kind: "lifecycle",
-        text: `Picked up the task (attempt ${task.attempt}; ${this.running.size} of ${Math.max(1, store.settings.maxConcurrency)} slots in use); preparing workspaces`,
+        text: `Picked up the task (attempt ${task.attempt}; ${this.running.size} of ${this.capacity()} slots in use); preparing workspaces`,
       });
       this.publish(task);
       const repo = store.getRepo(task.repoId);

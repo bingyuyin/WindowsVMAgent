@@ -34,6 +34,8 @@ export type DocFormat = "html" | "markdown";
 export type IsolationMode = "branch" | "worktree";
 
 export const TASK_KINDS: readonly TaskKind[] = ["auto", "coding", "design", "document", "testing", "design-coding"];
+/** Most tasks the hub runs at the same time; further tasks wait in the queue until a slot frees up. */
+export const MAX_PARALLEL_TASKS = 10;
 /** Order in which planned stages run: design first, documentation last (it documents the final state). */
 export const STAGE_ORDER: readonly StageKind[] = ["design", "coding", "testing", "document"];
 export const SEVERITIES: readonly Severity[] = ["blocker", "major", "minor", "nit"];

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import type { CommEntry, NewTaskEvent, Repo, Settings, Task, TaskEvent } from "./types.ts";
+import { MAX_PARALLEL_TASKS, type CommEntry, type NewTaskEvent, type Repo, type Settings, type Task, type TaskEvent } from "./types.ts";
 import { nowIso } from "./util.ts";
 
 interface HubMeta {
@@ -25,7 +25,7 @@ export const DEFAULT_SETTINGS: Settings = {
   resolverModel: null,
   managerModel: null,
   maxRounds: 3,
-  maxConcurrency: 2,
+  maxConcurrency: MAX_PARALLEL_TASKS,
   designDocDir: "docs/designs",
   documentDir: "docs",
   docFormat: "html",

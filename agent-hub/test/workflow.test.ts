@@ -155,6 +155,47 @@ describe("coding workflow", () => {
     }
   });
 
+  test("runs up to 10 tasks at once and queues the rest until a slot frees up", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let waiting = 0;
+    const gatedCoder =
+      (file: string): Step =>
+      async (spec, prompt) => {
+        waiting++;
+        const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("gate was never opened")), 120_000));
+        await Promise.race([gate, timeout]);
+        await writeFile(file, `${file}\n`)(spec, prompt);
+        await submitWork(`wrote ${file}`)(spec, prompt);
+      };
+    const count = 11;
+    const files = Array.from({ length: count }, (_, index) => `f${index + 1}.txt`);
+    const h = createHarness({ coder: files.map(gatedCoder), "code-reviewer": files.map(() => submitReview("approve")) });
+    try {
+      assert.equal(h.store.settings.maxConcurrency, 10, "10 parallel tasks by default");
+      const ids: string[] = [];
+      for (let index = 0; index < count; index++) {
+        ids.push((await h.runner.submit({ description: `Task ${index + 1}`, kind: "coding", repoId: "sample" })).id);
+      }
+      await waitFor(() => waiting === 10, 90_000);
+      const statuses = ids.map((id) => h.store.getTask(id)!.status);
+      assert.deepEqual(statuses.slice(0, 10), Array(10).fill("running"));
+      assert.equal(statuses[10], "queued", "the 11th task waits for a free slot");
+      assert.deepEqual({ running: h.runner.overview().running, queued: h.runner.overview().queued }, { running: 10, queued: 1 });
+      release();
+      await h.runner.idle();
+      const tasks = ids.map((id) => h.store.getTask(id)!);
+      assert.deepEqual(tasks.map((task) => task.status), Array(count).fill("completed"));
+      const firstFinish = Math.min(...tasks.slice(0, 10).map((task) => Date.parse(task.finishedAt!)));
+      assert.ok(Date.parse(tasks[10]!.startedAt!) >= firstFinish, "the queued task starts only after a running one finishes");
+      h.store.updateSettings({ maxConcurrency: 50 });
+      assert.equal(h.runner.capacity(), 10, "a hand-edited setting cannot exceed the cap");
+    } finally {
+      release();
+      h.cleanup();
+    }
+  });
+
   test("worktree isolation gives every sub-agent its own worktree", async () => {
     const h = createHarness(
       {

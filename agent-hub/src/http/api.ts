@@ -4,7 +4,7 @@ import type { CopilotService, LoginProvider } from "../copilot/service.ts";
 import { docForViewer, escapeHtml } from "../docs.ts";
 import type { RepoService } from "../repos.ts";
 import type { Store } from "../store.ts";
-import { DOC_FORMATS, ISOLATION_MODES, type DocFormat, type IsolationMode, type Settings, type TaskKind } from "../types.ts";
+import { DOC_FORMATS, ISOLATION_MODES, MAX_PARALLEL_TASKS, type DocFormat, type IsolationMode, type Settings, type TaskKind } from "../types.ts";
 import { HttpError } from "../util.ts";
 import type { TaskRunner } from "../workflow/runner.ts";
 import { summarizeTask } from "../workflow/summary.ts";
@@ -274,7 +274,7 @@ export function parseSettingsPatch(body: Record<string, unknown>): Partial<Setti
     patch.docFormat = body.docFormat as DocFormat;
   }
   if ("maxRounds" in body) patch.maxRounds = intIn(body.maxRounds, 1, 10, "maxRounds");
-  if ("maxConcurrency" in body) patch.maxConcurrency = intIn(body.maxConcurrency, 1, 8, "maxConcurrency");
+  if ("maxConcurrency" in body) patch.maxConcurrency = intIn(body.maxConcurrency, 1, MAX_PARALLEL_TASKS, "maxConcurrency");
   if ("turnTimeoutMinutes" in body) patch.turnTimeoutMinutes = intIn(body.turnTimeoutMinutes, 5, 600, "turnTimeoutMinutes");
   if ("inputTimeoutMinutes" in body) patch.inputTimeoutMinutes = intIn(body.inputTimeoutMinutes, 1, 1440, "inputTimeoutMinutes");
   if ("designDocDir" in body) patch.designDocDir = repoFolder(body.designDocDir, "designDocDir");

@@ -370,7 +370,7 @@ export function taskDetailView(root, { params }) {
     if (status === "queued") {
       setContent(
         heroBox,
-        h("div", { class: "card hero" }, h("div", { class: "hero-kicker" }, "QUEUED"), h("div", { class: "hero-title" }, "Waiting for a free slot"), h("div", { class: "muted" }, `Up to ${state.settings?.maxConcurrency ?? 2} tasks run in parallel; this one starts automatically.`)),
+        h("div", { class: "card hero" }, h("div", { class: "hero-kicker" }, "QUEUED"), h("div", { class: "hero-title" }, "Waiting for a free slot"), h("div", { class: "muted" }, `Up to ${state.settings?.maxConcurrency ?? 10} tasks run in parallel; this one starts automatically when a slot frees up.`)),
       );
       return;
     }

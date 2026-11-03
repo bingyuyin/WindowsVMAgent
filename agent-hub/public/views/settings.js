@@ -20,7 +20,7 @@ export function settingsView(root) {
   const cleanup = h("input", { type: "checkbox", checked: settings.cleanupWorktrees ?? true });
   const resume = h("input", { type: "checkbox", checked: settings.resumeInterruptedTasks ?? true });
   const rounds = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(settings.maxRounds ?? 3) });
-  const concurrency = h("input", { class: "input", type: "number", min: "1", max: "8", value: String(settings.maxConcurrency ?? 2) });
+  const concurrency = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(settings.maxConcurrency ?? 10) });
   const docFormat = h(
     "select",
     { class: "input" },
@@ -70,7 +70,7 @@ export function settingsView(root) {
         "div",
         { class: "grid-3" },
         field("Max review rounds / test runs", rounds, "Default per task: author/review iterations (or test runs) before stopping."),
-        field("Parallel tasks", concurrency, "How many tasks run at the same time."),
+        field("Parallel tasks", concurrency, "How many tasks run at the same time (1-10). Tasks beyond this wait in the queue and start as soon as a slot frees up."),
         field("Agent turn timeout (minutes)", turnTimeout, "Fails a turn that runs longer than this."),
         field("Question timeout (minutes)", inputTimeout, "When an agent asks you something and you don't answer in time, it proceeds on its own."),
         h(

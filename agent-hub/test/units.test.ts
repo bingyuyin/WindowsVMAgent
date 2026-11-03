@@ -326,4 +326,11 @@ describe("HTML documents", () => {
     assert.throws(() => parseSettingsPatch({ documentDir: "../outside" }), /documentDir/);
     assert.throws(() => parseSettingsPatch({ resumeInterruptedTasks: "yes" }), /resumeInterruptedTasks/);
   });
+
+  test("parallel tasks can be set from 1 to 10", () => {
+    assert.deepEqual(parseSettingsPatch({ maxConcurrency: 10 }), { maxConcurrency: 10 });
+    assert.deepEqual(parseSettingsPatch({ maxConcurrency: 1 }), { maxConcurrency: 1 });
+    assert.throws(() => parseSettingsPatch({ maxConcurrency: 11 }), /maxConcurrency' must be an integer between 1 and 10/);
+    assert.throws(() => parseSettingsPatch({ maxConcurrency: 0 }), /maxConcurrency/);
+  });
 });

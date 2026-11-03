@@ -277,7 +277,7 @@ export function agentsView(root) {
     const agents = tasks.filter((task) => ACTIVE.includes(task.status)).flatMap((task) => task.agents ?? []);
     const working = agents.filter((agent) => agent.status === "working").length;
     const waiting = agents.filter((agent) => agent.status === "idle").length;
-    const capacity = state.settings?.maxConcurrency ?? 2;
+    const capacity = state.settings?.maxConcurrency ?? 10;
     const online = Boolean(state.auth?.authenticated);
     const interval = state.manager?.monitorIntervalSec ?? 60;
     const lastCheck = state.manager?.lastCheckAt;
@@ -436,7 +436,7 @@ export function agentsView(root) {
       const tasks = [...state.tasks.values()];
       const running = tasks.filter((task) => task.status === "running" || task.status === "needs-input").length;
       const queued = tasks.filter((task) => task.status === "queued").length;
-      slots.textContent = `${running}/${state.settings?.maxConcurrency ?? 2} slots busy · ${queued} queued`;
+      slots.textContent = `${running}/${state.settings?.maxConcurrency ?? 10} slots busy · ${queued} queued`;
       const last = state.manager?.lastCheckAt;
       check.textContent = `monitors every ${state.manager?.monitorIntervalSec ?? 60}s${last ? ` · ${relTime(last)}` : ""}`;
     };

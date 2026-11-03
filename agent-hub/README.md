@@ -185,7 +185,8 @@ Designs go to `docs/designs/` and documents to `docs/` by default (both configur
 
 Set **Agent isolation** to "own worktree and branch per agent" to give every sub-agent its own worktree
 (`data/worktrees/<task>/<role>`) at the cost of more disk and per-agent dependency installs. Tasks never
-share worktrees, so up to **Parallel tasks** tasks run at once, including on the same repository; git
+share worktrees, so up to **Parallel tasks** tasks (default and maximum: 10) run at once, including on the
+same repository; further tasks wait in the queue and start in submission order as slots free up. Git
 worktree operations on a repository are serialized. When a task completes, its worktrees are removed
 (branches are kept) unless you turn **Cleanup** off; failed or cancelled tasks keep their worktrees for
 inspection or retry. Don't check out a task branch elsewhere while its task is running.
@@ -254,7 +255,7 @@ Environment variables:
 
 Settings page: default manager, author, comment-resolver/test-fixer and reviewer/test-executor models,
 agent isolation (own branch per agent, or own worktree per agent), worktree cleanup on completion, max
-review rounds / test runs (default 3), parallel tasks (default 2), agent turn timeout, question timeout,
+review rounds / test runs (default 3), parallel tasks (default and maximum 10; more tasks are queued), agent turn timeout, question timeout,
 resuming interrupted tasks after a restart (default on), document format (HTML or Markdown) and the
 design (`docs/designs`) and document (`docs`) folders. The **Storage** section shows where each kind of
 data is saved.
