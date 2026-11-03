@@ -12,6 +12,7 @@ import {
   isReviewerRole,
   KIND_LABELS,
   phaseLabel,
+  relTime,
   ROLE_DESCRIPTIONS,
   ROLE_ICONS,
   ROLE_LABELS,
@@ -43,6 +44,7 @@ const STAGE_STATUS = {
   cancelled: ["Cancelled", "neutral"],
 };
 const SEVERITY_CLASS = { blocker: "danger", major: "warning", minor: "info", nit: "neutral" };
+const PROVIDER_NAMES = { github: "GitHub", "azure-devops": "Azure DevOps", gitlab: "GitLab", bitbucket: "Bitbucket" };
 /** Testing stages pass or fail rather than being approved. */
 const stageStatus = (stage) =>
   stage.kind === "testing" && stage.status === "approved"
@@ -101,6 +103,14 @@ export function taskDetailView(root, { params }) {
   const toolRows = new Map();
   const toolStatus = new Map();
   const live = { role: null, messageId: null, text: "" };
+  // Push / pull request state: what the remote supports (GET /pull-request) and in-flight actions.
+  let remoteInfo = null;
+  let remoteInfoKey = null;
+  let pushBusy = false;
+  let prBusy = false;
+  let createPageUrl = null;
+  const deliveryHero = h("div", { class: "delivery" });
+  const deliveryResult = h("div", { class: "delivery" });
 
   const titleBox = h("div", { class: "detail-title-row" });
   const metaBox = h("div", { class: "meta-grid" });
@@ -448,6 +458,7 @@ export function taskDetailView(root, { params }) {
             task.branch ? h("span", {}, "branch ", h("span", { class: "mono" }, task.branch), " ", copyButton(task.branch)) : null,
           ),
           result.summary ? h("div", { class: "hero-summary" }, renderMarkdown(result.summary)) : null,
+          deliveryHero,
           h(
             "div",
             { class: "row wrap" },
@@ -459,6 +470,7 @@ export function taskDetailView(root, { params }) {
           ),
         ),
       );
+      renderDelivery();
       return;
     }
     if (status === "failed") {
@@ -470,6 +482,108 @@ export function taskDetailView(root, { params }) {
     } else {
       setContent(heroBox);
     }
+  }
+
+  /** Where the task branch stands on the remote, plus the push and pull request actions (hero and Result tab). */
+  function renderDelivery() {
+    if (!task || task.status !== "completed" || !task.result) return;
+    refreshRemoteInfo();
+    setContent(deliveryHero, deliveryContent());
+    setContent(deliveryResult, deliveryContent());
+  }
+
+  function refreshRemoteInfo() {
+    const key = JSON.stringify([task.id, task.push?.status, task.push?.sha, task.pullRequest?.url]);
+    if (remoteInfoKey === key) return;
+    remoteInfoKey = key;
+    get(`/api/tasks/${encodeURIComponent(task.id)}/pull-request`)
+      .catch((error) => ({ remote: null, direct: false, supported: false, error: error.message }))
+      .then((info) => {
+        if (disposed || remoteInfoKey !== key) return;
+        remoteInfo = info;
+        renderDelivery();
+      });
+  }
+
+  function deliveryContent() {
+    const push = task.push;
+    const pullRequest = task.pullRequest ?? remoteInfo?.pullRequest;
+    const remote = remoteInfo?.remote ?? null;
+    const noChanges = !task.result.commits;
+    const pushing = pushBusy || push?.status === "pushing";
+    const behind = push?.status === "pushed" && push.sha && task.result.headSha && push.sha !== task.result.headSha;
+    const where = push?.remote ? `${push.remote}/${push.branch}` : push?.branch;
+    const link = (href, label) => h("a", { href, target: "_blank", rel: "noopener noreferrer" }, label);
+
+    let status;
+    if (pushing) {
+      status = [spinner(), h("span", {}, `Pushing ${task.branch} to ${push?.remote ?? remote?.name ?? "the remote"}…`)];
+    } else if (push?.status === "pushed") {
+      status = [
+        h("span", { class: "delivery-icon delivery-ok" }, "✓"),
+        h("span", {}, "Pushed to ", h("span", { class: "mono" }, where)),
+        h("span", { class: "muted" }, `${shortSha(push.sha)} · ${relTime(push.at)}${push.auto ? " · automatically" : ""}`),
+        push.webUrl ? link(push.webUrl, "View branch ↗") : null,
+        behind ? h("span", { class: "delivery-warn" }, "the branch has newer commits") : null,
+      ];
+    } else if (push?.status === "failed") {
+      status = [h("span", { class: "delivery-icon delivery-bad" }, "✕"), h("span", {}, "Push to ", h("span", { class: "mono" }, where ?? task.branch), " failed")];
+    } else if (push?.status === "skipped") {
+      status = [h("span", { class: "delivery-icon" }, "–"), h("span", { class: "muted" }, `Not pushed: ${push.reason}`)];
+    } else {
+      status = [h("span", { class: "delivery-icon" }, "–"), h("span", { class: "muted" }, state.settings?.pushOnComplete === false ? "Not pushed (automatic pushes are off)" : "Not pushed yet")];
+    }
+
+    const canPush = remote && !pushing && !noChanges && (push?.status !== "pushed" || behind);
+    const pushButton = canPush
+      ? h("button", { class: "btn btn-sm", onclick: pushTaskBranch }, push?.status === "failed" ? "Retry push" : behind ? "Push again" : "Push branch")
+      : null;
+
+    let prButton;
+    if (pullRequest) {
+      prButton = [
+        h("a", { class: "btn btn-sm btn-primary", href: pullRequest.url, target: "_blank", rel: "noopener noreferrer" }, `Pull request${pullRequest.number ? ` #${pullRequest.number}` : ""} ↗`),
+        pullRequest.draft ? chip("Draft", "neutral") : null,
+      ];
+    } else {
+      const direct = Boolean(remoteInfo?.direct);
+      const disabledReason = !remoteInfo
+        ? "Checking the repository's remote…"
+        : !remote
+          ? "No git remote is configured for this repository"
+          : !remoteInfo.supported
+            ? `Pull requests are not supported for ${remote.url}`
+            : noChanges
+              ? "The task made no changes"
+              : pushing
+                ? "Wait for the push to finish"
+                : null;
+      const label = prBusy ? "Creating…" : `Create ${direct && !task.result.approved ? "draft " : ""}pull request${direct ? "" : " ↗"}`;
+      prButton = h(
+        "button",
+        {
+          class: `btn btn-sm ${task.result.approved ? "btn-primary" : ""}`,
+          disabled: Boolean(disabledReason) || prBusy,
+          title: disabledReason ?? (direct ? "Pushes the branch if needed and opens the pull request" : "Pushes the branch if needed and opens the page to create the pull request"),
+          onclick: createPullRequest,
+        },
+        label,
+      );
+    }
+
+    const host = remote ? (PROVIDER_NAMES[remote.provider] ?? remote.host ?? "the remote") : null;
+    let hint = null;
+    if (remoteInfo?.error) hint = `Could not check the remote: ${remoteInfo.error}`;
+    else if (remoteInfo && !remote) hint = "No git remote is configured for this repository; add one (git remote add origin <url>) to push the branch and open pull requests.";
+    else if (remote && !pullRequest && remoteInfo.supported && !remoteInfo.direct && !noChanges)
+      hint = `The pull request button opens ${host}'s create page with the branches filled in${remote.provider === "github" ? "; sign the GitHub CLI in (gh auth login) to have the hub create it directly" : ""}.`;
+
+    return [
+      h("div", { class: "delivery-row" }, h("div", { class: "delivery-status" }, status), h("span", { class: "spacer" }), pushButton, prButton),
+      push?.status === "failed" && push.reason && !pushing ? h("div", { class: "delivery-error" }, push.reason) : null,
+      createPageUrl && !pullRequest ? h("div", { class: "small" }, "If the page didn't open: ", link(createPageUrl, `create the pull request on ${host ?? "the remote"} ↗`)) : null,
+      hint ? h("div", { class: "muted small" }, hint) : null,
+    ];
   }
 
   /** One card per sub-agent: role, model, status, own branch/workspace, current assignment and activity. */
@@ -1236,14 +1350,76 @@ export function taskDetailView(root, { params }) {
         ),
         h("h3", {}, "Final summary"),
         result.summary ? renderMarkdown(result.summary) : h("p", { class: "muted" }, "No summary."),
+        h("h3", {}, "Remote & pull request"),
+        deliveryResult,
         h("h3", {}, "Next steps"),
-        h("p", { class: "muted small" }, "Review and merge the task branch into your checkout. The worktree is kept until you delete the task."),
+        h("p", { class: "muted small" }, "Review and merge the task branch: open a pull request above, or merge it into your checkout locally. The worktree is kept until you delete the task."),
         h("div", { class: "code-block" }, h("pre", {}, commands), copyButton(commands, "Copy commands")),
       ),
     );
+    renderDelivery();
   }
 
   // ---- actions ---------------------------------------------------------------------------
+
+  async function pushTaskBranch() {
+    if (pushBusy) return;
+    pushBusy = true;
+    renderDelivery();
+    try {
+      const updated = await post(`/api/tasks/${encodeURIComponent(task.id)}/push`);
+      const push = updated?.push;
+      if (push?.status === "pushed") toast(`Pushed ${push.branch} to ${push.remote}`, "success");
+      else if (push?.status === "failed") toast(`Push failed: ${push.reason ?? "unknown error"}`, "error");
+      else if (push?.reason) toast(push.reason);
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      pushBusy = false;
+      renderDelivery();
+    }
+  }
+
+  async function createPullRequest() {
+    if (prBusy) return;
+    // The host's create page opens in a tab that must be opened during the click, or popup blockers stop it.
+    const popup = remoteInfo?.direct ? null : window.open("about:blank", "_blank");
+    if (popup) {
+      popup.opener = null;
+      try {
+        popup.document.title = "Opening pull request…";
+        popup.document.body.textContent = "Pushing the branch and opening the pull request page…";
+      } catch {
+        // Cosmetic only.
+      }
+    }
+    const navigate = (url) => {
+      if (popup && !popup.closed) popup.location.href = url;
+      else window.open(url, "_blank", "noopener,noreferrer");
+    };
+    prBusy = true;
+    renderDelivery();
+    try {
+      const outcome = await post(`/api/tasks/${encodeURIComponent(task.id)}/pull-request`);
+      if (outcome.pullRequest) {
+        if (popup) navigate(outcome.pullRequest.url);
+        task.pullRequest = outcome.pullRequest;
+        toast(outcome.message, "success");
+      } else if (outcome.createUrl) {
+        createPageUrl = outcome.createUrl;
+        navigate(outcome.createUrl);
+        toast(outcome.message);
+      } else {
+        popup?.close();
+      }
+    } catch (error) {
+      popup?.close();
+      toast(error.message, "error");
+    } finally {
+      prBusy = false;
+      renderDelivery();
+    }
+  }
 
   async function cancelTask() {
     const ok = await confirmDialog({ title: `Cancel ${task.id}?`, body: h("p", {}, "Running agents are stopped. Work committed so far stays on the branch."), confirmText: "Cancel task", danger: true });

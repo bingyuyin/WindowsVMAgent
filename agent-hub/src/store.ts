@@ -34,6 +34,7 @@ export const DEFAULT_SETTINGS: Settings = {
   isolation: "branch",
   cleanupWorktrees: true,
   resumeInterruptedTasks: true,
+  pushOnComplete: true,
 };
 
 export interface StorageInfo {

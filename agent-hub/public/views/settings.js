@@ -18,6 +18,7 @@ export function settingsView(root) {
     h("option", { value: "worktree", selected: settings.isolation === "worktree" }, "Own worktree and branch per agent (most isolation, more disk)"),
   );
   const cleanup = h("input", { type: "checkbox", checked: settings.cleanupWorktrees ?? true });
+  const pushOnComplete = h("input", { type: "checkbox", checked: settings.pushOnComplete ?? true });
   const resume = h("input", { type: "checkbox", checked: settings.resumeInterruptedTasks ?? true });
   const rounds = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(settings.maxRounds ?? 3) });
   const concurrency = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(settings.maxConcurrency ?? 10) });
@@ -63,6 +64,17 @@ export function settingsView(root) {
           h("span", { class: "field-label" }, "Cleanup"),
           h("span", { class: "row small" }, cleanup, "Remove agent worktrees when a task completes (branches are kept)"),
           h("small", { class: "muted" }, "Failed or cancelled tasks keep their worktrees so you can inspect or retry them."),
+        ),
+        h(
+          "label",
+          { class: "field" },
+          h("span", { class: "field-label" }, "Push"),
+          h("span", { class: "row small" }, pushOnComplete, "Push each task's branch to the repository's remote when the task completes"),
+          h(
+            "small",
+            { class: "muted" },
+            "Uses your git credentials (never force-pushes). Finished tasks get a Create pull request button: it opens the PR directly when the GitHub CLI is signed in (gh auth login), otherwise the host's create page.",
+          ),
         ),
       ),
       h("h2", { class: "section-title" }, "Workflow"),
@@ -160,6 +172,7 @@ export function settingsView(root) {
         managerModel: managerSelect.value || null,
         isolation: isolation.value,
         cleanupWorktrees: cleanup.checked,
+        pushOnComplete: pushOnComplete.checked,
         resumeInterruptedTasks: resume.checked,
         maxRounds: Number(rounds.value),
         maxConcurrency: Number(concurrency.value),
@@ -199,5 +212,9 @@ export function settingsView(root) {
   renderAccount();
   renderStorage();
   fillModels(false);
-  return subscribe((kind) => kind === "auth" && renderAccount());
+  return subscribe((kind) => {
+    if (kind === "auth") renderAccount();
+    // Parallel tasks can be changed live from the Tasks and Agents pages (or another tab).
+    if (kind === "settings" && document.activeElement !== concurrency && state.settings?.maxConcurrency) concurrency.value = String(state.settings.maxConcurrency);
+  });
 }

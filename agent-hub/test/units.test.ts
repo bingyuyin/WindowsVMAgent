@@ -6,8 +6,10 @@ import { describeTool } from "../src/agents/copilotDriver.ts";
 import { systemPromptFor } from "../src/agents/prompts.ts";
 import { docForPrompt, docForViewer, documentProblem, formatOfPath, loadDocTemplates, renderDocTemplate } from "../src/docs.ts";
 import { parseSettingsPatch } from "../src/http/api.ts";
+import { branchWebUrl, parseRemote, pullRequestPageUrl, sanitizeRemoteUrl } from "../src/remote.ts";
 import { rolesFor, rolesForStages, stageKindsOf, worksDetached } from "../src/types.ts";
 import { describeTestRun } from "../src/workflow/engine.ts";
+import { pullRequestBase } from "../src/workflow/runner.ts";
 import {
   fallbackReview,
   fallbackTestRun,
@@ -332,5 +334,69 @@ describe("HTML documents", () => {
     assert.deepEqual(parseSettingsPatch({ maxConcurrency: 1 }), { maxConcurrency: 1 });
     assert.throws(() => parseSettingsPatch({ maxConcurrency: 11 }), /maxConcurrency' must be an integer between 1 and 10/);
     assert.throws(() => parseSettingsPatch({ maxConcurrency: 0 }), /maxConcurrency/);
+  });
+});
+
+describe("remotes and pull requests", () => {
+  test("parses GitHub, Azure DevOps, GitLab and Bitbucket remotes and drops credentials", () => {
+    const github = parseRemote("origin", "https://user:ghp_secret@github.com/bingyuyin/WindowsVMAgent.git");
+    assert.equal(github.url, "https://github.com/bingyuyin/WindowsVMAgent.git");
+    assert.deepEqual([github.provider, github.host, github.slug], ["github", "github.com", "bingyuyin/WindowsVMAgent"]);
+    assert.equal(github.webUrl, "https://github.com/bingyuyin/WindowsVMAgent");
+    assert.equal(parseRemote("origin", "git@github.com:acme/calc.git").webUrl, "https://github.com/acme/calc");
+    assert.equal(parseRemote("origin", "ssh://git@github.com/acme/calc").slug, "acme/calc");
+    assert.equal(parseRemote("origin", "https://acme.ghe.com/team/tool.git").provider, "github");
+
+    const ado = parseRemote("origin", "https://acme@dev.azure.com/acme/Platform%20Team/_git/Tools");
+    assert.equal(ado.provider, "azure-devops");
+    assert.equal(ado.url, "https://dev.azure.com/acme/Platform%20Team/_git/Tools");
+    assert.equal(ado.webUrl, "https://dev.azure.com/acme/Platform%20Team/_git/Tools");
+    assert.equal(parseRemote("origin", "git@ssh.dev.azure.com:v3/acme/Platform/Tools").webUrl, "https://dev.azure.com/acme/Platform/_git/Tools");
+    assert.equal(
+      parseRemote("origin", "https://acme.visualstudio.com/DefaultCollection/Platform/_git/Tools").webUrl,
+      "https://acme.visualstudio.com/DefaultCollection/Platform/_git/Tools",
+    );
+
+    assert.equal(parseRemote("origin", "https://gitlab.com/group/sub/repo.git").slug, "group/sub/repo");
+    assert.equal(parseRemote("origin", "git@bitbucket.org:team/repo.git").webUrl, "https://bitbucket.org/team/repo");
+    for (const local of ["C:\\repos\\calc.git", "/srv/git/calc.git", "file:///C:/repos/calc.git", "https://git.example.com/a/b.git"]) {
+      const remote = parseRemote("origin", local);
+      assert.deepEqual([remote.provider, remote.webUrl], ["other", null], local);
+    }
+    assert.equal(
+      sanitizeRemoteUrl("fatal: unable to access 'https://x-access-token:abc123@github.com/a/b.git/': denied"),
+      "fatal: unable to access 'https://github.com/a/b.git/': denied",
+    );
+  });
+
+  test("links to the pushed branch and to the host's prefilled create page", () => {
+    const request = { head: "agent-hub/t-001-add", base: "main", title: "Add & test", body: "Summary\n> request" };
+    const github = parseRemote("origin", "https://github.com/acme/calc.git");
+    assert.equal(branchWebUrl(github, request.head), "https://github.com/acme/calc/tree/agent-hub/t-001-add");
+    assert.equal(
+      pullRequestPageUrl(github, request),
+      "https://github.com/acme/calc/compare/main...agent-hub/t-001-add?expand=1&title=Add%20%26%20test&body=Summary%0A%3E%20request",
+    );
+    const ado = parseRemote("origin", "https://dev.azure.com/acme/Platform/_git/Tools");
+    assert.equal(branchWebUrl(ado, request.head), "https://dev.azure.com/acme/Platform/_git/Tools?version=GBagent-hub%2Ft-001-add");
+    assert.equal(pullRequestPageUrl(ado, request), "https://dev.azure.com/acme/Platform/_git/Tools/pullrequestcreate?sourceRef=agent-hub%2Ft-001-add&targetRef=main");
+    assert.match(pullRequestPageUrl(parseRemote("origin", "https://gitlab.com/g/r.git"), request)!, /^https:\/\/gitlab\.com\/g\/r\/-\/merge_requests\/new\?merge_request%5Bsource_branch%5D=agent-hub%2Ft-001-add&merge_request%5Btarget_branch%5D=main/);
+    assert.equal(pullRequestPageUrl(parseRemote("origin", "git@bitbucket.org:t/r.git"), request), "https://bitbucket.org/t/r/pull-requests/new?source=agent-hub%2Ft-001-add&dest=main");
+    assert.equal(pullRequestPageUrl(parseRemote("origin", "C:\\repos\\calc.git"), request), null);
+    // Long descriptions are truncated to keep the URL usable.
+    assert.ok(pullRequestPageUrl(github, { ...request, body: "x".repeat(20_000) })!.length < 4_300);
+  });
+
+  test("pull requests target the branch the task started from, else the default branch", () => {
+    assert.equal(pullRequestBase({ baseRef: "release/2.0" }, { defaultBranch: "main" }), "release/2.0");
+    assert.equal(pullRequestBase({ baseRef: "refs/heads/dev" }, { defaultBranch: "main" }), "dev");
+    assert.equal(pullRequestBase({ baseRef: "HEAD" }, { defaultBranch: "master" }), "master");
+    assert.equal(pullRequestBase({ baseRef: "9ffa42b0c1d2" }, { defaultBranch: "main" }), "main");
+    assert.equal(pullRequestBase({ baseRef: "" }, { defaultBranch: "HEAD" }), "main");
+  });
+
+  test("automatic pushes can be turned off in the settings", () => {
+    assert.deepEqual(parseSettingsPatch({ pushOnComplete: false }), { pushOnComplete: false });
+    assert.throws(() => parseSettingsPatch({ pushOnComplete: "no" }), /pushOnComplete/);
   });
 });

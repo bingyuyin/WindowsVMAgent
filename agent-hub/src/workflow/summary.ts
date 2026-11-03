@@ -1,4 +1,19 @@
-import type { Activity, AgentInfo, Phase, StageKind, StageStatus, Task, TaskKind, TaskStatus, TestRunInfo, TestStatus, Usage, Verdict } from "../types.ts";
+import type {
+  Activity,
+  AgentInfo,
+  Phase,
+  PullRequestInfo,
+  PushInfo,
+  StageKind,
+  StageStatus,
+  Task,
+  TaskKind,
+  TaskStatus,
+  TestRunInfo,
+  TestStatus,
+  Usage,
+  Verdict,
+} from "../types.ts";
 
 export interface TaskSummary {
   id: string;
@@ -30,6 +45,8 @@ export interface TaskSummary {
   /** Auto tasks: the stages the manager planned (agents are created per stage). */
   plan?: { stages: StageKind[]; rationale: string; fallback?: boolean };
   tests?: Pick<TestRunInfo, "status" | "total" | "passed" | "failed" | "skipped">;
+  push?: Pick<PushInfo, "status" | "remote" | "branch" | "webUrl" | "reason">;
+  pullRequest?: Pick<PullRequestInfo, "url" | "number" | "draft">;
   needsInput: boolean;
   error?: string;
   stages: Array<{
@@ -92,6 +109,10 @@ export function summarizeTask(task: Task): TaskSummary {
           skipped: task.result.tests.skipped,
         }
       : undefined,
+    push: task.push
+      ? { status: task.push.status, remote: task.push.remote, branch: task.push.branch, webUrl: task.push.webUrl, reason: task.push.reason }
+      : undefined,
+    pullRequest: task.pullRequest ? { url: task.pullRequest.url, number: task.pullRequest.number, draft: task.pullRequest.draft } : undefined,
     needsInput: Boolean(task.pendingInput),
     error: task.error,
     stages: task.stages.map((stage) => ({

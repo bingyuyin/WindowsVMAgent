@@ -8,8 +8,12 @@ import type { CopilotService } from "../src/copilot/service.ts";
 import { loadDocTemplates } from "../src/docs.ts";
 import { createApiRouter } from "../src/http/api.ts";
 import { createHttpServer } from "../src/http/server.ts";
+import type { PullRequestCreator, PullRequestRequest } from "../src/remote.ts";
 import type { RepoService } from "../src/repos.ts";
+import { summarizeTask } from "../src/workflow/summary.ts";
 import {
+  addRemote,
+  bareGit,
   branchExists,
   branchHead,
   createHarness,
@@ -961,6 +965,148 @@ describe("manager planning (auto tasks)", () => {
       assert.deepEqual(task.plan?.stages, ["document"]);
       assert.equal(task.plan?.fallback, true);
       assert.equal(task.result?.approved, true);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("push & pull requests", () => {
+  const pushedComms = (h: ReturnType<typeof createHarness>, taskId: string) =>
+    h.store.recentComm({ taskId }).filter((entry) => entry.from === "manager" && entry.to === "user" && entry.text.startsWith("Pushed the task branch"));
+
+  test("pushes the finished task's branch to the remote, then opens a pull request once", async () => {
+    const requests: PullRequestRequest[] = [];
+    const creator: PullRequestCreator = {
+      canCreate: async (remote) => remote.provider === "github",
+      findOpen: async () => null,
+      create: async (_remote, request) => {
+        requests.push(request);
+        return { url: "https://github.com/acme/sample/pull/7", number: 7, draft: request.draft };
+      },
+    };
+    const h = createHarness(
+      {
+        coder: [steps(writeFile("a.txt", "a\n"), submitWork("Add a"))],
+        resolver: [steps(writeFile("a.txt", "b\n"), submitWork("Use b", [{ comment_id: "C1", status: "addressed", note: "Done" }]))],
+        "code-reviewer": [submitReview("request_changes", [{ severity: "minor", body: "Use b" }]), submitReview("approve")],
+      },
+      { pullRequests: creator },
+    );
+    try {
+      const bare = addRemote(h);
+      const created = await h.runner.submit({ description: "Add a file named a.txt", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(task.push?.status, "pushed");
+      assert.equal(task.push?.auto, true);
+      assert.equal(task.push?.remote, "origin");
+      assert.equal(task.push?.sha, branchHead(h.repoPath, task.branch!));
+      assert.equal(task.push?.webUrl, `https://github.com/acme/sample/tree/${task.branch}`);
+      // Only the task branch goes to the remote; the agents' own branches stay local.
+      assert.equal(bareGit(bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"), `refs/heads/${task.branch} ${task.push?.sha}`);
+      assert.equal(pushedComms(h, task.id).length, 1);
+      assert.deepEqual(summarizeTask(task).push, { status: "pushed", remote: "origin", branch: task.branch, webUrl: task.push?.webUrl, reason: undefined });
+
+      const status = await h.runner.pullRequestStatus(task.id);
+      assert.deepEqual([status.remote?.provider, status.remote?.url, status.direct, status.supported], ["github", "https://github.com/acme/sample.git", true, true]);
+
+      const outcome = await h.runner.pullRequest(task.id);
+      assert.equal(outcome.pullRequest?.number, 7);
+      assert.equal(requests.length, 1);
+      const [request] = requests;
+      assert.deepEqual([request!.head, request!.base, request!.title, request!.draft], [task.branch, "main", task.title, false]);
+      assert.match(request!.body, /> Add a file named a\.txt/);
+      assert.match(request!.body, /\*\*Outcome:\*\* approved by the reviewer/);
+      assert.equal(pushedComms(h, task.id).length, 1, "the branch was already up to date, so it was not pushed again");
+      assert.equal(task.pullRequest?.url, "https://github.com/acme/sample/pull/7");
+      assert.equal(task.pullRequest?.base, "main");
+      assert.ok(h.store.recentComm({ taskId: task.id }).some((entry) => entry.text === "Opened pull request #7 into main"));
+
+      const again = await h.runner.pullRequest(task.id);
+      assert.equal(again.pullRequest?.number, 7);
+      assert.equal(requests.length, 1, "asking again returns the recorded pull request");
+      assert.equal(summarizeTask(task).pullRequest?.number, 7);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("failed pushes can be retried, and without the GitHub CLI the host's create page is offered", async () => {
+    const h = createHarness(
+      { coder: [steps(writeFile("b.txt", "b\n"), submitWork("Add b"))], "code-reviewer": [submitReview("request_changes", [{ severity: "major", body: "Needs tests" }])] },
+      { settings: { maxRounds: 1 } },
+    );
+    try {
+      const bare = addRemote(h);
+      git(h.repoPath, "config", "remote.origin.pushurl", path.join(h.root, "missing.git"));
+      const created = await h.runner.submit({ description: "Add b", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(task.result?.approved, false);
+      assert.equal(task.push?.status, "failed");
+      assert.match(task.push?.reason ?? "", /does not appear to be a git repository|not found|No such/i);
+      assert.ok(h.store.recentComm({ taskId: task.id }).some((entry) => entry.text.startsWith("Could not push origin/")));
+
+      // A hub restart in the middle of a push leaves a retryable failure rather than a stuck "pushing".
+      task.push = { ...task.push!, status: "pushing" };
+      const restarted = h.newRunner();
+      restarted.init();
+      await restarted.shutdown();
+      assert.equal(task.push?.status, "failed");
+      assert.match(task.push?.reason ?? "", /hub stopped/);
+
+      git(h.repoPath, "config", "remote.origin.pushurl", bare);
+      const retried = await h.runner.pushNow(task.id);
+      assert.equal(retried.push?.status, "pushed");
+      assert.equal(retried.push?.auto, false);
+      assert.equal(bareGit(bare, "rev-parse", `refs/heads/${task.branch}`), branchHead(h.repoPath, task.branch!));
+
+      const status = await h.runner.pullRequestStatus(task.id);
+      assert.deepEqual([status.direct, status.supported], [false, true]);
+      const outcome = await h.runner.pullRequest(task.id);
+      assert.equal(outcome.pullRequest, undefined);
+      const url = new URL(outcome.createUrl!);
+      assert.equal(`${url.origin}${url.pathname}`, `https://github.com/acme/sample/compare/main...${task.branch}`);
+      assert.equal(url.searchParams.get("title"), task.title);
+      assert.match(url.searchParams.get("body") ?? "", /not approved — 1 open comment/);
+      assert.equal(task.pullRequest, undefined);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("nothing is pushed without a remote, or when automatic pushes are off", async () => {
+    const h = createHarness({
+      coder: [steps(writeFile("c.txt", "c\n"), submitWork("Add c")), steps(writeFile("d.txt", "d\n"), submitWork("Add d"))],
+      "code-reviewer": [submitReview("approve"), submitReview("approve")],
+    });
+    try {
+      const first = await h.runner.submit({ description: "Add c", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const noRemote = h.store.getTask(first.id)!;
+      assert.equal(noRemote.push?.status, "skipped");
+      assert.match(noRemote.push?.reason ?? "", /No git remote/);
+      assert.deepEqual(await h.runner.pullRequestStatus(noRemote.id), { remote: null, direct: false, supported: false, pullRequest: undefined });
+      await assert.rejects(h.runner.pullRequest(noRemote.id), /No git remote is configured/);
+
+      const bare = addRemote(h, "C:\\shares\\sample.git");
+      h.store.updateSettings({ pushOnComplete: false });
+      const second = await h.runner.submit({ description: "Add d", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const manual = h.store.getTask(second.id)!;
+      assert.equal(manual.status, "completed");
+      assert.equal(manual.push, undefined);
+      assert.equal(bareGit(bare, "for-each-ref", "refs/heads"), "");
+      // A remote without a web page can still be pushed to, but offers no pull request page.
+      const pushed = (await h.runner.pushNow(manual.id)).push;
+      assert.equal(pushed?.status, "pushed");
+      assert.equal(pushed?.webUrl, undefined);
+      assert.equal(bareGit(bare, "rev-parse", `refs/heads/${manual.branch}`), branchHead(h.repoPath, manual.branch!));
+      assert.equal((await h.runner.pullRequestStatus(manual.id)).supported, false);
+      await assert.rejects(h.runner.pullRequest(manual.id), /not supported for this remote/);
     } finally {
       h.cleanup();
     }

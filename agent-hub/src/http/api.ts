@@ -156,6 +156,10 @@ export function createApiRouter(deps: ApiDeps): Router {
     runner.diff(params.id!, url.searchParams.get("from") ?? undefined, url.searchParams.get("to") ?? undefined),
   );
 
+  router.post("/api/tasks/:id/push", ({ params }) => runner.pushNow(params.id!));
+  router.get("/api/tasks/:id/pull-request", ({ params }) => runner.pullRequestStatus(params.id!));
+  router.post("/api/tasks/:id/pull-request", ({ params }) => runner.pullRequest(params.id!));
+
   const documentRound = (url: URL) => {
     const round = Number(url.searchParams.get("round"));
     return Number.isInteger(round) && round > 0 ? round : undefined;
@@ -268,6 +272,10 @@ export function parseSettingsPatch(body: Record<string, unknown>): Partial<Setti
   if ("resumeInterruptedTasks" in body) {
     if (typeof body.resumeInterruptedTasks !== "boolean") throw new HttpError(400, "'resumeInterruptedTasks' must be a boolean");
     patch.resumeInterruptedTasks = body.resumeInterruptedTasks;
+  }
+  if ("pushOnComplete" in body) {
+    if (typeof body.pushOnComplete !== "boolean") throw new HttpError(400, "'pushOnComplete' must be a boolean");
+    patch.pushOnComplete = body.pushOnComplete;
   }
   if ("docFormat" in body) {
     if (!DOC_FORMATS.includes(body.docFormat as DocFormat)) throw new HttpError(400, `'docFormat' must be one of: ${DOC_FORMATS.join(", ")}`);

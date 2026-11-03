@@ -8,6 +8,7 @@ import { CopilotService } from "./copilot/service.ts";
 import { loadDocTemplates } from "./docs.ts";
 import { createApiRouter } from "./http/api.ts";
 import { createHttpServer } from "./http/server.ts";
+import { GhPullRequestCreator } from "./remote.ts";
 import { RepoService } from "./repos.ts";
 import { Store } from "./store.ts";
 import { errorMessage } from "./util.ts";
@@ -37,6 +38,7 @@ const runner = new TaskRunner({
   worktreesDir: config.worktreesDir,
   hubSkills: loadHubSkills(config.skillsDir),
   docTemplates,
+  pullRequests: new GhPullRequestCreator(),
 });
 const repos = new RepoService(store, bus, config.reposDir);
 runner.init();

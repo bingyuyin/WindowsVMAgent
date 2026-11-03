@@ -4,6 +4,7 @@ import type { AgentDriver, AgentObserver, UserQuestion } from "../agents/driver.
 import type { Bus } from "../bus.ts";
 import { describeContext, discoverContext, type HubSkills } from "../context.ts";
 import { formatOfPath, type DocTemplates } from "../docs.ts";
+import { branchWebUrl, primaryRemote, pullRequestPageUrl, pushBranch, sanitizeRemoteUrl, type PullRequestCreator } from "../remote.ts";
 import {
   deleteBranch,
   deleteBranchesWithPrefix,
@@ -30,6 +31,8 @@ import {
   type DocFormat,
   type NewCommEntry,
   type NewTaskEvent,
+  type PullRequestInfo,
+  type PushInfo,
   type Repo,
   type StageKind,
   type Task,
@@ -66,6 +69,8 @@ export interface RunnerDeps {
   worktreesDir: string;
   hubSkills?: HubSkills;
   docTemplates?: DocTemplates | null;
+  /** Creates pull requests directly (e.g. with the GitHub CLI); without it the host's create page is used. */
+  pullRequests?: PullRequestCreator;
   /** How often the manager checks on working agents (default 60 s). */
   monitorIntervalMs?: number;
   /** Silence after which the manager posts a check-in about a working agent (default 5 min). */
@@ -81,6 +86,14 @@ interface RunningTask {
 interface InputWaiter {
   inputId: string;
   resolve: (answer: string) => void;
+}
+
+/** Result of asking for a pull request: either it exists/was created, or the host's create page to open. */
+export interface PullRequestOutcome {
+  pullRequest?: PullRequestInfo;
+  /** The host's "create pull request" page (with branches filled in) when it cannot be created directly. */
+  createUrl?: string;
+  message: string;
 }
 
 /** What the manager is doing right now (for the Agents view). */
@@ -118,6 +131,8 @@ export class TaskRunner {
   private readonly waiters = new Map<string, InputWaiter>();
   private readonly repoLocks = new KeyedMutex();
   private readonly updateTimers = new Map<string, NodeJS.Timeout>();
+  /** Work that runs after a task has released its slot (pushing its branch). */
+  private readonly postWork = new Set<Promise<unknown>>();
   /** Tasks interrupted by the last hub stop that resume once the runtime is signed in. */
   private readonly resumeQueue = new Set<string>();
   private readonly checkIns = new Set<string>();
@@ -134,6 +149,10 @@ export class TaskRunner {
   init(): void {
     const { store } = this.deps;
     for (const task of store.tasks) {
+      if (task.push?.status === "pushing") {
+        task.push = { ...task.push, status: "failed", reason: "The hub stopped while the branch was being pushed; push it again", at: nowIso() };
+        store.saveTask(task);
+      }
       if (task.status !== "running" && task.status !== "needs-input") continue;
       task.status = "interrupted";
       task.activity = undefined;
@@ -346,9 +365,11 @@ export class TaskRunner {
     }
   }
 
-  /** Waits until no task is running (used by tests and shutdown). */
+  /** Waits until no task is running and post-completion work (pushes) has finished (used by tests and shutdown). */
   async idle(): Promise<void> {
-    while (this.running.size) await Promise.all([...this.running.values()].map((entry) => entry.done));
+    while (this.running.size || this.postWork.size) {
+      await Promise.all([...[...this.running.values()].map((entry) => entry.done), ...this.postWork]);
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -357,7 +378,7 @@ export class TaskRunner {
     const entries = [...this.running.values()];
     for (const entry of entries) entry.controller.abort();
     await Promise.all(entries.map((entry) => entry.engine?.abortAgents()));
-    await Promise.race([Promise.all(entries.map((entry) => entry.done)), new Promise((resolve) => setTimeout(resolve, 5000))]);
+    await Promise.race([Promise.all([...entries.map((entry) => entry.done), ...this.postWork]), new Promise((resolve) => setTimeout(resolve, 5000))]);
   }
 
   /** How many tasks may run at once: the Parallel tasks setting, never more than MAX_PARALLEL_TASKS. */
@@ -408,6 +429,122 @@ export class TaskRunner {
     if (!target?.author?.docSnapshot) return { ...base, round: null, content: null };
     const content = await this.deps.store.readArtifact(task.id, target.author.docSnapshot);
     return { ...base, round: target.n, content };
+  }
+
+  /** Pushes the task branch now (e.g. after a failed automatic push, or with automatic pushes turned off). */
+  async pushNow(id: string): Promise<Task> {
+    const task = this.get(id);
+    if (this.running.has(id) || ACTIVE_STATUSES.includes(task.status)) throw new HttpError(409, "Wait until the task has finished before pushing its branch");
+    if (task.push?.status === "pushing") throw new HttpError(409, "The branch is being pushed right now");
+    await this.pushTask(task, false);
+    return task;
+  }
+
+  /**
+   * Opens a pull request for the task branch: pushes the latest commit first, then creates the pull request
+   * directly when a creator (the GitHub CLI) can, otherwise returns the host's prefilled create page.
+   */
+  async pullRequest(id: string): Promise<PullRequestOutcome> {
+    const task = this.get(id);
+    if (this.running.has(id) || ACTIVE_STATUSES.includes(task.status)) throw new HttpError(409, "Wait until the task has finished before opening a pull request");
+    if (task.pullRequest) return { pullRequest: task.pullRequest, message: `Pull request ${prName(task.pullRequest)} already exists` };
+    const repo = this.deps.store.getRepo(task.repoId);
+    if (!repo || !task.branch || !task.baseSha) throw new HttpError(409, "This task has no branch to open a pull request for");
+    const remote = await primaryRemote(repo.path);
+    if (!remote) throw new HttpError(409, "No git remote is configured for this repository, so there is nowhere to open a pull request");
+    const head = await resolveCommit(repo.path, `refs/heads/${task.branch}`);
+    if (!(task.push?.status === "pushed" && task.push.sha === head)) {
+      const push = await this.pushTask(task, false, true);
+      if (push.status !== "pushed") throw new HttpError(409, `The branch could not be pushed: ${push.reason ?? push.status}`);
+    }
+    const request = {
+      head: task.branch,
+      base: pullRequestBase(task, repo),
+      title: task.title,
+      body: pullRequestBody(task),
+      draft: !task.result?.approved,
+    };
+    const creator = this.deps.pullRequests;
+    if (creator && (await creator.canCreate(remote))) {
+      try {
+        const created = (await creator.findOpen(remote, request.head)) ?? (await creator.create(remote, request));
+        task.pullRequest = { ...created, base: request.base, createdAt: nowIso() };
+      } catch (error) {
+        throw new HttpError(502, sanitizeRemoteUrl(errorMessage(error)));
+      }
+      const name = prName(task.pullRequest);
+      this.emit(task, { type: "info", text: `Pull request ${name} opened: ${task.pullRequest.url}`, data: { pullRequest: task.pullRequest } });
+      this.comm(task, { from: "manager", to: "user", kind: "lifecycle", text: `Opened pull request ${name}${task.pullRequest.draft ? " (draft)" : ""} into ${request.base}` });
+      this.publish(task);
+      return { pullRequest: task.pullRequest, message: `Opened pull request ${name}` };
+    }
+    const createUrl = pullRequestPageUrl(remote, request);
+    if (!createUrl) throw new HttpError(409, `Pull requests are not supported for this remote (${remote.url})`);
+    return { createUrl, message: `Opening the ${remote.host ?? "remote"} page to create the pull request` };
+  }
+
+  /** What the UI's pull request button can do for this task. */
+  async pullRequestStatus(id: string): Promise<{
+    remote: { name: string; url: string; provider: string; host?: string } | null;
+    /** True when the pull request can be created directly (GitHub CLI signed in); otherwise the host's page opens. */
+    direct: boolean;
+    supported: boolean;
+    pullRequest?: PullRequestInfo;
+  }> {
+    const task = this.get(id);
+    const repo = this.deps.store.getRepo(task.repoId);
+    const remote = repo ? await primaryRemote(repo.path) : null;
+    if (!remote) return { remote: null, direct: false, supported: false, pullRequest: task.pullRequest };
+    const direct = Boolean(this.deps.pullRequests && (await this.deps.pullRequests.canCreate(remote)));
+    return {
+      remote: { name: remote.name, url: remote.url, provider: remote.provider, host: remote.host },
+      direct,
+      supported: direct || remote.webUrl !== null,
+      pullRequest: task.pullRequest,
+    };
+  }
+
+  /**
+   * Pushes the task branch to the repository's remote; never throws (the outcome is recorded on the task).
+   * With `reuseCurrent`, a push that already sent the current head (e.g. an automatic push that finished
+   * while this call waited for the lock) is returned as is.
+   */
+  private async pushTask(task: Task, auto: boolean, reuseCurrent = false): Promise<PushInfo> {
+    const repo = this.deps.store.getRepo(task.repoId);
+    const branch = task.branch;
+    const record = (info: PushInfo): PushInfo => {
+      task.push = info;
+      const where = info.remote ? `${info.remote}/${info.branch}` : info.branch;
+      if (info.status === "pushed") {
+        this.emit(task, { type: "info", text: `Pushed ${info.branch} to ${info.remote} (${info.sha?.slice(0, 10)})`, data: { push: info } });
+        this.comm(task, { from: "manager", to: "user", kind: "lifecycle", text: `Pushed the task branch to ${where} (${info.sha?.slice(0, 10)})` });
+      } else if (info.status === "failed") {
+        this.emit(task, { type: "warning", text: `Could not push ${info.branch} to ${info.remote}: ${info.reason}`, data: { push: info } });
+        this.comm(task, { from: "manager", to: "user", kind: "lifecycle", text: `Could not push ${where}: ${truncate(info.reason ?? "", 200)}` });
+      } else if (info.status === "skipped") {
+        this.emit(task, { type: "info", text: `Branch not pushed: ${info.reason}`, data: { push: info } });
+      }
+      this.publish(task);
+      return info;
+    };
+    if (!repo || !branch || !task.baseSha) return record({ status: "skipped", branch: branch ?? "", reason: "The task has no branch", auto, at: nowIso() });
+    // Pushes on one repository go one at a time; other tasks' worktree work is not blocked.
+    return this.repoLocks.run(`${repo.path}#push`, async () => {
+      try {
+        const remote = await primaryRemote(repo.path);
+        if (!remote) return record({ status: "skipped", branch, reason: "No git remote is configured for this repository", auto, at: nowIso() });
+        const sha = await resolveCommit(repo.path, `refs/heads/${branch}`);
+        if (reuseCurrent && task.push?.status === "pushed" && task.push.sha === sha && task.push.remote === remote.name) return task.push;
+        const target = { branch, remote: remote.name, remoteUrl: remote.url, sha, auto };
+        if (sha === task.baseSha) return record({ ...target, status: "skipped", reason: "The task made no changes, so there is nothing to push", at: nowIso() });
+        task.push = { ...target, status: "pushing", at: nowIso() };
+        this.publish(task);
+        await pushBranch(repo.path, remote.name, branch);
+        return record({ ...target, status: "pushed", webUrl: branchWebUrl(remote, branch) ?? undefined, at: nowIso() });
+      } catch (error) {
+        return record({ status: "failed", branch, remote: task.push?.remote, remoteUrl: task.push?.remoteUrl, sha: task.push?.sha, reason: truncate(errorMessage(error), 1000), auto, at: nowIso() });
+      }
+    });
   }
 
   private async execute(task: Task, entry: RunningTask): Promise<void> {
@@ -474,7 +611,14 @@ export class TaskRunner {
       this.waiters.delete(task.id);
       this.publish(task);
       this.pump();
+      if (task.status === "completed" && store.settings.pushOnComplete && !this.shuttingDown) this.afterTask(this.pushTask(task, true));
     }
+  }
+
+  /** Tracks work that continues after the task has released its slot. */
+  private afterTask(work: Promise<unknown>): void {
+    const tracked = work.catch((error: unknown) => console.error("[runner] post-task work failed:", error)).finally(() => this.postWork.delete(tracked));
+    this.postWork.add(tracked);
   }
 
   private outcomeText(task: Task): string {
@@ -768,3 +912,48 @@ function completionText(task: Task): string {
     ? `Completed with failing tests (${result?.openComments ?? 0} failure(s) remain)`
     : `Completed without approval (${result?.openComments ?? 0} open comment(s))`;
 }
+
+function prName(pullRequest: PullRequestInfo): string {
+  return pullRequest.number ? `#${pullRequest.number}` : pullRequest.url;
+}
+
+/** The branch a pull request targets: the branch the task started from, or the repository's default branch. */
+export function pullRequestBase(task: Pick<Task, "baseRef">, repo: Pick<Repo, "defaultBranch">): string {
+  const ref = (task.baseRef ?? "").trim().replace(/^refs\/heads\//, "");
+  if (ref && ref !== "HEAD" && !SHA.test(ref)) return ref;
+  return repo.defaultBranch && repo.defaultBranch !== "HEAD" ? repo.defaultBranch : "main";
+}
+
+/** Pull request description: the outcome, the request, the plan, tests and the agents that worked on it. */
+export function pullRequestBody(task: Task): string {
+  const result = task.result;
+  const lines: string[] = [];
+  if (result?.summary.trim()) lines.push(result.summary.trim(), "");
+  lines.push("---", "", "**Request**", "", ...truncate(task.description.trim(), 1500).split(/\r?\n/).map((line) => `> ${line}`), "");
+  if (task.plan) {
+    lines.push(`**Manager's plan:** ${task.plan.stages.map((stage) => STAGE_TITLES[stage]).join(" → ")} — ${task.plan.rationale}`, "");
+  }
+  if (result) {
+    const testsLast = stageKindsOf(task).at(-1) === "testing";
+    lines.push(
+      `**Outcome:** ${
+        result.approved
+          ? testsLast
+            ? "all tests pass (verified by the test executor)"
+            : "approved by the reviewer"
+          : `not approved — ${result.openComments} open ${testsLast ? "failure" : "comment"}(s)`
+      }${result.shortStat ? ` · ${result.shortStat}` : ""}`,
+    );
+    if (result.tests) {
+      const counts = result.tests.total !== undefined ? ` (${result.tests.passed ?? "?"}/${result.tests.total} passed)` : "";
+      const commands = result.tests.commands.length ? ` · ${result.tests.commands.slice(0, 3).map((command) => `\`${command}\``).join(", ")}` : "";
+      lines.push(`**Tests:** ${result.tests.status}${counts}${commands}`);
+    }
+  }
+  const agents = (task.agents ?? []).filter((agent) => agent.turns > 0);
+  if (agents.length) lines.push(`**Agents:** ${agents.map((agent) => `${ROLE_LABELS[agent.role]} (${agent.model})`).join(", ")}`);
+  lines.push("", `_Created with Copilot Agent Hub — task ${task.id}._`);
+  return lines.join("\n");
+}
+
+const STAGE_TITLES: Record<StageKind, string> = { design: "Design", coding: "Coding", testing: "Execute & verify", document: "Document" };

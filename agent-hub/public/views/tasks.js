@@ -13,6 +13,7 @@ import {
   statusInfo,
 } from "../lib/dom.js";
 import { state, subscribe } from "../lib/store.js";
+import { parallelControl } from "../lib/parallel.js";
 
 const FILTERS = [
   { id: "all", label: "All", test: () => true },
@@ -61,6 +62,8 @@ export function pipelineMini(task) {
 export function tasksView(root) {
   const filterBar = h("div", { class: "filters", role: "tablist" });
   const list = h("div", { class: "task-list" });
+  const parallel = parallelControl();
+  const load = h("span", { class: "muted small" });
   root.append(
     h(
       "div",
@@ -71,13 +74,21 @@ export function tasksView(root) {
         h("h1", {}, "Tasks"),
         h("p", { class: "muted" }, "Pick a task type, or choose Auto and the manager agent reads your request and decides which sub-agents to create: designers, coders, reviewers, test executors and fixers, technical writers. Each agent works on its own branch."),
       ),
-      h("a", { class: "btn btn-primary", href: "#/tasks/new" }, "+ New task"),
+      h("div", { class: "page-actions" }, h("div", { class: "parallel-box" }, parallel.el, load), h("a", { class: "btn btn-primary", href: "#/tasks/new" }, "+ New task")),
     ),
     filterBar,
     list,
   );
 
+  function renderLoad() {
+    const tasks = [...state.tasks.values()];
+    const running = tasks.filter((task) => task.status === "running" || task.status === "needs-input").length;
+    const queued = tasks.filter((task) => task.status === "queued").length;
+    load.textContent = `${running} running · ${queued} queued`;
+  }
+
   function render() {
+    renderLoad();
     const tasks = [...state.tasks.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     setContent(
       filterBar,
@@ -127,7 +138,10 @@ export function tasksView(root) {
     setContent(list, visible.map(taskCard));
   }
 
-  const unsubscribe = subscribe((kind) => (kind === "tasks" || kind === "repos") && render());
+  const unsubscribe = subscribe((kind) => {
+    if (kind === "tasks" || kind === "repos") render();
+    if (kind === "settings") parallel.update();
+  });
   const ticker = setInterval(render, 30_000);
   render();
   return () => {
@@ -215,6 +229,7 @@ function resultLine(task) {
     const testText = tests
       ? ` · tests ${tests.status}${tests.total !== undefined ? ` (${tests.passed ?? tests.total - (tests.failed ?? 0)}/${tests.total})` : ""}`
       : "";
+    const push = task.push;
     return h(
       "div",
       { class: `task-result ${task.approved ? "ok" : "warn"}` },
@@ -222,6 +237,10 @@ function resultLine(task) {
       task.shortStat ? h("span", { class: "muted" }, ` · ${task.shortStat}`) : null,
       testText ? h("span", { class: "muted" }, testText) : null,
       !task.approved && task.openComments ? h("span", { class: "muted" }, ` · ${task.openComments} ${testsLast ? "failure" : "open comment"}(s)`) : null,
+      push?.status === "pushed" ? h("span", { class: "result-badge ok", title: `Pushed to ${push.remote}/${push.branch}` }, "↑ pushed") : null,
+      push?.status === "pushing" ? h("span", { class: "result-badge" }, "pushing…") : null,
+      push?.status === "failed" ? h("span", { class: "result-badge danger", title: push.reason ?? "" }, "push failed") : null,
+      task.pullRequest ? h("span", { class: "result-badge pr", title: task.pullRequest.url }, `PR ${task.pullRequest.number ? `#${task.pullRequest.number}` : "open"}${task.pullRequest.draft ? " (draft)" : ""}`) : null,
     );
   }
   return task.error ? h("div", { class: "task-activity danger ellipsis" }, task.error) : null;

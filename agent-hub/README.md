@@ -103,6 +103,8 @@ flowchart LR
 6. **Result**: the task branch, commits, diff stat, test results and final summary (one section per stage),
    with ready-to-copy `git` commands to inspect and merge. Design and document tasks keep every document
    version (v1, v2, … final).
+7. **Push & pull request**: the hub pushes the task branch to the repository's remote and the task gets a
+   **Create pull request** button (see [Pushing branches and pull requests](#pushing-branches-and-pull-requests)).
 
 Each agent keeps one Copilot session per stage, so it remembers earlier rounds; a comment resolver or test
 fixer that starts fresh gets the request, the previous summary and the diff so far. If an agent ends a turn
@@ -141,8 +143,9 @@ a missing tool).
 
 The **Agents** page shows the work from the agents' side, updated live over Server-Sent Events:
 
-- **Stats**: whether the manager is online, running/queued tasks against the parallel-task capacity,
-  how many sub-agents are working or waiting for their turn, and recent message volume.
+- **Stats**: whether the manager is online, running/queued tasks against the parallel-task capacity
+  (with a live **Limit − / +** control), how many sub-agents are working or waiting for their turn, and
+  recent message volume.
 - **Hierarchy** diagram: *You → Manager agent → tasks → sub-agents*. For Auto tasks the manager's
   **planner** appears first under the task, followed by the agents it decided to create. Each agent
   node shows its model, status, what it is doing now, its last instruction from (↓) or report to (↑) the
@@ -186,10 +189,35 @@ Designs go to `docs/designs/` and documents to `docs/` by default (both configur
 Set **Agent isolation** to "own worktree and branch per agent" to give every sub-agent its own worktree
 (`data/worktrees/<task>/<role>`) at the cost of more disk and per-agent dependency installs. Tasks never
 share worktrees, so up to **Parallel tasks** tasks (default and maximum: 10) run at once, including on the
-same repository; further tasks wait in the queue and start in submission order as slots free up. Git
-worktree operations on a repository are serialized. When a task completes, its worktrees are removed
-(branches are kept) unless you turn **Cleanup** off; failed or cancelled tasks keep their worktrees for
-inspection or retry. Don't check out a task branch elsewhere while its task is running.
+same repository; further tasks wait in the queue and start in submission order as slots free up. Change
+the limit live with the **Parallel tasks − / +** control in the Tasks page header (or the Agents page,
+or Settings): raising it starts queued tasks right away; lowering it lets running tasks finish while new
+ones wait. Git worktree operations on a repository are serialized. When a task completes, its worktrees
+are removed (branches are kept) unless you turn **Cleanup** off; failed or cancelled tasks keep their
+worktrees for inspection or retry. Don't check out a task branch elsewhere while its task is running.
+
+## Pushing branches and pull requests
+
+- **Automatic push**: when a task completes, the hub pushes its task branch (only the task branch, not
+  the agents' `--coder`/`--fixer`/… branches) to the repository's remote (`origin`, or the first remote)
+  with your normal git credentials. It never force-pushes, pushes to one repository one at a time, and
+  pushes after the task has freed its slot, so queued tasks don't wait for the network. Repositories
+  without a remote, and tasks that made no changes, are skipped. A failed push shows git's error and a
+  **Retry push** button. Turn automatic pushes off in Settings → Workspaces → **Push**; finished tasks
+  then offer **Push branch**.
+- **Create pull request** (task result card and Result tab) pushes the branch first if needed, then:
+  - creates the pull request directly when the GitHub CLI is signed in to the remote's host
+    (`gh auth login`): title from the task, a description built from the result (summary, request,
+    manager's plan, outcome, tests, agents), as a **draft** when the task wasn't approved or tests still
+    fail. The task then links to it (**Pull request #N ↗**);
+  - otherwise opens the host's create page with the branches filled in: GitHub (including GitHub
+    Enterprise), Azure DevOps, GitLab and Bitbucket (GitHub and GitLab also get the title and
+    description).
+- Pull requests target the branch the task started from, or the repository's default branch. When a
+  task runs again (for example **Continue review loop**), its new commits are pushed to the same branch,
+  so an open pull request updates itself.
+- The task list shows **↑ pushed**, **push failed** and **PR #N** badges. The hub never reads or stores
+  git or GitHub tokens: pushes use git's credential helper, pull requests the GitHub CLI's sign-in.
 
 ## Best-practice skills
 
@@ -233,7 +261,7 @@ store. After a successful sign-in the hub restarts its runtime to load the new c
   `switch`), `rebase`, `reset --hard`, worktree/remote changes and global git config are rejected.
   Reads outside the worktree and persistent memory are denied. Each agent may still use its own
   session scratch folder under `<copilot home>/session-state` (for example for plans) and read the
-  skill folders it was given.
+  skill folders it was given. Only the hub itself pushes, and only finished task branches, never forced.
 - These are guardrails enforced through the SDK permission callback, **not a sandbox**: author agents
   and the test executor run build/test commands on your machine with your user account. Only register
   repositories you are comfortable letting an agent work on.
@@ -254,8 +282,9 @@ Environment variables:
 | `HUB_RUNTIME_LOG_LEVEL` | `error` | Copilot runtime log level |
 
 Settings page: default manager, author, comment-resolver/test-fixer and reviewer/test-executor models,
-agent isolation (own branch per agent, or own worktree per agent), worktree cleanup on completion, max
-review rounds / test runs (default 3), parallel tasks (default and maximum 10; more tasks are queued), agent turn timeout, question timeout,
+agent isolation (own branch per agent, or own worktree per agent), worktree cleanup on completion, pushing
+task branches when tasks complete (default on), max
+review rounds / test runs (default 3), parallel tasks (default and maximum 10; more tasks are queued; also adjustable live from the Tasks and Agents pages), agent turn timeout, question timeout,
 resuming interrupted tasks after a restart (default on), document format (HTML or Markdown) and the
 design (`docs/designs`) and document (`docs`) folders. The **Storage** section shows where each kind of
 data is saved.
@@ -271,7 +300,7 @@ data/
   settings.json              settings
   repos.json                 registered repositories
   manager-log.jsonl          manager <-> sub-agent messages (Agents view; rotated at 8 MB)
-  tasks/<id>/task.json       last known state of the task (stages, rounds, comments, agents, result)
+  tasks/<id>/task.json       last known state of the task (stages, rounds, comments, agents, result, push, pull request)
   tasks/<id>/events.jsonl    timeline (append-only)
   tasks/<id>/doc-rN.html     design/document snapshot for round N (.md for Markdown documents)
   worktrees/<id>/author/     author agents' worktree (or <id>/<role>/ with per-agent worktrees)
@@ -300,6 +329,8 @@ deletes the task branch.
 | `GET/POST /api/tasks` · `GET/DELETE /api/tasks/:id` | Tasks (`kind`: `auto`, `coding`, `testing`, `design`, `document`, `design-coding`; optional `managerModel` for Auto) |
 | `POST /api/tasks/:id/cancel` · `POST /api/tasks/:id/retry` · `POST /api/tasks/:id/input` | Control and answers |
 | `GET /api/tasks/:id/diff?from=&to=` | Changes |
+| `POST /api/tasks/:id/push` | Push the task branch to the remote now (retry, or with automatic pushes off) |
+| `GET /api/tasks/:id/pull-request` · `POST /api/tasks/:id/pull-request` | What the remote supports / open the pull request (returns it, or the host's `createUrl`) |
 | `GET /api/tasks/:id/doc?round=` · `GET /api/tasks/:id/doc/view?round=` | Design/document versions (JSON, or the sandboxed HTML page) |
 | `GET /api/agents/overview?taskId=&limit=` | Manager state and its recent messages with sub-agents |
 | `GET /api/stream` · `GET /api/tasks/:id/stream?after=<seq>` | Server-Sent Events (global incl. manager messages / per task) |

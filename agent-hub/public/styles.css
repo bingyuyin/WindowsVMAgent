@@ -627,6 +627,121 @@ details > summary {
   border: 1px solid var(--border-muted);
 }
 
+/* ---- push & pull request ------------------------------------------------------------------ */
+
+.delivery {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-muted);
+}
+.delivery:empty {
+  display: none;
+}
+.delivery-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.delivery-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  min-width: 0;
+  font-size: 13px;
+}
+.delivery-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--bg-inset);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.delivery-icon.delivery-ok {
+  background: var(--success-muted);
+  color: var(--success);
+}
+.delivery-icon.delivery-bad {
+  background: var(--danger-muted);
+  color: var(--danger);
+}
+.delivery-warn {
+  color: var(--warning);
+}
+.delivery-error {
+  max-height: 120px;
+  overflow: auto;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--danger-muted);
+  color: var(--danger);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---- parallel tasks control --------------------------------------------------------------- */
+
+.page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.parallel-box {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+.parallel-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  font-size: 12.5px;
+  transition: opacity 0.15s;
+}
+.parallel-control.saving {
+  opacity: 0.7;
+}
+.parallel-label {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+.parallel-value {
+  min-width: 2ch;
+  font-size: 14px;
+  font-weight: 650;
+  text-align: center;
+}
+.parallel-step {
+  min-width: 26px;
+}
+.agents-stat-extra:not(:empty) {
+  margin-top: 8px;
+}
+.agents-stat-extra .parallel-control {
+  padding-left: 8px;
+}
+
 /* ---- agents ------------------------------------------------------------------------------ */
 
 .agents {
@@ -777,6 +892,34 @@ details > summary {
 }
 .task-result.warn {
   color: var(--warning);
+}
+.result-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elev-2);
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 18px;
+  vertical-align: 1px;
+}
+.result-badge.ok {
+  border-color: color-mix(in srgb, var(--success) 35%, var(--border));
+  background: var(--success-muted);
+  color: var(--success);
+}
+.result-badge.danger {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  background: var(--danger-muted);
+  color: var(--danger);
+}
+.result-badge.pr {
+  border-color: color-mix(in srgb, var(--violet) 35%, var(--border));
+  background: var(--violet-muted);
+  color: var(--violet);
 }
 .attention-text {
   color: var(--attention);

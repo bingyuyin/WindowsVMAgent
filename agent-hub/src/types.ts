@@ -63,6 +63,8 @@ export interface Settings {
   cleanupWorktrees: boolean;
   /** Re-queue tasks that were running when the hub stopped, once it is signed in again. */
   resumeInterruptedTasks: boolean;
+  /** Push each task's branch to the repository's remote when the task completes. */
+  pushOnComplete: boolean;
 }
 
 export interface Repo {
@@ -253,6 +255,33 @@ export interface TaskPlan {
   plannedAt: string;
 }
 
+/** Last attempt to push the task branch to the repository's remote. */
+export interface PushInfo {
+  status: "pushing" | "pushed" | "failed" | "skipped";
+  branch: string;
+  /** Remote name and URL (credentials stripped). */
+  remote?: string;
+  remoteUrl?: string;
+  /** Web page of the pushed branch, when the host is known. */
+  webUrl?: string;
+  /** Commit that was pushed. */
+  sha?: string;
+  /** Why the push failed or was skipped. */
+  reason?: string;
+  /** True for the automatic push when the task completed. */
+  auto: boolean;
+  at: string;
+}
+
+/** A pull request opened for the task branch. */
+export interface PullRequestInfo {
+  url: string;
+  number?: number;
+  draft?: boolean;
+  base: string;
+  createdAt: string;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -292,6 +321,9 @@ export interface Task {
   sessions: SessionRef[];
   error?: string;
   result?: TaskResult;
+  /** Pushing the task branch to the remote (after completion, or on request). */
+  push?: PushInfo;
+  pullRequest?: PullRequestInfo;
   usage: Usage;
   attempt: number;
   /** Review rounds allowed for the current attempt (set on continue/retry). */

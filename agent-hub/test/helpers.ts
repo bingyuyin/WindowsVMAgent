@@ -15,6 +15,7 @@ import { Bus } from "../src/bus.ts";
 import type { HubSkills } from "../src/context.ts";
 import type { DocTemplates } from "../src/docs.ts";
 import { Store } from "../src/store.ts";
+import type { PullRequestCreator } from "../src/remote.ts";
 import type { AgentRole, Settings } from "../src/types.ts";
 import { TaskRunner } from "../src/workflow/runner.ts";
 
@@ -147,6 +148,7 @@ export interface HarnessOptions {
   hubSkills?: HubSkills;
   docTemplates?: DocTemplates | null;
   ready?: boolean;
+  pullRequests?: PullRequestCreator;
 }
 
 export const TEMPLATES_DIR = path.join(import.meta.dirname, "..", "templates");
@@ -188,6 +190,7 @@ export function createHarness(script: Partial<Record<AgentRole, Step[]>>, option
       worktreesDir,
       hubSkills: options.hubSkills,
       docTemplates: options.docTemplates,
+      pullRequests: options.pullRequests,
     });
   const runner = newRunner();
   return {
@@ -219,3 +222,18 @@ export async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promi
 
 export const branchHead = (repoPath: string, branch: string): string => git(repoPath, "rev-parse", `refs/heads/${branch}`);
 export const branchExists = (repoPath: string, branch: string): boolean => git(repoPath, "branch", "--list", branch).length > 0;
+
+/**
+ * Gives the sample repository an "origin" that looks like `url` (so the hub links to that host) while pushes
+ * go to a local bare repository. Returns the bare repository's path.
+ */
+export function addRemote(h: Harness, url = "https://github.com/acme/sample.git"): string {
+  const bare = path.join(h.root, "origin.git");
+  git(h.root, "init", "-q", "--bare", bare);
+  git(h.repoPath, "remote", "add", "origin", url);
+  git(h.repoPath, "config", "remote.origin.pushurl", bare);
+  return bare;
+}
+
+/** Runs git in a bare repository, naming it explicitly (as `safe.bareRepository=explicit` requires). */
+export const bareGit = (bare: string, ...args: string[]): string => git(path.dirname(bare), `--git-dir=${bare}`, ...args);

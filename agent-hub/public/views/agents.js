@@ -17,6 +17,7 @@ import {
   statusInfo,
 } from "../lib/dom.js";
 import { state, subscribe } from "../lib/store.js";
+import { parallelControl } from "../lib/parallel.js";
 
 const ACTIVE = ["queued", "running", "needs-input"];
 const PREFS_KEY = "agent-hub.agents-view";
@@ -153,6 +154,15 @@ export function agentsView(root) {
   };
 
   const statsBox = h("div", { class: "agents-stats" });
+  const parallel = parallelControl({ label: "Limit" });
+  const statCards = {
+    manager: makeStat("Manager agent"),
+    tasks: makeStat("Tasks running"),
+    agents: makeStat("Sub-agents working"),
+    messages: makeStat("Messages (10 min)"),
+  };
+  statCards.tasks.extra.append(parallel.el);
+  statsBox.append(...Object.values(statCards).map((stat) => stat.card));
   const modeBar = h("div", { class: "seg", role: "tablist", "aria-label": "Diagram style" });
   const finishedToggle = h("input", {
     type: "checkbox",
@@ -283,20 +293,37 @@ export function agentsView(root) {
     const lastCheck = state.manager?.lastCheckAt;
     const recent = state.comm.filter((entry) => Date.now() - Date.parse(entry.ts) < 10 * 60_000).length;
     const latest = state.comm.at(-1);
-    const stat = (label, value, sub, cls = "") =>
-      h("div", { class: `card agents-stat ${cls}` }, h("div", { class: "agents-stat-label" }, label), h("div", { class: "agents-stat-value" }, value), h("div", { class: "muted small" }, sub));
-    setContent(
-      statsBox,
-      stat(
-        "Manager agent",
-        [h("span", { class: `dot ${online ? "dot-success" : "dot-danger"}` }), online ? " Online" : " Signed out"],
-        `checks on agents every ${interval}s${lastCheck ? ` · last ${relTime(lastCheck)}` : ""}`,
-        online ? "stat-ok" : "stat-bad",
-      ),
-      stat("Tasks running", `${running} / ${capacity}`, `${queued} queued · ${needsInput} waiting for you`, needsInput ? "stat-attention" : ""),
-      stat("Sub-agents working", String(working), `${waiting} waiting for their turn · ${agents.length} in active tasks`),
-      stat("Messages (10 min)", String(recent), latest ? `last: ${partyLabel(latest.from)} → ${partyLabel(latest.to)} ${relTime(latest.ts)}` : "no messages yet"),
+    setStat(
+      statCards.manager,
+      [h("span", { class: `dot ${online ? "dot-success" : "dot-danger"}` }), online ? " Online" : " Signed out"],
+      `checks on agents every ${interval}s${lastCheck ? ` · last ${relTime(lastCheck)}` : ""}`,
+      online ? "stat-ok" : "stat-bad",
     );
+    setStat(
+      statCards.tasks,
+      `${running} / ${capacity}`,
+      running > capacity
+        ? `limit lowered: running tasks finish first · ${queued} queued`
+        : `${queued} queued · ${needsInput} waiting for you`,
+      needsInput ? "stat-attention" : "",
+    );
+    setStat(statCards.agents, String(working), `${waiting} waiting for their turn · ${agents.length} in active tasks`);
+    setStat(statCards.messages, String(recent), latest ? `last: ${partyLabel(latest.from)} → ${partyLabel(latest.to)} ${relTime(latest.ts)}` : "no messages yet");
+  }
+
+  /** Stat cards are built once and updated in place, so the parallel-tasks control inside keeps working between refreshes. */
+  function makeStat(label) {
+    const value = h("div", { class: "agents-stat-value" });
+    const sub = h("div", { class: "muted small" });
+    const extra = h("div", { class: "agents-stat-extra" });
+    const card = h("div", { class: "card agents-stat" }, h("div", { class: "agents-stat-label" }, label), value, sub, extra);
+    return { card, value, sub, extra };
+  }
+
+  function setStat(stat, value, sub, cls = "") {
+    stat.card.className = `card agents-stat ${cls}`;
+    setContent(stat.value, value);
+    stat.sub.textContent = sub;
   }
 
   // ---- hierarchy (SVG) -----------------------------------------------------------------------
@@ -883,6 +910,7 @@ export function agentsView(root) {
         schedule();
       }
     } else if (kind === "tasks" || kind === "settings" || kind === "auth" || kind === "manager") {
+      if (kind === "settings") parallel.update();
       schedule();
     }
   });
