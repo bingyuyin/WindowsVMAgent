@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { isReviewerRole, type AgentRole, type IsolationMode } from "./types.ts";
+import { isReviewerRole, worksDetached, type AgentRole, type IsolationMode } from "./types.ts";
 
 export class GitError extends Error {
   readonly stderr: string;
@@ -266,11 +266,13 @@ export class GitTaskWorkspace implements TaskWorkspace {
 
   pathFor(role: AgentRole): string {
     if (this.isolation === "worktree") return path.join(this.root, role);
-    return path.join(this.root, isReviewerRole(role) ? "review" : "author");
+    // The executor keeps its own checkout so installed dependencies and build output survive between runs.
+    if (role === "executor") return path.join(this.root, "run");
+    return path.join(this.root, isReviewerRole(role) || role === "planner" ? "review" : "author");
   }
 
   branchFor(role: AgentRole): string | null {
-    return isReviewerRole(role) ? null : `${this.taskBranch}--${role}`;
+    return worksDetached(role) ? null : `${this.taskBranch}--${role}`;
   }
 
   /** Creates the task branch at the base commit when it does not exist yet. */

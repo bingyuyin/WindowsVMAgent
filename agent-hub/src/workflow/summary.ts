@@ -1,4 +1,4 @@
-import type { Activity, AgentInfo, Phase, StageKind, StageStatus, Task, TaskKind, TaskStatus, Usage, Verdict } from "../types.ts";
+import type { Activity, AgentInfo, Phase, StageKind, StageStatus, Task, TaskKind, TaskStatus, TestRunInfo, TestStatus, Usage, Verdict } from "../types.ts";
 
 export interface TaskSummary {
   id: string;
@@ -18,6 +18,8 @@ export interface TaskSummary {
   activity?: Activity;
   authorModel: string;
   reviewerModel: string;
+  resolverModel?: string;
+  managerModel?: string;
   agents: Array<
     Pick<AgentInfo, "role" | "status" | "model" | "assignment" | "lastActivity" | "branch" | "updatedAt" | "turns" | "rounds" | "usage">
   >;
@@ -25,12 +27,15 @@ export interface TaskSummary {
   shortStat?: string;
   openComments?: number;
   docPath?: string;
+  /** Auto tasks: the stages the manager planned (agents are created per stage). */
+  plan?: { stages: StageKind[]; rationale: string; fallback?: boolean };
+  tests?: Pick<TestRunInfo, "status" | "total" | "passed" | "failed" | "skipped">;
   needsInput: boolean;
   error?: string;
   stages: Array<{
     kind: StageKind;
     status: StageStatus;
-    rounds: Array<{ n: number; verdict: Verdict | null; comments: number; authored: boolean }>;
+    rounds: Array<{ n: number; verdict: Verdict | null; comments: number; authored: boolean; testStatus?: TestStatus }>;
   }>;
   usage: Usage;
   attempt: number;
@@ -59,6 +64,8 @@ export function summarizeTask(task: Task): TaskSummary {
     activity: task.activity,
     authorModel: task.authorModel,
     reviewerModel: task.reviewerModel,
+    resolverModel: task.resolverModel,
+    managerModel: task.managerModel,
     agents: (task.agents ?? []).map(({ role, status, model, assignment, lastActivity, branch, updatedAt, turns, rounds, usage }) => ({
       role,
       status,
@@ -75,6 +82,16 @@ export function summarizeTask(task: Task): TaskSummary {
     shortStat: task.result?.shortStat,
     openComments: task.result?.openComments,
     docPath: task.result?.docPath ?? task.stages.find((stage) => stage.docPath)?.docPath,
+    plan: task.plan ? { stages: task.plan.stages, rationale: task.plan.rationale, fallback: task.plan.fallback } : undefined,
+    tests: task.result?.tests
+      ? {
+          status: task.result.tests.status,
+          total: task.result.tests.total,
+          passed: task.result.tests.passed,
+          failed: task.result.tests.failed,
+          skipped: task.result.tests.skipped,
+        }
+      : undefined,
     needsInput: Boolean(task.pendingInput),
     error: task.error,
     stages: task.stages.map((stage) => ({
@@ -85,6 +102,7 @@ export function summarizeTask(task: Task): TaskSummary {
         verdict: round.review?.verdict ?? null,
         comments: round.review?.comments.length ?? 0,
         authored: Boolean(round.author),
+        testStatus: round.review?.testRun?.status,
       })),
     })),
     usage: task.usage,

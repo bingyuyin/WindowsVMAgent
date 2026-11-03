@@ -17,20 +17,23 @@ import {
   ROLE_LABELS,
   ROLE_SKILLS,
   roleTag,
-  rolesFor,
+  rolesForTask,
   setContent,
   shortSha,
   spinner,
   STAGE_LABELS,
   statusInfo,
   toast,
+  worksDetached,
 } from "../lib/dom.js";
 import { renderDiff, renderMarkdown } from "../lib/markdown.js";
 import { state } from "../lib/store.js";
 
 const ACTIVE = ["queued", "running", "needs-input"];
-const REVIEWER_ROLE = { design: "design-reviewer", document: "doc-reviewer", coding: "code-reviewer" };
-const AUTHOR_ROLE = { design: "designer", document: "writer", coding: "coder" };
+const REVIEWER_ROLE = { design: "design-reviewer", document: "doc-reviewer", coding: "code-reviewer", testing: "executor" };
+const AUTHOR_ROLE = { design: "designer", document: "writer", coding: "coder", testing: "fixer" };
+const TEST_STATUS = { passed: ["Passed", "success"], failed: ["Failed", "danger"], blocked: ["Blocked", "warning"] };
+const CATEGORY_CLASS = { "product-bug": "danger", "test-bug": "warning", environment: "neutral", flaky: "info", integrity: "danger", unknown: "neutral" };
 const STAGE_STATUS = {
   pending: ["Pending", "neutral"],
   running: ["In progress", "running"],
@@ -40,6 +43,14 @@ const STAGE_STATUS = {
   cancelled: ["Cancelled", "neutral"],
 };
 const SEVERITY_CLASS = { blocker: "danger", major: "warning", minor: "info", nit: "neutral" };
+/** Testing stages pass or fail rather than being approved. */
+const stageStatus = (stage) =>
+  stage.kind === "testing" && stage.status === "approved"
+    ? ["Tests pass", "success"]
+    : stage.kind === "testing" && stage.status === "not-approved"
+      ? ["Tests failing", "warning"]
+      : (STAGE_STATUS[stage.status] ?? [stage.status, "neutral"]);
+const roundsTabLabel = (task) => (task.stages.length && task.stages.every((stage) => stage.kind === "testing") ? "Test runs" : "Rounds");
 const EVENT_ICONS = {
   status: "●",
   phase: "▸",
@@ -60,6 +71,16 @@ const excerpt = (text, max = 280) => {
   const flat = String(text ?? "").replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 };
+/** "12 tests · 11 passed · 1 failed · 2 skipped" */
+const testCounts = (run) =>
+  [
+    run.total !== undefined ? `${run.total} test${run.total === 1 ? "" : "s"}` : null,
+    run.passed !== undefined ? `${run.passed} passed` : null,
+    run.failed ? `${run.failed} failed` : null,
+    run.skipped ? `${run.skipped} skipped` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ") || "no counts reported";
 
 export function taskDetailView(root, { params }) {
   const id = params[0];
@@ -87,6 +108,7 @@ export function taskDetailView(root, { params }) {
   const heroBox = h("div");
   const heroElapsed = h("span", { class: "muted small mono" });
   const inputBox = h("div");
+  const planBox = h("div");
   const agentsBox = h("section", { class: "agents" });
   const pipelineBox = h("div");
   const streamRole = h("span", { class: "muted small" });
@@ -110,6 +132,7 @@ export function taskDetailView(root, { params }) {
     h("div", { class: "detail-header" }, titleBox, metaBox),
     heroBox,
     inputBox,
+    planBox,
     agentsBox,
     pipelineBox,
     liveBox,
@@ -215,11 +238,81 @@ export function taskDetailView(root, { params }) {
     renderMeta();
     renderHero();
     renderInput();
+    renderPlan();
     renderAgents();
     renderPipeline();
     renderLive();
     renderTabs();
     renderActiveTab(false);
+  }
+
+  /** Auto tasks: what the manager decided - which stages (sub-agent teams) to run and each team's assignment. */
+  function renderPlan() {
+    const signature = JSON.stringify([task.kind, task.plan, task.status, task.phase]);
+    if (signatures.plan === signature) return;
+    signatures.plan = signature;
+    if (task.kind !== "auto") {
+      setContent(planBox);
+      return;
+    }
+    const plan = task.plan;
+    if (!plan) {
+      const planning = ["running", "needs-input"].includes(task.status);
+      setContent(
+        planBox,
+        h(
+          "section",
+          { class: "card plan-card" },
+          h("div", { class: "plan-head" }, h("span", { class: "plan-badge", "aria-hidden": "true" }, "◆"), h("strong", {}, "Manager's plan")),
+          planning
+            ? spinner("The manager is reading the request and the repository to decide which sub-agents to create…")
+            : h("p", { class: "muted small" }, task.status === "queued" ? "The manager plans this task when it starts." : "The task stopped before the manager finished planning; Retry plans it again."),
+        ),
+      );
+      return;
+    }
+    setContent(
+      planBox,
+      h(
+        "section",
+        { class: "card plan-card" },
+        h(
+          "div",
+          { class: "plan-head" },
+          h("span", { class: "plan-badge", "aria-hidden": "true" }, "◆"),
+          h("strong", {}, "Manager's plan"),
+          plan.fallback ? chip("derived from keywords", "warning", "The planner did not submit a plan; the hub chose stages from the request") : null,
+          h("span", { class: "spacer" }),
+          h("span", { class: "muted small" }, plan.plannedAt ? `planned ${clock(plan.plannedAt)}` : ""),
+        ),
+        h(
+          "div",
+          { class: "plan-flow" },
+          plan.stages.map((stage, index) => [
+            index ? h("span", { class: "plan-arrow", "aria-hidden": "true" }, "→") : null,
+            h(
+              "span",
+              { class: `plan-stage plan-${task.stages.find((candidate) => candidate.kind === stage)?.status ?? "pending"}` },
+              STAGE_LABELS[stage],
+              h("span", { class: "plan-roles" }, rolesForTask({ kind: "auto", plan: { stages: [stage] } }).slice(1).map((role) => ROLE_LABELS[role]).join(" · ")),
+            ),
+          ]),
+        ),
+        h("p", { class: "plan-rationale" }, plan.rationale),
+        plan.stages.some((stage) => plan.instructions?.[stage])
+          ? h(
+              "details",
+              { class: "plan-assignments" },
+              h("summary", {}, "Assignments the manager gave each team"),
+              plan.stages.map((stage) =>
+                plan.instructions?.[stage]
+                  ? h("div", { class: "plan-assignment" }, h("div", { class: "label" }, `${STAGE_LABELS[stage]} team`), renderMarkdown(plan.instructions[stage]))
+                  : null,
+              ),
+            )
+          : null,
+      ),
+    );
   }
 
   function renderTitle() {
@@ -228,7 +321,7 @@ export function taskDetailView(root, { params }) {
     if (ACTIVE.includes(task.status)) actions.push(h("button", { class: "btn btn-danger-outline", onclick: cancelTask }, "Cancel"));
     if (["failed", "cancelled", "interrupted"].includes(task.status)) actions.push(h("button", { class: "btn btn-primary", onclick: () => retryTask(false) }, "Retry"));
     if (task.status === "completed" && task.result && !task.result.approved) {
-      actions.push(h("button", { class: "btn btn-primary", onclick: () => retryTask(true) }, "Continue review loop"));
+      actions.push(h("button", { class: "btn btn-primary", onclick: () => retryTask(true) }, task.stages.at(-1)?.kind === "testing" ? "Continue fixing" : "Continue review loop"));
     }
     if (!ACTIVE.includes(task.status)) actions.push(h("button", { class: "btn btn-ghost-danger", onclick: deleteTask }, "Delete"));
     setContent(
@@ -245,7 +338,8 @@ export function taskDetailView(root, { params }) {
 
   function renderMeta() {
     const usage = task.usage ?? {};
-    const resolver = task.kind === "coding" || task.kind === "design-coding" ? (task.resolverModel && task.resolverModel !== task.authorModel ? ` · resolver ${task.resolverModel}` : "") : "";
+    const resolver = task.kind === "coding" || task.kind === "design-coding" || task.kind === "testing" || task.kind === "auto" ? (task.resolverModel && task.resolverModel !== task.authorModel ? ` · resolver/fixer ${task.resolverModel}` : "") : "";
+    const manager = task.kind === "auto" && task.managerModel && task.managerModel !== task.authorModel ? `manager ${task.managerModel} · ` : "";
     setContent(
       metaBox,
       meta("Repository", task.repoName),
@@ -260,7 +354,7 @@ export function taskDetailView(root, { params }) {
             : "—",
         h("div", { class: "muted small" }, task.isolation === "worktree" ? "one worktree per agent" : "authors share a worktree on their own branches; reviewers have their own"),
       ),
-      meta("Models", h("span", { class: "mono small" }, `author ${task.authorModel}${resolver} · reviewer ${task.reviewerModel}`)),
+      meta("Models", h("span", { class: "mono small" }, `${manager}author ${task.authorModel}${resolver} · reviewer ${task.reviewerModel}`)),
       meta("Review rounds", `up to ${task.roundsBudget ?? task.maxRounds}${task.attempt > 1 ? ` · attempt ${task.attempt}` : ""}`),
       meta("Duration", task.startedAt ? duration(task.startedAt, ACTIVE.includes(task.status) ? null : task.finishedAt) : "—"),
       meta(
@@ -307,9 +401,11 @@ export function taskDetailView(root, { params }) {
                 { class: "hero-title" },
                 status === "needs-input"
                   ? `${ROLE_LABELS[task.pendingInput?.role] ?? "An agent"} is waiting for your answer`
-                  : role
-                    ? `${ROLE_LABELS[role]}: ${working?.assignment ?? phaseLabel(task.currentStage, task.phase)}`
-                    : phaseLabel(task.currentStage, task.phase),
+                  : role === "planner"
+                    ? "Manager is planning: deciding which sub-agents to create and what each should do"
+                    : role
+                      ? `${ROLE_LABELS[role]}: ${working?.assignment ?? phaseLabel(task.currentStage, task.phase)}`
+                      : phaseLabel(task.currentStage, task.phase),
               ),
               now ? h("div", { class: "hero-now" }, h("span", { class: "muted" }, "Now: "), h("span", { class: "mono" }, now)) : null,
               working?.lastMessage ? h("div", { class: "hero-message" }, `“${excerpt(working.lastMessage)}”`) : null,
@@ -322,26 +418,30 @@ export function taskDetailView(root, { params }) {
     if (status === "completed" && task.result) {
       const result = task.result;
       const lastStage = task.stages.at(-1);
+      const testsLast = lastStage?.kind === "testing";
       const approvedRound = lastStage?.rounds.find((round) => round.review?.verdict === "approve");
       const reviewer = lastStage ? ROLE_LABELS[REVIEWER_ROLE[lastStage.kind]] : "reviewer";
       const docPath = result.docPath ?? result.designDocPath;
       const docStage = task.stages.find((stage) => isDocStage(stage.kind));
+      const tests = result.tests;
+      const title = testsLast
+        ? result.approved
+          ? `✓ All tests pass — verified by the test executor${approvedRound ? ` in round ${approvedRound.n}` : ""}`
+          : `Tests still failing — ${result.openComments} failure(s) remain`
+        : result.approved
+          ? `✓ Approved by the ${reviewer.toLowerCase()}${approvedRound ? ` in round ${approvedRound.n}` : ""}`
+          : `Finished without approval — ${result.openComments} review comment(s) still open`;
       setContent(
         heroBox,
         h(
           "div",
           { class: `card hero hero-result ${result.approved ? "hero-ok" : "hero-warn"}` },
           h("div", { class: "hero-top" }, h("span", { class: "hero-kicker" }, "RESULT"), h("span", { class: "spacer" }), h("span", { class: "muted small" }, `took ${duration(task.startedAt, task.finishedAt)}`)),
-          h(
-            "div",
-            { class: "hero-title" },
-            result.approved
-              ? `✓ Approved by the ${reviewer.toLowerCase()}${approvedRound ? ` in round ${approvedRound.n}` : ""}`
-              : `Finished without approval — ${result.openComments} review comment(s) still open`,
-          ),
+          h("div", { class: "hero-title" }, title),
           h(
             "div",
             { class: "result-stats" },
+            tests ? h("span", {}, chip(...(TEST_STATUS[tests.status] ?? [tests.status, "neutral"])), " ", testCounts(tests)) : null,
             h("span", {}, h("strong", {}, String(result.commits ?? 0)), " commit(s)"),
             result.shortStat ? h("span", {}, result.shortStat) : null,
             docPath ? h("span", {}, docStage?.kind === "document" ? "document " : "design ", h("span", { class: "mono" }, docPath)) : null,
@@ -353,9 +453,9 @@ export function taskDetailView(root, { params }) {
             { class: "row wrap" },
             docStage ? h("button", { class: "btn btn-sm btn-primary", onclick: () => selectTab("document") }, docStage.kind === "document" ? "View document" : "View design") : null,
             h("button", { class: "btn btn-sm", onclick: () => selectTab("changes") }, "View changes"),
-            h("button", { class: "btn btn-sm", onclick: () => selectTab("conversation") }, "Review rounds"),
+            h("button", { class: "btn btn-sm", onclick: () => selectTab("conversation") }, roundsTabLabel(task)),
             h("button", { class: "btn btn-sm", onclick: () => selectTab("result") }, "Merge instructions"),
-            !result.approved ? h("button", { class: "btn btn-sm btn-primary", onclick: () => retryTask(true) }, "Continue review loop") : null,
+            !result.approved ? h("button", { class: "btn btn-sm btn-primary", onclick: () => retryTask(true) }, testsLast ? "Continue fixing" : "Continue review loop") : null,
           ),
         ),
       );
@@ -375,7 +475,7 @@ export function taskDetailView(root, { params }) {
   /** One card per sub-agent: role, model, status, own branch/workspace, current assignment and activity. */
   function renderAgents() {
     const byRole = new Map((task.agents ?? []).map((agent) => [agent.role, agent]));
-    const signature = JSON.stringify([task.status, task.agents, task.activity?.text]);
+    const signature = JSON.stringify([task.status, task.agents, task.activity?.text, task.plan?.stages]);
     if (signatures.agents === signature) return;
     signatures.agents = signature;
     if (!task.agents?.length && task.layout !== 2 && !ACTIVE.includes(task.status)) {
@@ -389,25 +489,36 @@ export function taskDetailView(root, { params }) {
     setContent(
       agentsBox,
       h("h2", { class: "section-title" }, "Agents"),
+      task.kind === "auto" && !task.plan && ACTIVE.includes(task.status)
+        ? h("p", { class: "muted small" }, "The manager creates the other sub-agents once it has planned the task.")
+        : null,
       h(
         "div",
         { class: "agent-grid" },
-        rolesFor(task.kind).map((role) => {
+        rolesForTask(task).map((role) => {
           const agent = byRole.get(role);
           const notNeeded = !agent && !ACTIVE.includes(task.status) && task.status === "completed";
           const info = notNeeded ? { label: "Not needed", cls: "neutral" } : agentStatusInfo(agent);
-          const reviewer = isReviewerRole(role);
+          const detached = worksDetached(role);
           const tokens = agent ? (agent.usage?.inputTokens ?? 0) + (agent.usage?.outputTokens ?? 0) : 0;
           const workspace = agent?.workspace
             ? agent.workspaceRemoved
               ? h("span", { class: "muted small" }, "worktree removed after completion")
               : [h("span", { class: "mono small break" }, agent.workspace), " ", copyButton(agent.workspace)]
             : h("span", { class: "muted small" }, "—");
-          const branch = reviewer
-            ? h("span", { class: "muted small" }, "detached at the reviewed commit (read-only)")
+          const checkout =
+            role === "executor"
+              ? "detached at the commit under test (runs commands, cannot edit files)"
+              : role === "planner"
+                ? "read-only checkout at the base commit"
+                : "detached at the reviewed commit (read-only)";
+          const branch = detached
+            ? h("span", { class: "muted small" }, checkout)
             : agent?.branch
               ? [h("span", { class: "mono small break" }, agent.branch), " ", copyButton(agent.branch)]
               : h("span", { class: "muted small" }, notNeeded ? "—" : "created when the agent starts");
+          const unusedText =
+            role === "resolver" ? "approved without review comments to resolve" : role === "fixer" ? "tests passed without failures to fix" : "not used by this run";
           return h(
             "div",
             { class: `agent-card agent-${agent?.status ?? (notNeeded ? "unused" : "pending")}` },
@@ -426,7 +537,7 @@ export function taskDetailView(root, { params }) {
               { class: "agent-meta" },
               h("dt", {}, "Model"),
               h("dd", { class: "mono small" }, agent?.model ?? modelForRole(role)),
-              h("dt", {}, reviewer ? "Checkout" : "Branch"),
+              h("dt", {}, detached ? "Checkout" : "Branch"),
               h("dd", {}, branch),
               h("dt", {}, "Worktree"),
               h("dd", {}, workspace),
@@ -437,13 +548,11 @@ export function taskDetailView(root, { params }) {
                 agent
                   ? `${agent.rounds.length ? `round${agent.rounds.length > 1 ? "s" : ""} ${agent.rounds.join(", ")} · ` : ""}${agent.turns} turn(s) · ${compactNumber(tokens)} tokens`
                   : notNeeded
-                    ? role === "resolver"
-                      ? "approved without review comments to resolve"
-                      : "not used by this run"
+                    ? unusedText
                     : "not started",
               ),
-              h("dt", {}, "Skills"),
-              h("dd", { class: "small" }, ROLE_SKILLS[role].map((skill) => h("span", { class: "skill-chip" }, skill))),
+              ROLE_SKILLS[role].length ? h("dt", {}, "Skills") : null,
+              ROLE_SKILLS[role].length ? h("dd", { class: "small" }, ROLE_SKILLS[role].map((skill) => h("span", { class: "skill-chip" }, skill))) : null,
             ),
           );
         }),
@@ -452,8 +561,9 @@ export function taskDetailView(root, { params }) {
   }
 
   function modelForRole(role) {
-    if (isReviewerRole(role)) return task.reviewerModel;
-    if (role === "resolver") return task.resolverModel || task.authorModel;
+    if (role === "planner") return task.managerModel || task.authorModel;
+    if (isReviewerRole(role) || role === "executor") return task.reviewerModel;
+    if (role === "resolver" || role === "fixer") return task.resolverModel || task.authorModel;
     return task.authorModel;
   }
 
@@ -496,13 +606,18 @@ export function taskDetailView(root, { params }) {
     if (signatures.pipeline === signature) return;
     signatures.pipeline = signature;
     const running = ["running", "needs-input"].includes(task.status);
+    if (!task.stages.length) {
+      setContent(pipelineBox, task.kind === "auto" ? h("div", { class: "card pipeline muted small" }, running ? spinner("Stages appear once the manager has planned the task…") : "Not planned yet.") : null);
+      return;
+    }
     setContent(
       pipelineBox,
       h(
         "div",
         { class: "card pipeline" },
         task.stages.map((stage, index) => {
-          const [label, cls] = STAGE_STATUS[stage.status] ?? [stage.status, "neutral"];
+          const [label, cls] = stageStatus(stage);
+          const testing = stage.kind === "testing";
           return [
             index > 0 ? h("div", { class: "stage-arrow", "aria-hidden": "true" }, "→") : null,
             h(
@@ -515,15 +630,37 @@ export function taskDetailView(root, { params }) {
                 stage.rounds.length
                   ? stage.rounds.map((round) => {
                       const current = running && task.currentStage === stage.kind && task.currentRound === round.n;
-                      const authorState = round.author ? "done" : current ? "active" : "pending";
+                      const authorState = round.author ? "done" : current && task.phase !== "reviewing" ? "active" : "pending";
                       const reviewState = round.review ? (round.review.verdict === "approve" ? "approved" : "changes") : current && task.phase === "reviewing" ? "active" : "pending";
+                      const run = round.review?.testRun;
                       const reviewLabel = round.review
-                        ? round.review.verdict === "approve"
-                          ? "✓ Approved"
-                          : `✕ ${round.review.comments.length} comment${round.review.comments.length === 1 ? "" : "s"}`
+                        ? testing
+                          ? run?.status === "passed"
+                            ? "✓ Passed"
+                            : run?.status === "blocked"
+                              ? "⛔ Blocked"
+                              : `✕ ${round.review.comments.length} failing`
+                          : round.review.verdict === "approve"
+                            ? "✓ Approved"
+                            : `✕ ${round.review.comments.length} comment${round.review.comments.length === 1 ? "" : "s"}`
                         : reviewState === "active"
-                          ? "Reviewing…"
-                          : "Review";
+                          ? testing
+                            ? "Running…"
+                            : "Reviewing…"
+                          : testing
+                            ? "▶ Run"
+                            : "Review";
+                      const authorLabel = authorState === "active"
+                        ? testing
+                          ? "Fixing…"
+                          : `${isDocStage(stage.kind) ? "Writing" : "Coding"}…`
+                        : testing
+                          ? "✚ Fix"
+                          : isDocStage(stage.kind)
+                            ? "✎ Draft"
+                            : "✎ Code";
+                      // The first test run has no fix step before it.
+                      const showAuthor = !testing || Boolean(round.author) || authorState === "active";
                       return h(
                         "div",
                         { class: `round-node ${current ? "current" : ""}` },
@@ -531,8 +668,8 @@ export function taskDetailView(root, { params }) {
                         h(
                           "div",
                           { class: "rn-steps" },
-                          h("span", { class: `rn-step rn-${authorState}` }, authorState === "active" ? `${isDocStage(stage.kind) ? "Writing" : "Coding"}…` : isDocStage(stage.kind) ? "✎ Draft" : "✎ Code"),
-                          h("span", { class: "rn-sep" }, "→"),
+                          showAuthor ? h("span", { class: `rn-step rn-${authorState}` }, authorLabel) : null,
+                          showAuthor ? h("span", { class: "rn-sep" }, "→") : null,
                           h("span", { class: `rn-step rn-${reviewState}` }, reviewLabel),
                         ),
                       );
@@ -589,7 +726,7 @@ export function taskDetailView(root, { params }) {
   function renderTabs() {
     const docStage = task.stages.find((stage) => isDocStage(stage.kind));
     const tabs = [
-      ["conversation", "Review rounds"],
+      ["conversation", roundsTabLabel(task)],
       ["timeline", "Timeline"],
       docStage ? ["document", docStage.kind === "document" ? "Document" : "Design doc"] : null,
       ["changes", "Changes"],
@@ -642,7 +779,7 @@ export function taskDetailView(root, { params }) {
     const signature = JSON.stringify(context ?? null);
     if (!force && signatures.context === signature) return;
     signatures.context = signature;
-    const roles = rolesFor(task.kind);
+    const roles = rolesForTask(task).filter((role) => ROLE_SKILLS[role].length);
     const hubSkills = h(
       "div",
       { class: "context-section" },
@@ -711,7 +848,14 @@ export function taskDetailView(root, { params }) {
     signatures.conversation = signature;
     const stages = task.stages.filter((stage) => stage.rounds.length);
     if (!stages.length) {
-      setContent(tabBody, h("div", { class: "empty card muted" }, ACTIVE.includes(task.status) ? spinner("Agents are starting…") : "No rounds were recorded."));
+      setContent(
+        tabBody,
+        h(
+          "div",
+          { class: "empty card muted" },
+          ACTIVE.includes(task.status) ? spinner(task.phase === "planning" ? "The manager is planning which agents to create…" : "Agents are starting…") : "No rounds were recorded.",
+        ),
+      );
       return;
     }
     setContent(
@@ -720,7 +864,7 @@ export function taskDetailView(root, { params }) {
         h(
           "section",
           { class: "conv-stage" },
-          h("h2", { class: "section-title" }, `${STAGE_LABELS[stage.kind]} stage`, " ", chip(...(STAGE_STATUS[stage.status] ?? [stage.status]))),
+          h("h2", { class: "section-title" }, `${STAGE_LABELS[stage.kind]} stage`, " ", chip(...stageStatus(stage))),
           stage.rounds.map((round) => roundCard(stage, round)),
         ),
       ),
@@ -729,10 +873,14 @@ export function taskDetailView(root, { params }) {
 
   function roundCard(stage, round) {
     const current = ["running", "needs-input"].includes(task.status) && task.currentStage === stage.kind && task.currentRound === round.n;
+    const testing = stage.kind === "testing";
     const author = round.author;
     const review = round.review;
-    const authorRole = author?.role ?? (isDocStage(stage.kind) ? AUTHOR_ROLE[stage.kind] : round.n > 1 || (current && task.phase === "revising") ? "resolver" : "coder");
+    const authorRole =
+      author?.role ??
+      (isDocStage(stage.kind) || testing ? AUTHOR_ROLE[stage.kind] : round.n > 1 || (current && task.phase === "revising") ? "resolver" : "coder");
     const reviewerRole = REVIEWER_ROLE[stage.kind];
+    const run = review?.testRun;
     return h(
       "div",
       { class: `card round-card ${current ? "current" : ""}` },
@@ -740,6 +888,7 @@ export function taskDetailView(root, { params }) {
         "div",
         { class: "round-head" },
         h("strong", {}, `Round ${round.n}`),
+        testing && !author ? h("span", { class: "muted small" }, "initial run") : null,
         round.attempt > 1 ? chip(`attempt ${round.attempt}`, "outline") : null,
         h("span", { class: "muted small" }, clock(round.startedAt)),
       ),
@@ -762,46 +911,60 @@ export function taskDetailView(root, { params }) {
               ? h(
                   "div",
                   { class: "sub-block" },
-                  h("div", { class: "label" }, "Responses to review comments"),
+                  h("div", { class: "label" }, testing ? "Responses to test failures" : "Responses to review comments"),
                   author.responses.map((response) =>
                     h(
                       "div",
                       { class: "response" },
                       h("span", { class: "mono comment-id" }, response.commentId),
-                      chip(response.status, response.status === "addressed" ? "success" : "warning"),
+                      chip(response.status === "addressed" && testing ? "fixed" : response.status, response.status === "addressed" ? "success" : "warning"),
                       h("span", {}, response.note),
                     ),
                   ),
                 )
               : null,
           )
-        : current
+        : current && task.phase !== "reviewing"
           ? h("div", { class: "conv-block" }, spinner(`${ROLE_LABELS[authorRole]} is working…`))
           : null,
       review
         ? h(
             "div",
-            { class: "conv-block review" },
+            { class: `conv-block review ${run ? `test-run test-${run.status}` : ""}` },
             h(
               "div",
               { class: "conv-block-head" },
               roleTag(reviewerRole),
-              review.verdict === "approve" ? chip("Approved", "success") : chip("Changes requested", "warning"),
-              review.reviewedSha ? h("span", { class: "mono small muted" }, `reviewed ${shortSha(review.reviewedSha)}`) : null,
-              review.fallback ? chip("no structured review", "warning") : null,
+              run
+                ? chip(...(TEST_STATUS[run.status] ?? [run.status, "neutral"]))
+                : review.verdict === "approve"
+                  ? chip("Approved", "success")
+                  : chip("Changes requested", "warning"),
+              run ? h("span", { class: "small" }, testCounts(run)) : null,
+              review.reviewedSha ? h("span", { class: "mono small muted" }, `${run ? "tested" : "reviewed"} ${shortSha(review.reviewedSha)}`) : null,
+              review.fallback ? chip(run ? "no structured results" : "no structured review", "warning") : null,
             ),
             renderMarkdown(review.summary),
+            run?.commands.length
+              ? h("div", { class: "sub-block" }, h("div", { class: "label" }, "Commands run"), h("pre", { class: "pre-wrap test-commands" }, run.commands.join("\n")))
+              : null,
+            run?.logExcerpt ? h("details", { class: "sub-block" }, h("summary", { class: "label" }, "Output excerpt"), h("pre", { class: "pre-wrap" }, run.logExcerpt)) : null,
+            review.comments.length && run ? h("div", { class: "label sub-block" }, `Failures (${review.comments.length})`) : null,
             review.comments.map(commentCard),
           )
-        : author && current
-          ? h("div", { class: "conv-block review" }, spinner(`${ROLE_LABELS[reviewerRole]} is reviewing…`))
+        : current && (author || testing) && task.phase === "reviewing"
+          ? h("div", { class: "conv-block review" }, spinner(testing ? `${ROLE_LABELS[reviewerRole]} is running the tests…` : `${ROLE_LABELS[reviewerRole]} is reviewing…`))
           : null,
     );
   }
 
   function commentCard(comment) {
     const statusChip =
-      comment.status === "addressed" ? chip("Addressed", "success") : comment.status === "declined" ? chip("Declined", "warning") : chip("Open", "neutral");
+      comment.status === "addressed"
+        ? chip(comment.test ? "Fix submitted" : "Addressed", "success")
+        : comment.status === "declined"
+          ? chip("Declined", "warning")
+          : chip("Open", "neutral");
     return h(
       "div",
       { class: `comment sev-${comment.severity}` },
@@ -809,7 +972,10 @@ export function taskDetailView(root, { params }) {
         "div",
         { class: "comment-head" },
         h("span", { class: "mono comment-id" }, comment.id),
-        chip(comment.severity, SEVERITY_CLASS[comment.severity] ?? "neutral"),
+        comment.test
+          ? chip(comment.category ?? "unknown", CATEGORY_CLASS[comment.category] ?? "neutral")
+          : chip(comment.severity, SEVERITY_CLASS[comment.severity] ?? "neutral"),
+        comment.test ? h("strong", { class: "small break" }, comment.test) : null,
         comment.file ? h("span", { class: "mono small" }, comment.line ? `${comment.file}:${comment.line}` : comment.file) : null,
         h("span", { class: "spacer" }),
         statusChip,
@@ -1037,15 +1203,23 @@ export function taskDetailView(root, { params }) {
       `git -C "${repoPath}" diff ${shortSha(task.baseSha)}...${task.branch}`,
       `git -C "${repoPath}" merge --no-ff ${task.branch}`,
     ].join("\n");
+    const testsLast = task.stages.at(-1)?.kind === "testing";
     setContent(
       tabBody,
       result.approved
-        ? h("div", { class: "callout callout-success" }, h("strong", {}, "Approved. "), "The reviewer approved the final version.")
+        ? h(
+            "div",
+            { class: "callout callout-success" },
+            h("strong", {}, testsLast ? "All tests pass. " : "Approved. "),
+            testsLast ? "The test executor verified the final version." : "The reviewer approved the final version.",
+          )
         : h(
             "div",
             { class: "callout callout-warning" },
-            h("strong", {}, "Finished without approval. "),
-            `${result.openComments} review comment(s) remain open. Use “Continue review loop” to run more rounds.`,
+            h("strong", {}, testsLast ? "Tests still failing. " : "Finished without approval. "),
+            testsLast
+              ? `${result.openComments} failure(s) remain. Use “Continue fixing” to run more fix-and-verify rounds.`
+              : `${result.openComments} review comment(s) remain open. Use “Continue review loop” to run more rounds.`,
           ),
       h(
         "div",
@@ -1057,6 +1231,7 @@ export function taskDetailView(root, { params }) {
           meta("Head commit", h("span", { class: "mono" }, shortSha(result.headSha))),
           meta("Commits", String(result.commits ?? 0)),
           meta("Changes", result.shortStat || "—"),
+          result.tests ? meta("Tests", chip(...(TEST_STATUS[result.tests.status] ?? [result.tests.status, "neutral"])), " ", testCounts(result.tests)) : null,
           (result.docPath ?? result.designDocPath) ? meta(task.kind === "document" ? "Document" : "Design document", h("span", { class: "mono" }, result.docPath ?? result.designDocPath)) : null,
         ),
         h("h3", {}, "Final summary"),

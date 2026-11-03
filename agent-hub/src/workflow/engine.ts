@@ -2,7 +2,10 @@ import type {
   AgentDriver,
   AgentHandle,
   AgentObserver,
+  PlanSubmissionInput,
   ReviewSubmissionInput,
+  SubmitChannel,
+  TestRunSubmissionInput,
   TurnResult,
   UserQuestion,
   WorkSubmissionInput,
@@ -10,9 +13,13 @@ import type {
 import path from "node:path";
 import {
   authorPrompt,
+  executionPrompt,
   MAX_INLINE_DIFF,
+  NUDGE_PLAN,
   NUDGE_REVIEW,
+  NUDGE_TEST,
   NUDGE_WORK,
+  plannerPrompt,
   reviewPrompt,
   systemPromptFor,
   type DesignContext,
@@ -27,7 +34,8 @@ import {
   resolverRoleFor,
   reviewerRoleFor,
   ROLE_LABELS,
-  stagesFor,
+  rolesForStages,
+  stageKindsOf,
   type AgentInfo,
   type AgentRole,
   type AgentStatus,
@@ -42,16 +50,26 @@ import {
   type Stage,
   type StageKind,
   type Task,
+  type TestRunInfo,
 } from "../types.ts";
 import { CancelledError, firstLine, nowIso, slugify, truncate } from "../util.ts";
-import { fallbackReview, normalizeReview, normalizeWork } from "./submissions.ts";
+import {
+  fallbackReview,
+  fallbackTestRun,
+  heuristicPlan,
+  normalizePlan,
+  normalizeReview,
+  normalizeTestRun,
+  normalizeWork,
+  severityForCategory,
+} from "./submissions.ts";
 
 /** Side effects the engine needs from its host (persistence, live updates, user prompts). */
 export interface EngineHooks {
   readonly signal: AbortSignal;
   emit(event: NewTaskEvent): void;
   update(): void;
-  observer(role: AgentRole, stage: StageKind): AgentObserver;
+  observer(role: AgentRole, stage?: StageKind): AgentObserver;
   askUser(role: AgentRole, question: UserQuestion): Promise<string>;
   saveArtifact(name: string, content: string): Promise<void>;
   readArtifact(name: string): Promise<string | null>;
@@ -79,21 +97,25 @@ interface ActiveAgent {
 const MAX_SUBMIT_NUDGES = 2;
 const MAX_ROUND_DIFF_BYTES = 60_000;
 const CO_AUTHOR = "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>";
-const COMMENT_PREFIX: Record<StageKind, string> = { design: "D", document: "W", coding: "C" };
+const COMMENT_PREFIX: Record<StageKind, string> = { design: "D", document: "W", coding: "C", testing: "T" };
 
-export const STAGE_LABELS: Record<StageKind, string> = { design: "Design", document: "Document", coding: "Coding" };
+export const STAGE_LABELS: Record<StageKind, string> = { design: "Design", document: "Document", coding: "Coding", testing: "Execute & verify" };
 
-export function modelFor(task: Pick<Task, "authorModel" | "reviewerModel" | "resolverModel">, role: AgentRole): string {
-  if (isReviewerRole(role)) return task.reviewerModel;
-  if (role === "resolver") return task.resolverModel || task.authorModel;
+export function modelFor(task: Pick<Task, "authorModel" | "reviewerModel" | "resolverModel" | "managerModel">, role: AgentRole): string {
+  if (role === "planner") return task.managerModel || task.authorModel;
+  // The executor verifies the fixer's work, so it gets the reviewer model (a second opinion).
+  if (isReviewerRole(role) || role === "executor") return task.reviewerModel;
+  if (role === "resolver" || role === "fixer") return task.resolverModel || task.authorModel;
   return task.authorModel;
 }
 
 /**
- * Runs a task's stages. Each stage is an author <-> reviewer loop between sub-agents that each work
- * in their own place: authors on their own branch, reviewers in a worktree pinned to the commit under
- * review. After each author round the hub commits and fast-forwards the task branch; open review
- * comments go to the comment resolver (code) or back to the designer (design) until approval.
+ * Runs a task's stages. Auto tasks start with the manager's planner, which decides the stages (and so
+ * the sub-agents). Each stage is a loop between sub-agents that each work in their own place: authors
+ * on their own branch, reviewers and the test executor in a worktree pinned to the commit under
+ * review/test. After each author round the hub commits and fast-forwards the task branch; open review
+ * comments go to the comment resolver (code), test failures to the test fixer, and document comments
+ * back to the author, until the reviewer approves or the tests pass.
  */
 export class WorkflowEngine {
   private readonly task: Task;
@@ -101,6 +123,8 @@ export class WorkflowEngine {
   private readonly agents = new Map<AgentRole, ActiveAgent>();
   private pendingWork: WorkSubmissionInput | null = null;
   private pendingReview: ReviewSubmissionInput | null = null;
+  private pendingTest: TestRunSubmissionInput | null = null;
+  private pendingPlan: PlanSubmissionInput | null = null;
   private expectedCommentIds: string[] = [];
   private currentAuthorWorkspace: AgentWorkspace | null = null;
   /** Template content the current document was seeded with (to detect an unmodified template). */
@@ -112,7 +136,8 @@ export class WorkflowEngine {
   }
 
   async run(): Promise<void> {
-    const kinds = stagesFor(this.task.kind);
+    if (this.task.kind === "auto" && !this.task.plan) await this.plan();
+    const kinds = stageKindsOf(this.task);
     for (const kind of kinds) {
       if (!this.task.stages.some((stage) => stage.kind === kind)) {
         this.task.stages.push({ kind, status: "pending", rounds: [], nextCommentNumber: 1 });
@@ -137,6 +162,66 @@ export class WorkflowEngine {
     await Promise.all([...this.agents.values()].map((agent) => agent.handle.abort()));
   }
 
+  /**
+   * The manager plans an Auto task: its planner reads the request and the repository and decides which
+   * stages (and so which sub-agents) to create, with an assignment for each.
+   */
+  private async plan(): Promise<void> {
+    const { hooks, workspace } = this.options;
+    const task = this.task;
+    const role: AgentRole = "planner";
+    this.setPhase(undefined, "planning", 0);
+    hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", text: "Planning: reading the request and the repository to decide which sub-agents to create" });
+    let status: AgentStatus = "done";
+    try {
+      const ws = await workspace.prepareReviewer(role, workspace.baseSha);
+      const agent = await this.agentFor(role, undefined, ws.path);
+      hooks.agent(role, (info) => {
+        info.status = "working";
+        info.workspace = ws.path;
+        info.workspaceRemoved = false;
+        info.branch = null;
+        info.assignment = assignmentFor(role, 0, 0);
+      });
+      hooks.comm({ from: "manager", to: role, kind: "assign", text: "Plan the task: choose the sub-agent teams to create and write their assignments" });
+      this.pendingPlan = null;
+      let result = await this.send(agent, plannerPrompt(task, task.context));
+      for (let nudge = 0; !this.submittedPlan() && nudge < MAX_SUBMIT_NUDGES; nudge++) {
+        this.throwIfAborted();
+        hooks.emit({ type: "warning", role, text: "Planner ended its turn without calling submit_plan; asking it to submit." });
+        hooks.comm({ from: "manager", to: role, kind: "nudge", text: "Your turn ended without submit_plan - submit the plan" });
+        result = await this.send(agent, NUDGE_PLAN);
+      }
+      this.throwIfAborted();
+      let plan = this.submittedPlan();
+      const fallback = !plan;
+      if (!plan) {
+        hooks.emit({ type: "warning", role, text: `Planner never called submit_plan (last message: ${truncate(firstLine(result.lastMessage ?? ""), 200) || "none"}); choosing stages from the request.` });
+        plan = heuristicPlan(task.description);
+      }
+      task.plan = { stages: plan.stages, rationale: plan.rationale, instructions: plan.instructions, fallback: fallback || undefined, plannedAt: nowIso() };
+      task.stages = plan.stages.map((kind) => ({ kind, status: "pending", rounds: [], nextCommentNumber: 1 }));
+      const flow = plan.stages.map((kind) => STAGE_LABELS[kind]).join(" → ");
+      hooks.emit({ type: "info", role, text: `Manager's plan: ${flow}. ${plan.rationale}`, data: { plan: task.plan } });
+      hooks.comm({ from: role, to: "manager", kind: "plan", text: `Plan: ${flow} - ${truncate(plan.rationale, 240)}` });
+      // The resolver and the fixer only start when a review requests changes or a test run fails.
+      const team = rolesForStages(plan.stages);
+      const onDemand: AgentRole[] = team.filter((candidate) => candidate === "resolver" || candidate === "fixer");
+      hooks.comm({
+        from: "manager",
+        to: "manager",
+        kind: "lifecycle",
+        text: `Creating sub-agents: ${team.filter((candidate) => !onDemand.includes(candidate)).map((candidate) => ROLE_LABELS[candidate]).join(", ")}${onDemand.length ? `; on demand: ${onDemand.map((candidate) => ROLE_LABELS[candidate]).join(", ")}` : ""}`,
+      });
+    } catch (error) {
+      status = hooks.signal.aborted || error instanceof CancelledError ? "cancelled" : "failed";
+      throw error;
+    } finally {
+      await this.releaseAgent(role, status);
+      hooks.update();
+    }
+  }
+
   private stage(kind: StageKind): Stage {
     const stage = this.task.stages.find((candidate) => candidate.kind === kind);
     if (!stage) throw new Error(`Stage ${kind} missing`);
@@ -155,13 +240,13 @@ export class WorkflowEngine {
     if (this.options.hooks.signal.aborted) throw new CancelledError();
   }
 
-  private setPhase(stage: StageKind, phase: Phase, round: number): void {
+  private setPhase(stage: StageKind | undefined, phase: Phase, round: number): void {
     const task = this.task;
     task.currentStage = stage;
     task.phase = phase;
     task.currentRound = round;
     task.phaseStartedAt = nowIso();
-    this.options.hooks.emit({ type: "phase", stage, round, text: phaseLabel(stage, phase), data: { phase } });
+    this.options.hooks.emit({ type: "phase", stage, round: round || undefined, text: phaseLabel(stage, phase), data: { phase } });
     this.options.hooks.update();
   }
 
@@ -177,22 +262,25 @@ export class WorkflowEngine {
       stage.docPath ??= this.docPathFor(kind, stage.docFormat);
     }
     task.currentStage = kind;
+    const testing = kind === "testing";
     hooks.emit({ type: "info", stage: kind, text: `${STAGE_LABELS[kind]} stage started` });
     hooks.comm({
       from: "manager",
       to: "manager",
       kind: "lifecycle",
       stage: kind,
-      text: `${STAGE_LABELS[kind]} stage started: ${ROLE_LABELS[authorRoleFor(kind)]} writes, ${ROLE_LABELS[reviewerRoleFor(kind)]} reviews${stage.docPath ? ` (${stage.docPath})` : ""}`,
+      text: testing
+        ? `${STAGE_LABELS[kind]} stage started: ${ROLE_LABELS.executor} runs and verifies the tests, ${ROLE_LABELS.fixer} fixes failures`
+        : `${STAGE_LABELS[kind]} stage started: ${ROLE_LABELS[authorRoleFor(kind)]} writes, ${ROLE_LABELS[reviewerRoleFor(kind)]} reviews${stage.docPath ? ` (${stage.docPath})` : ""}`,
     });
     hooks.update();
 
     const budget = Math.max(1, task.roundsBudget ?? task.maxRounds);
-    const design = kind === "coding" ? await this.designContext() : undefined;
+    const design = kind === "coding" || testing ? await this.designContext() : undefined;
     const resumed = stage.rounds.some((round) => round.author);
 
     let last = stage.rounds.at(-1);
-    if (last && !last.author) {
+    if (last && !last.author && !last.review) {
       stage.rounds.pop();
       last = stage.rounds.at(-1);
     }
@@ -210,6 +298,10 @@ export class WorkflowEngine {
         if (reviewOnly) {
           round = reviewOnly;
           reviewOnly = null;
+        } else if (testing && !lastReview) {
+          // A testing stage starts by running the automation on the task branch as it is.
+          round = { n: stage.rounds.length + 1, attempt: task.attempt, startedAt: nowIso() };
+          stage.rounds.push(round);
         } else {
           const role = open.length ? resolverRoleFor(kind) : authorRoleFor(kind);
           used.add(role);
@@ -218,6 +310,15 @@ export class WorkflowEngine {
           this.setPhase(kind, open.length ? "revising" : "authoring", round.n);
           round.author = await this.authorTurn(stage, round, role, { design, resumed, lastReview, open });
           hooks.update();
+          const responses = round.author.responses;
+          if (testing && !round.author.commit && responses.length && responses.every((response) => response.status === "declined")) {
+            // Re-running unchanged code cannot change the outcome.
+            stage.status = "not-approved";
+            const text = `The test fixer could not fix the remaining ${responses.length} failure(s) in code; stopped without re-running unchanged code.`;
+            hooks.emit({ type: "warning", stage: kind, round: round.n, text });
+            hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", stage: kind, round: round.n, text });
+            break;
+          }
         }
 
         this.throwIfAborted();
@@ -227,14 +328,18 @@ export class WorkflowEngine {
         const review = await this.reviewTurn(stage, round, reviewerRole, design);
         reviews++;
         round.review = review;
-        const verdictText = review.verdict === "approve" ? "Approved" : `Changes requested (${review.comments.length} comment(s))`;
+        const verdictText = review.testRun
+          ? describeTestRun(review.testRun, review.comments)
+          : review.verdict === "approve"
+            ? "Approved"
+            : `Changes requested (${review.comments.length} comment(s))`;
         hooks.emit({
           type: "review",
           role: reviewerRole,
           stage: kind,
           round: round.n,
           text: `${verdictText}: ${truncate(review.summary, 600)}`,
-          data: { verdict: review.verdict, comments: review.comments.length, fallback: review.fallback ?? false },
+          data: { verdict: review.verdict, comments: review.comments.length, fallback: review.fallback ?? false, testRun: review.testRun },
         });
         hooks.comm({
           from: reviewerRole,
@@ -242,7 +347,9 @@ export class WorkflowEngine {
           kind: "verdict",
           stage: kind,
           round: round.n,
-          text: `${review.verdict === "approve" ? "Approved" : `Requested changes: ${describeComments(review.comments)}`} - ${truncate(firstLine(review.summary), 200)}`,
+          text: review.testRun
+            ? `${verdictText} - ${truncate(firstLine(review.summary), 200)}`
+            : `${review.verdict === "approve" ? "Approved" : `Requested changes: ${describeComments(review.comments)}`} - ${truncate(firstLine(review.summary), 200)}`,
         });
         hooks.update();
 
@@ -257,7 +364,9 @@ export class WorkflowEngine {
           hooks.emit({
             type: "warning",
             stage: kind,
-            text: `Stopped after ${reviews} review round(s) without approval; ${open.length} comment(s) remain open.`,
+            text: testing
+              ? `Stopped after ${reviews} test run(s); ${open.length} failure(s) remain.`
+              : `Stopped after ${reviews} review round(s) without approval; ${open.length} comment(s) remain open.`,
           });
           break;
         }
@@ -273,9 +382,13 @@ export class WorkflowEngine {
     }
     const finalRound = stage.rounds.at(-1)?.n ?? 0;
     const outcome =
-      stage.status === "approved"
-        ? `${STAGE_LABELS[kind]} approved in round ${finalRound}`
-        : `${STAGE_LABELS[kind]} finished without approval after round ${finalRound}`;
+      kind === "testing"
+        ? stage.status === "approved"
+          ? `${STAGE_LABELS[kind]}: all tests pass, verified in round ${finalRound}`
+          : `${STAGE_LABELS[kind]} finished with failing tests after round ${finalRound}`
+        : stage.status === "approved"
+          ? `${STAGE_LABELS[kind]} approved in round ${finalRound}`
+          : `${STAGE_LABELS[kind]} finished without approval after round ${finalRound}`;
     hooks.emit({ type: "info", stage: kind, text: outcome });
     hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", stage: kind, round: finalRound, text: outcome });
   }
@@ -327,8 +440,11 @@ export class WorkflowEngine {
     });
 
     let previousWork: { summary: string; stat: string; diff: { text: string; truncated: boolean } } | undefined;
-    if (fresh && role === "resolver") {
-      const prior = [...stage.rounds].reverse().find((candidate) => candidate !== round && candidate.author)?.author;
+    if (fresh && (role === "resolver" || role === "fixer") && startHead !== workspace.baseSha) {
+      // A fresh resolver/fixer did not see earlier rounds (or an earlier coding stage): give it the change so far.
+      const prior =
+        [...stage.rounds].reverse().find((candidate) => candidate !== round && candidate.author)?.author ??
+        this.task.stages.flatMap((candidate) => candidate.rounds).filter((candidate) => candidate.author).at(-1)?.author;
       previousWork = {
         summary: prior?.summary ?? "",
         stat: await workspace.diffStat(workspace.baseSha, startHead),
@@ -366,12 +482,18 @@ export class WorkflowEngine {
     const fresh = !this.agents.has(role);
     const agent = await this.agentFor(role, stage.kind, ws.path);
     const authorRole = round.author?.role ?? authorRoleFor(stage.kind);
+    const executor = role === "executor";
+    const sha = reviewedSha.slice(0, 10);
     hooks.agent(role, (info) => {
       info.status = "working";
       info.workspace = ws.path;
       info.workspaceRemoved = false;
       info.branch = null;
-      info.assignment = `Reviewing round ${round.n} at ${reviewedSha.slice(0, 10)}`;
+      info.assignment = executor
+        ? round.author
+          ? `Verifying the fixes: re-running the tests at ${sha} (round ${round.n})`
+          : `Running the test automation at ${sha} (round ${round.n})`
+        : `Reviewing round ${round.n} at ${sha}`;
       if (!info.rounds.includes(round.n)) info.rounds.push(round.n);
     });
     hooks.comm({
@@ -380,22 +502,28 @@ export class WorkflowEngine {
       kind: "relay",
       stage: stage.kind,
       round: round.n,
-      text: `Review the ${ROLE_LABELS[authorRole].toLowerCase()}'s round ${round.n} at ${reviewedSha.slice(0, 10)}${round.author?.shortStat ? ` (${round.author.shortStat})` : ""}`,
+      text: executor
+        ? round.author
+          ? `Re-run the tests at ${sha} and verify the ${ROLE_LABELS[authorRole].toLowerCase()}'s fixes${round.author.shortStat ? ` (${round.author.shortStat})` : ""}`
+          : `Run the test automation at ${sha} and verify the results`
+        : `Review the ${ROLE_LABELS[authorRole].toLowerCase()}'s round ${round.n} at ${sha}${round.author?.shortStat ? ` (${round.author.shortStat})` : ""}`,
     });
-    const prompt = await this.buildReviewPrompt(stage, round, fresh, design, reviewedSha);
-    const review = await this.runReviewTurn(agent, prompt, stage, reviewedSha);
+    const review = executor
+      ? await this.runTestTurn(agent, await this.buildExecutionPrompt(stage, round, fresh, design, reviewedSha), stage, reviewedSha)
+      : await this.runReviewTurn(agent, await this.buildReviewPrompt(stage, round, fresh, design, reviewedSha), stage, reviewedSha);
     hooks.agent(role, (info) => {
       info.status = "idle";
     });
     return review;
   }
 
-  private async agentFor(role: AgentRole, stageKind: StageKind, workingDirectory: string): Promise<ActiveAgent> {
+  private async agentFor(role: AgentRole, stageKind: StageKind | undefined, workingDirectory: string): Promise<ActiveAgent> {
     const existing = this.agents.get(role);
     if (existing) return existing;
     const { driver, workspace, settings, hooks, hubSkills } = this.options;
     const task = this.task;
-    const reviewer = isReviewerRole(role);
+    const readOnly = isReviewerRole(role) || role === "planner";
+    const executeOnly = role === "executor";
     const model = modelFor(task, role);
     const hubNames = (hubSkills?.skills ?? []).map((skill) => skill.name);
     const roleSkills = hubNames.filter((name) => ROLE_SKILLS[role].includes(name));
@@ -409,17 +537,19 @@ export class WorkflowEngine {
         role,
         { worktree: workingDirectory, branch: workspace.branchFor(role), taskBranch: workspace.taskBranch, baseSha: workspace.baseSha },
         roleSkills,
-        { docFormat: isDocStage(stageKind) ? (this.task.stages.find((stage) => stage.kind === stageKind)?.docFormat ?? "markdown") : undefined },
+        {
+          docFormat:
+            stageKind && isDocStage(stageKind) ? (this.task.stages.find((stage) => stage.kind === stageKind)?.docFormat ?? "markdown") : undefined,
+        },
       ),
-      readOnly: reviewer,
+      readOnly,
+      executeOnly,
       skillDirectories: [
         ...(task.context?.skillRoots ?? []).map((root) => path.join(workingDirectory, root)),
         ...(hubSkills?.dir ? [hubSkills.dir] : []),
       ],
       disabledSkills: hubNames.filter((name) => !roleSkills.includes(name)),
-      submit: reviewer
-        ? { kind: "review", onSubmit: (input) => void (this.pendingReview = normalizeReview(input)) }
-        : { kind: "work", onSubmit: (input) => this.acceptWork(input, stageKind) },
+      submit: this.submitChannelFor(role, stageKind),
       observer: hooks.observer(role, stageKind),
       askUser: (question) => hooks.askUser(role, question),
       turnTimeoutMs: settings.turnTimeoutMinutes * 60_000,
@@ -432,14 +562,24 @@ export class WorkflowEngine {
       info.sessionId = handle.sessionId;
     });
     hooks.emit({ type: "info", role, stage: stageKind, text: `${ROLE_LABELS[role]} agent started on ${model}`, data: { sessionId: handle.sessionId } });
+    const access = readOnly ? " (read-only)" : executeOnly ? " (runs commands, no file edits)" : "";
     hooks.comm({
       from: "manager",
       to: role,
       kind: "spawn",
       stage: stageKind,
-      text: `Started a ${ROLE_LABELS[role].toLowerCase()} session on ${model}${reviewer ? " (read-only)" : ""}${roleSkills.length ? `; skills: ${roleSkills.join(", ")}` : ""}`,
+      text: `Started a ${ROLE_LABELS[role].toLowerCase()} session on ${model}${access}${roleSkills.length ? `; skills: ${roleSkills.join(", ")}` : ""}`,
     });
     return agent;
+  }
+
+  /** The terminal tool through which each kind of agent hands back its structured result. */
+  private submitChannelFor(role: AgentRole, stageKind: StageKind | undefined): SubmitChannel {
+    if (role === "planner") return { kind: "plan", onSubmit: (input) => void (this.pendingPlan = normalizePlan(input)) };
+    if (role === "executor") return { kind: "test", onSubmit: (input) => void (this.pendingTest = normalizeTestRun(input)) };
+    if (isReviewerRole(role)) return { kind: "review", onSubmit: (input) => void (this.pendingReview = normalizeReview(input)) };
+    if (!stageKind) throw new Error(`${role} needs a stage`);
+    return { kind: "work", onSubmit: (input) => this.acceptWork(input, stageKind) };
   }
 
   private async releaseAgent(role: AgentRole, status: AgentStatus): Promise<void> {
@@ -500,6 +640,61 @@ export class WorkflowEngine {
     return this.pendingReview;
   }
 
+  private submittedTest(): TestRunSubmissionInput | null {
+    return this.pendingTest;
+  }
+
+  private submittedPlan(): PlanSubmissionInput | null {
+    return this.pendingPlan;
+  }
+
+  /** The executor runs the test automation; its failures become comment-like items (T1, T2, ...) for the fixer. */
+  private async runTestTurn(agent: ActiveAgent, prompt: string, stage: Stage, testedSha: string): Promise<ReviewSubmission> {
+    const { hooks } = this.options;
+    const role = agent.role;
+    this.pendingTest = null;
+    let result = await this.send(agent, prompt);
+    for (let nudge = 0; !this.submittedTest() && nudge < MAX_SUBMIT_NUDGES; nudge++) {
+      this.throwIfAborted();
+      hooks.emit({ type: "warning", role, text: "Test executor ended its turn without calling submit_test_results; asking it to submit." });
+      hooks.comm({ from: "manager", to: role, kind: "nudge", text: "Your turn ended without submit_test_results - report the run" });
+      result = await this.send(agent, NUDGE_TEST);
+    }
+    let input = this.submittedTest();
+    const fallback = !input;
+    if (!input) {
+      hooks.emit({ type: "warning", role, text: "Test executor never called submit_test_results; treating the run as blocked." });
+      input = fallbackTestRun(result.lastMessage);
+    }
+    const testRun: TestRunInfo = {
+      status: input.status,
+      commands: input.commands,
+      total: input.total,
+      passed: input.passed,
+      failed: input.failed,
+      skipped: input.skipped,
+      logExcerpt: input.log_excerpt,
+    };
+    return {
+      verdict: input.status === "passed" ? "approve" : "request_changes",
+      summary: input.summary,
+      comments: input.failures.map((failure) => ({
+        id: `${COMMENT_PREFIX[stage.kind]}${stage.nextCommentNumber++}`,
+        severity: severityForCategory(failure.category),
+        file: failure.file,
+        line: failure.line,
+        body: [`\`\`\`\n${failure.error}\n\`\`\``, failure.suggestion ? `**Suggested fix:** ${failure.suggestion}` : ""].filter(Boolean).join("\n\n"),
+        status: "open" as const,
+        test: failure.test,
+        category: failure.category,
+      })),
+      reviewedSha: testedSha,
+      testRun,
+      fallback: fallback || undefined,
+      at: nowIso(),
+    };
+  }
+
   private async runReviewTurn(agent: ActiveAgent, prompt: string, stage: Stage, reviewedSha: string): Promise<ReviewSubmission> {
     const role = agent.role;
     this.pendingReview = null;
@@ -558,7 +753,7 @@ export class WorkflowEngine {
       }
     }
 
-    const label = stage.kind === "coding" ? (role === "resolver" ? "review fixes" : "code") : stage.kind;
+    const label = stage.kind === "coding" ? (role === "resolver" ? "review fixes" : "code") : stage.kind === "testing" ? "test fixes" : stage.kind;
     const subject = `[agent-hub] ${task.id} ${label} round ${round.n}: ${truncate(firstLine(input.summary), 72)}`;
     await ws.commitAll(subject, `${task.title}\n\nAuthor agent: ${ROLE_LABELS[role]}\n\n${CO_AUTHOR}`);
     // Also picks up commits an agent made itself despite the instructions.
@@ -617,6 +812,31 @@ export class WorkflowEngine {
       docSnapshot,
       at: nowIso(),
     };
+  }
+
+  private async buildExecutionPrompt(
+    stage: Stage,
+    round: Round,
+    includeContext: boolean,
+    design: DesignContext | undefined,
+    headSha: string,
+  ): Promise<string> {
+    const { workspace } = this.options;
+    const fix = round.author;
+    const fixDiff = fix?.commit ? await workspace.diff(fix.prevCommit ?? workspace.baseSha, headSha, MAX_ROUND_DIFF_BYTES) : undefined;
+    return executionPrompt({
+      task: this.task,
+      round: round.n,
+      includeContext,
+      design,
+      context: this.task.context,
+      baseSha: workspace.baseSha,
+      headSha,
+      totalStat: await workspace.diffStat(workspace.baseSha, headSha),
+      fix,
+      fixDiff,
+      previousRun: stage.rounds.find((candidate) => candidate.n === round.n - 1)?.review,
+    });
   }
 
   private async buildReviewPrompt(
@@ -708,16 +928,25 @@ export class WorkflowEngine {
   private async finalize(): Promise<void> {
     const { workspace, hooks, settings } = this.options;
     const task = this.task;
-    const kinds = stagesFor(task.kind);
+    const kinds = stageKindsOf(task);
     const lastStage = this.stage(kinds[kinds.length - 1]!);
     this.setPhase(lastStage.kind, "finalizing", task.currentRound);
     const head = await workspace.taskHead();
-    const lastAuthor = [...lastStage.rounds].reverse().find((round) => round.author)?.author;
     const lastReview = [...lastStage.rounds].reverse().find((round) => round.review)?.review;
     const docStage = task.stages.find((stage) => isDocStage(stage.kind));
+    const testStage = task.stages.find((stage) => stage.kind === "testing");
+    const stages = kinds.map((kind) => this.stage(kind));
+    const summary =
+      stages.length > 1
+        ? stages
+            .map((stage) => [stage, stageSummary(stage)] as const)
+            .filter(([, text]) => text)
+            .map(([stage, text]) => `**${STAGE_LABELS[stage.kind]}:** ${text}`)
+            .join("\n\n")
+        : stageSummary(lastStage);
     task.result = {
       approved: lastStage.status === "approved",
-      summary: lastAuthor?.summary ?? "",
+      summary,
       headSha: head,
       diffStat: await workspace.diffStat(workspace.baseSha, head),
       shortStat: await workspace.shortStat(workspace.baseSha, head),
@@ -725,7 +954,14 @@ export class WorkflowEngine {
       designDocPath: task.stages.find((stage) => stage.kind === "design")?.docPath,
       docPath: docStage?.docPath,
       docFormat: docStage?.docFormat,
-      openComments: lastReview?.comments.filter((comment) => comment.status === "open").length ?? 0,
+      tests: testStage ? [...testStage.rounds].reverse().find((round) => round.review?.testRun)?.review?.testRun : undefined,
+      // Failures of the last run stay unresolved until a run passes, whatever the fixer answered.
+      openComments:
+        lastStage.kind === "testing"
+          ? lastReview?.verdict === "approve"
+            ? 0
+            : (lastReview?.comments.length ?? 0)
+          : (lastReview?.comments.filter((comment) => comment.status === "open").length ?? 0),
     };
     if (settings.cleanupWorktrees) {
       await workspace.removeWorktrees();
@@ -739,7 +975,11 @@ export class WorkflowEngine {
     task.phase = "done";
     hooks.emit({
       type: "info",
-      text: task.result.approved ? "Workflow complete: final version approved by the reviewer." : "Workflow complete without final approval.",
+      text: task.result.approved
+        ? lastStage.kind === "testing"
+          ? "Workflow complete: all tests pass, verified by the test executor."
+          : "Workflow complete: final version approved by the reviewer."
+        : "Workflow complete without final approval.",
     });
     hooks.update();
   }
@@ -748,10 +988,14 @@ export class WorkflowEngine {
 export function assignmentFor(role: AgentRole, round: number, openComments: number): string {
   const comments = `${openComments} review comment${openComments === 1 ? "" : "s"}`;
   switch (role) {
+    case "planner":
+      return "Planning: deciding which sub-agents to create and what each should do";
     case "coder":
       return `Implementing the request (round ${round})`;
     case "resolver":
       return `Resolving ${comments} (round ${round})`;
+    case "fixer":
+      return `Fixing ${openComments} test failure${openComments === 1 ? "" : "s"} (round ${round})`;
     case "designer":
       return openComments ? `Revising the design for ${comments} (round ${round})` : `Writing the design (round ${round})`;
     case "writer":
@@ -762,6 +1006,11 @@ export function assignmentFor(role: AgentRole, round: number, openComments: numb
 }
 
 export function phaseLabel(stage: StageKind | undefined, phase: Phase): string {
+  if (phase === "planning") return "Planning";
+  if (stage === "testing") {
+    if (phase === "reviewing") return "Running tests";
+    if (phase === "authoring" || phase === "revising") return "Fixing test failures";
+  }
   const noun = stage === "design" ? "design" : stage === "document" ? "document" : "code";
   if (phase === "authoring") return stage === "design" ? "Designing" : stage === "document" ? "Writing" : "Coding";
   if (phase === "reviewing") return `Reviewing ${noun}`;
@@ -770,6 +1019,25 @@ export function phaseLabel(stage: StageKind | undefined, phase: Phase): string {
   if (phase === "finalizing") return "Finalizing";
   if (phase === "done") return "Done";
   return "Queued";
+}
+
+/** What a stage produced: the last author's summary; for testing, the executor's verdict plus the fixes. */
+function stageSummary(stage: Stage): string {
+  const lastAuthor = [...stage.rounds].reverse().find((round) => round.author)?.author;
+  if (stage.kind !== "testing") return lastAuthor?.summary ?? "";
+  const lastRun = [...stage.rounds].reverse().find((round) => round.review)?.review;
+  return [lastRun?.summary ?? "", lastAuthor ? `Fixes: ${lastAuthor.summary}` : ""].filter(Boolean).join("\n\n");
+}
+
+/** "Passed: 12 tests" / "Failed: 2 of 12 (1 product-bug, 1 test-bug)" / "Blocked: ...". */
+export function describeTestRun(run: TestRunInfo, failures: readonly ReviewComment[]): string {
+  if (run.status === "passed") return `Passed${run.total !== undefined ? `: ${run.total} test${run.total === 1 ? "" : "s"}` : ""}${run.skipped ? `, ${run.skipped} skipped` : ""}`;
+  const counts = new Map<string, number>();
+  for (const failure of failures) counts.set(failure.category ?? "unknown", (counts.get(failure.category ?? "unknown") ?? 0) + 1);
+  const breakdown = [...counts].map(([category, count]) => `${count} ${category}`).join(", ");
+  if (run.status === "blocked") return `Blocked: ${truncate(failures[0]?.test ?? "the automation could not run", 120)}`;
+  const failed = run.failed ?? failures.length;
+  return `Failed: ${failed}${run.total !== undefined ? ` of ${run.total}` : ""} (${breakdown})`;
 }
 
 function describeComments(comments: readonly ReviewComment[]): string {

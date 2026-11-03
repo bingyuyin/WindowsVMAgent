@@ -13,9 +13,12 @@ const GUIDE_PATTERNS = [
   /^(\.github\/|docs\/)?CONTRIBUTING\.md$/i,
   /^(docs\/)?ARCHITECTURE\.md$/i,
   /^(docs\/)?DESIGN\.md$/i,
-  /^(docs\/)?(CODING[-_]?GUIDELINES|STYLE[-_]?GUIDE|STYLEGUIDE|CONVENTIONS|DEVELOPMENT|DEVELOPING)\.md$/i,
+  /^(docs\/)?(CODING[-_]?GUIDELINES|STYLE[-_]?GUIDE|STYLEGUIDE|CONVENTIONS|DEVELOPMENT|DEVELOPING|TESTING)\.md$/i,
   /^(\.github\/)?SECURITY\.md$/i,
   /^README\.md$/i,
+  // CI pipelines show how the project is built and how its tests run.
+  /^\.github\/workflows\/[^/]+\.ya?ml$/i,
+  /^(\.azure-pipelines\/|\.pipelines\/)?azure-pipelines[^/]*\.ya?ml$/i,
 ];
 const DESIGN_DOCS = /^(docs\/)?(design|designs|adr|adrs|rfc|rfcs|decisions|architecture|specs?)\/.+\.(md|html?)$/i;
 const SKILL_ROOTS = [".github/skills", ".copilot/skills", ".claude/skills", "skills"];
@@ -23,6 +26,7 @@ const MAX_LISTED = 25;
 
 /** Skills bundled with the hub, applied when the repository has no guidance of its own. */
 export const ROLE_SKILLS: Record<AgentRole, string[]> = {
+  planner: [],
   designer: ["system-design"],
   "design-reviewer": ["design-review"],
   writer: ["technical-writing"],
@@ -30,6 +34,8 @@ export const ROLE_SKILLS: Record<AgentRole, string[]> = {
   coder: ["coding-best-practices"],
   resolver: ["review-comment-resolution", "coding-best-practices"],
   "code-reviewer": ["code-review"],
+  executor: ["test-execution"],
+  fixer: ["test-fixing", "coding-best-practices"],
 };
 
 export interface HubSkills {
@@ -135,6 +141,10 @@ async function detectToolchain(
     for (const target of ["build", "lint", "test"]) {
       if (new RegExp(`^${target}\\s*:`, "m").test(content)) validation.push(`make ${target}`);
     }
+  }
+  if (files.some((file) => /\.(ps1|psm1|psd1)$/i.test(file))) {
+    stack.push("PowerShell");
+    if (files.some((file) => /\.tests\.ps1$/i.test(file))) validation.push("Invoke-Pester");
   }
   return { validation: [...new Set(validation)], stack: [...new Set(stack)] };
 }

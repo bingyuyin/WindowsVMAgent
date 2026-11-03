@@ -125,6 +125,7 @@ export function createApiRouter(deps: ApiDeps): Router {
       authorModel: optionalString(body, "authorModel", 200),
       reviewerModel: optionalString(body, "reviewerModel", 200),
       resolverModel: optionalString(body, "resolverModel", 200),
+      managerModel: optionalString(body, "managerModel", 200),
       maxRounds,
     });
   });
@@ -250,7 +251,7 @@ function intIn(value: unknown, min: number, max: number, key: string): number {
 
 export function parseSettingsPatch(body: Record<string, unknown>): Partial<Settings> {
   const patch: Partial<Settings> = {};
-  for (const key of ["authorModel", "reviewerModel", "resolverModel"] as const) {
+  for (const key of ["authorModel", "reviewerModel", "resolverModel", "managerModel"] as const) {
     if (!(key in body)) continue;
     const value = body[key];
     if (value !== null && typeof value !== "string") throw new HttpError(400, `'${key}' must be a string`);

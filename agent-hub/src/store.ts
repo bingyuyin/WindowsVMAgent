@@ -23,6 +23,7 @@ export const DEFAULT_SETTINGS: Settings = {
   authorModel: null,
   reviewerModel: null,
   resolverModel: null,
+  managerModel: null,
   maxRounds: 3,
   maxConcurrency: 2,
   designDocDir: "docs/designs",

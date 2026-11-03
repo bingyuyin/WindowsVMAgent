@@ -1,13 +1,29 @@
-export type TaskKind = "coding" | "design" | "document" | "design-coding";
+/** "auto": the manager agent reads the request and plans which stages (and sub-agents) to run. */
+export type TaskKind = "auto" | "coding" | "design" | "document" | "testing" | "design-coding";
 export type TaskStatus = "queued" | "running" | "needs-input" | "completed" | "failed" | "cancelled" | "interrupted";
-export type StageKind = "design" | "document" | "coding";
-export type AgentRole = "designer" | "design-reviewer" | "writer" | "doc-reviewer" | "coder" | "resolver" | "code-reviewer";
-export type Phase = "queued" | "preparing" | "authoring" | "reviewing" | "revising" | "finalizing" | "done";
+/** "testing": a test executor runs the test automation and verifies the results; a test fixer fixes failures. */
+export type StageKind = "design" | "document" | "coding" | "testing";
+export type AgentRole =
+  | "planner"
+  | "designer"
+  | "design-reviewer"
+  | "writer"
+  | "doc-reviewer"
+  | "coder"
+  | "resolver"
+  | "code-reviewer"
+  | "executor"
+  | "fixer";
+export type Phase = "queued" | "preparing" | "planning" | "authoring" | "reviewing" | "revising" | "finalizing" | "done";
 export type Severity = "blocker" | "major" | "minor" | "nit";
 export type Verdict = "approve" | "request_changes";
 export type CommentStatus = "open" | "addressed" | "declined";
 export type StageStatus = "pending" | "running" | "approved" | "not-approved" | "failed" | "cancelled";
 export type AgentStatus = "idle" | "working" | "done" | "failed" | "cancelled";
+/** Outcome of one test-automation run reported by the test executor. */
+export type TestStatus = "passed" | "failed" | "blocked";
+/** Why a test failed, as triaged by the test executor. "integrity": a fix made a test pass without fixing the cause. */
+export type FailureCategory = "product-bug" | "test-bug" | "environment" | "flaky" | "integrity" | "unknown";
 /** File format of design/document deliverables. HTML documents are light-themed and can embed Mermaid diagrams. */
 export type DocFormat = "html" | "markdown";
 /**
@@ -17,16 +33,21 @@ export type DocFormat = "html" | "markdown";
  */
 export type IsolationMode = "branch" | "worktree";
 
-export const TASK_KINDS: readonly TaskKind[] = ["coding", "design", "document", "design-coding"];
+export const TASK_KINDS: readonly TaskKind[] = ["auto", "coding", "design", "document", "testing", "design-coding"];
+/** Order in which planned stages run: design first, documentation last (it documents the final state). */
+export const STAGE_ORDER: readonly StageKind[] = ["design", "coding", "testing", "document"];
 export const SEVERITIES: readonly Severity[] = ["blocker", "major", "minor", "nit"];
 export const ISOLATION_MODES: readonly IsolationMode[] = ["branch", "worktree"];
 export const DOC_FORMATS: readonly DocFormat[] = ["html", "markdown"];
+export const FAILURE_CATEGORIES: readonly FailureCategory[] = ["product-bug", "test-bug", "environment", "flaky", "integrity", "unknown"];
 
 export interface Settings {
   authorModel: string | null;
   reviewerModel: string | null;
   /** Model for the comment-resolver agent; null means "same as the author model". */
   resolverModel: string | null;
+  /** Model the manager uses to plan Auto tasks; null means "same as the author model". */
+  managerModel: string | null;
   maxRounds: number;
   maxConcurrency: number;
   designDocDir: string;
@@ -58,6 +79,9 @@ export interface ReviewComment {
   line?: number;
   body: string;
   status: CommentStatus;
+  /** Test failures only: the failing test and the executor's triage. */
+  test?: string;
+  category?: FailureCategory;
   response?: string;
 }
 
@@ -91,8 +115,23 @@ export interface ReviewSubmission {
   comments: ReviewComment[];
   /** Commit the reviewer's worktree was pinned to. */
   reviewedSha?: string;
+  /** Testing stage only: the executor's run (commands, counts); failures are the comments. */
+  testRun?: TestRunInfo;
   fallback?: boolean;
   at: string;
+}
+
+/** One run of the test automation, as executed and verified by the test executor. */
+export interface TestRunInfo {
+  status: TestStatus;
+  /** Exact commands the executor ran. */
+  commands: string[];
+  total?: number;
+  passed?: number;
+  failed?: number;
+  skipped?: number;
+  /** Relevant output (failure messages, summary lines). */
+  logExcerpt?: string;
 }
 
 export interface Round {
@@ -140,6 +179,8 @@ export interface TaskResult {
   /** Deliverable document of the task's document stage (design doc or documentation). */
   docPath?: string;
   docFormat?: DocFormat;
+  /** Latest test run of the testing stage. */
+  tests?: TestRunInfo;
   openComments: number;
 }
 
@@ -199,6 +240,17 @@ export interface RepoContext {
   discoveredAt: string;
 }
 
+/** The manager's plan for an Auto task: which stages (and so which sub-agents) to run, and their assignments. */
+export interface TaskPlan {
+  stages: StageKind[];
+  rationale: string;
+  /** The manager's assignment for each stage's agents (scope, acceptance criteria, commands to run). */
+  instructions: Partial<Record<StageKind, string>>;
+  /** True when the planner never submitted a plan and the hub derived one from the request. */
+  fallback?: boolean;
+  plannedAt: string;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -220,6 +272,8 @@ export interface Task {
   authorModel: string;
   reviewerModel: string;
   resolverModel?: string;
+  /** Model of the manager's planner (Auto tasks). */
+  managerModel?: string;
   maxRounds: number;
   status: TaskStatus;
   phase: Phase;
@@ -227,6 +281,8 @@ export interface Task {
   currentStage?: StageKind;
   currentRound: number;
   activity?: Activity;
+  /** Auto tasks: the manager's plan (set once the planner has run). */
+  plan?: TaskPlan;
   stages: Stage[];
   agents?: AgentInfo[];
   context?: RepoContext;
@@ -278,6 +334,7 @@ export type NewTaskEvent = Omit<TaskEvent, "seq" | "ts">;
 /** Kind of message in the manager's communication log with its sub-agents and the user. */
 export type CommKind =
   | "lifecycle"
+  | "plan"
   | "spawn"
   | "assign"
   | "submit"
@@ -307,17 +364,27 @@ export interface CommEntry {
 
 export type NewCommEntry = Omit<CommEntry, "seq" | "ts" | "taskId" | "taskTitle">;
 
+/** Stages of a task kind. Auto tasks have none until the manager has planned them. */
 export function stagesFor(kind: TaskKind): StageKind[] {
   switch (kind) {
+    case "auto":
+      return [];
     case "coding":
       return ["coding"];
     case "design":
       return ["design"];
     case "document":
       return ["document"];
+    case "testing":
+      return ["testing"];
     case "design-coding":
       return ["design", "coding"];
   }
+}
+
+/** Stages a task runs: the manager's plan for Auto tasks, otherwise fixed by the task kind. */
+export function stageKindsOf(task: Pick<Task, "kind" | "plan">): StageKind[] {
+  return task.plan?.stages ?? stagesFor(task.kind);
 }
 
 /** Stages whose deliverable is a document (design doc or other documentation) rather than code. */
@@ -325,35 +392,67 @@ export function isDocStage(kind: StageKind): boolean {
   return kind === "design" || kind === "document";
 }
 
+/** Agent that writes each round's changes (in the testing stage: the fixer). */
 export function authorRoleFor(stage: StageKind): AgentRole {
-  return stage === "design" ? "designer" : stage === "document" ? "writer" : "coder";
+  switch (stage) {
+    case "design":
+      return "designer";
+    case "document":
+      return "writer";
+    case "testing":
+      return "fixer";
+    default:
+      return "coder";
+  }
 }
 
-/** Agent that addresses review comments: a dedicated resolver for code, the document's author otherwise. */
+/** Agent that addresses review comments: a dedicated resolver for code, the fixer for test failures, the document's author otherwise. */
 export function resolverRoleFor(stage: StageKind): AgentRole {
   return stage === "coding" ? "resolver" : authorRoleFor(stage);
 }
 
+/** Agent that checks each round (in the testing stage: the executor, which runs and verifies the tests). */
 export function reviewerRoleFor(stage: StageKind): AgentRole {
-  return stage === "design" ? "design-reviewer" : stage === "document" ? "doc-reviewer" : "code-reviewer";
+  switch (stage) {
+    case "design":
+      return "design-reviewer";
+    case "document":
+      return "doc-reviewer";
+    case "testing":
+      return "executor";
+    default:
+      return "code-reviewer";
+  }
 }
 
 export function isReviewerRole(role: AgentRole): boolean {
   return role === "design-reviewer" || role === "code-reviewer" || role === "doc-reviewer";
 }
 
-/** Sub-agents a task of the given kind uses, in workflow order. */
-export function rolesFor(kind: TaskKind): AgentRole[] {
+/** Agents that work in a checkout pinned to a commit (no branch of their own): reviewers, the executor and the planner. */
+export function worksDetached(role: AgentRole): boolean {
+  return isReviewerRole(role) || role === "executor" || role === "planner";
+}
+
+/** Sub-agents that run the given stages, in workflow order. */
+export function rolesForStages(stages: readonly StageKind[]): AgentRole[] {
   const roles: AgentRole[] = [];
-  for (const stage of stagesFor(kind)) {
-    for (const role of [authorRoleFor(stage), reviewerRoleFor(stage), resolverRoleFor(stage)]) {
+  for (const stage of stages) {
+    const ordered = stage === "testing" ? ["executor", "fixer"] as AgentRole[] : [authorRoleFor(stage), reviewerRoleFor(stage), resolverRoleFor(stage)];
+    for (const role of ordered) {
       if (!roles.includes(role)) roles.push(role);
     }
   }
   return roles;
 }
 
+/** Sub-agents a task of the given kind uses, in workflow order (Auto tasks start with the manager's planner). */
+export function rolesFor(kind: TaskKind): AgentRole[] {
+  return kind === "auto" ? ["planner"] : rolesForStages(stagesFor(kind));
+}
+
 export const ROLE_LABELS: Record<AgentRole, string> = {
+  planner: "Planner",
   designer: "Designer",
   "design-reviewer": "Design reviewer",
   writer: "Technical writer",
@@ -361,6 +460,8 @@ export const ROLE_LABELS: Record<AgentRole, string> = {
   coder: "Coder",
   resolver: "Comment resolver",
   "code-reviewer": "Code reviewer",
+  executor: "Test executor",
+  fixer: "Test fixer",
 };
 
 export const ACTIVE_STATUSES: readonly TaskStatus[] = ["queued", "running", "needs-input"];

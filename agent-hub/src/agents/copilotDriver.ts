@@ -21,6 +21,7 @@ export class CopilotAgentDriver implements AgentDriver {
     const toolNames = new Map<string, string>();
     const policy = createPermissionPolicy({
       readOnly: spec.readOnly,
+      executeOnly: spec.executeOnly,
       workingDirectory: spec.workingDirectory,
       scratchRoots: [path.join(this.copilot.copilotHome, "session-state")],
       readRoots: spec.skillDirectories,
@@ -129,6 +130,14 @@ export function describeTool(name: string, args: unknown, cwd: string): string {
   if (name === "submit_review") {
     const verdict = isRecord(args) && typeof args.verdict === "string" ? args.verdict.replace("_", " ") : "";
     return `Submitting review${verdict ? ` (${verdict})` : ""}`;
+  }
+  if (name === "submit_test_results") {
+    const status = isRecord(args) && typeof args.status === "string" ? args.status : "";
+    return `Submitting test results${status ? ` (${status})` : ""}`;
+  }
+  if (name === "submit_plan") {
+    const stages = isRecord(args) && Array.isArray(args.stages) ? args.stages.filter((stage) => typeof stage === "string").join(" → ") : "";
+    return `Submitting plan${stages ? ` (${stages})` : ""}`;
   }
   if (name === "skill") {
     const skill = isRecord(args) ? Object.values(args).find((value): value is string => typeof value === "string" && value.trim().length > 0) : undefined;

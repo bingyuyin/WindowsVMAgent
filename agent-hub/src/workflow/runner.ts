@@ -20,6 +20,7 @@ import {
   ACTIVE_STATUSES,
   isDocStage,
   ROLE_LABELS,
+  stageKindsOf,
   stagesFor,
   TASK_KINDS,
   type AgentInfo,
@@ -46,6 +47,7 @@ export interface SubmitTaskInput {
   authorModel?: string;
   reviewerModel?: string;
   resolverModel?: string;
+  managerModel?: string;
   maxRounds?: number;
 }
 
@@ -100,9 +102,11 @@ const SHA = /^[0-9a-f]{7,40}$/i;
 const MAX_AUTO_RESUMES = 3;
 
 export const KIND_LABELS: Record<TaskKind, string> = {
+  auto: "Auto (manager plans)",
   coding: "Coding",
   design: "Design",
   document: "Document",
+  testing: "Execute & verify",
   "design-coding": "Design → Coding",
 };
 
@@ -178,6 +182,7 @@ export class TaskRunner {
     const authorModel = (input.authorModel || settings.authorModel || "").trim();
     const reviewerModel = (input.reviewerModel || settings.reviewerModel || authorModel).trim();
     const resolverModel = (input.resolverModel || settings.resolverModel || authorModel).trim();
+    const managerModel = input.kind === "auto" ? (input.managerModel || settings.managerModel || authorModel).trim() : undefined;
     if (!authorModel || !reviewerModel) throw new HttpError(400, "Choose the author and reviewer models first (Settings)");
     const maxRounds = clampInt(input.maxRounds ?? settings.maxRounds, 1, 10);
 
@@ -207,6 +212,7 @@ export class TaskRunner {
       authorModel,
       reviewerModel,
       resolverModel,
+      managerModel,
       maxRounds,
       status: "queued",
       phase: "queued",
@@ -434,10 +440,7 @@ export class TaskRunner {
       await engine.run();
       task.status = "completed";
       task.roundsBudget = undefined;
-      this.emit(task, {
-        type: "status",
-        text: task.result?.approved ? "Completed: approved by the reviewer" : "Completed without reviewer approval",
-      });
+      this.emit(task, { type: "status", text: completionText(task) });
     } catch (error) {
       if (this.shuttingDown) {
         task.status = "interrupted";
@@ -472,8 +475,15 @@ export class TaskRunner {
     switch (task.status) {
       case "completed": {
         const result = task.result;
-        const detail = [result?.shortStat, result?.docPath ? `document ${result.docPath}` : ""].filter(Boolean).join("; ");
-        return `${result?.approved ? "Completed: approved by the reviewer" : `Completed without approval (${result?.openComments ?? 0} open comment(s))`}${detail ? ` - ${detail}` : ""}`;
+        const tests = result?.tests;
+        const detail = [
+          result?.shortStat,
+          tests ? `tests ${tests.status}${tests.total !== undefined ? ` (${tests.passed ?? tests.total - (tests.failed ?? 0)}/${tests.total})` : ""}` : "",
+          result?.docPath ? `document ${result.docPath}` : "",
+        ]
+          .filter(Boolean)
+          .join("; ");
+        return `${completionText(task)}${detail ? ` - ${detail}` : ""}`;
       }
       case "failed":
         return `Failed: ${truncate(task.error ?? "unknown error", 200)}`;
@@ -567,7 +577,7 @@ export class TaskRunner {
     return info;
   }
 
-  private observer(task: Task, role: AgentRole, stage: StageKind): AgentObserver {
+  private observer(task: Task, role: AgentRole, stage?: StageKind): AgentObserver {
     return {
       onDelta: (messageId, text) => this.deps.bus.publishTask(task.id, { type: "delta", role, messageId, text }),
       onMessage: (text) => {
@@ -742,4 +752,13 @@ function clampInt(value: unknown, min: number, max: number): number {
   const number = Math.round(Number(value));
   if (!Number.isFinite(number)) return min;
   return Math.min(max, Math.max(min, number));
+}
+
+function completionText(task: Task): string {
+  const result = task.result;
+  const testsLast = stageKindsOf(task).at(-1) === "testing";
+  if (result?.approved) return testsLast ? "Completed: all tests pass (verified by the test executor)" : "Completed: approved by the reviewer";
+  return testsLast
+    ? `Completed with failing tests (${result?.openComments ?? 0} failure(s) remain)`
+    : `Completed without approval (${result?.openComments ?? 0} open comment(s))`;
 }

@@ -87,6 +87,7 @@ export function s(tag, attrs, ...children) {
 }
 
 export const ROLE_LABELS = {
+  planner: "Planner",
   designer: "Designer",
   "design-reviewer": "Design reviewer",
   writer: "Technical writer",
@@ -94,11 +95,25 @@ export const ROLE_LABELS = {
   coder: "Coder",
   resolver: "Comment resolver",
   "code-reviewer": "Code reviewer",
+  executor: "Test executor",
+  fixer: "Test fixer",
 };
 
-export const ROLE_ICONS = { designer: "✎", "design-reviewer": "◎", writer: "¶", "doc-reviewer": "◎", coder: "⌨", resolver: "⚒", "code-reviewer": "◎" };
+export const ROLE_ICONS = {
+  planner: "◆",
+  designer: "✎",
+  "design-reviewer": "◎",
+  writer: "¶",
+  "doc-reviewer": "◎",
+  coder: "⌨",
+  resolver: "⚒",
+  "code-reviewer": "◎",
+  executor: "▶",
+  fixer: "✚",
+};
 
 export const ROLE_DESCRIPTIONS = {
+  planner: "The manager's planner: reads the request and repository and decides which sub-agents to create",
   designer: "Writes the design document and revises it for review comments",
   "design-reviewer": "Reviews the design in a read-only worktree",
   writer: "Writes the document and revises it for review comments",
@@ -106,10 +121,13 @@ export const ROLE_DESCRIPTIONS = {
   coder: "Implements the request on its own branch",
   resolver: "Resolves code review comments on its own branch",
   "code-reviewer": "Reviews each commit in a read-only worktree pinned to it",
+  executor: "Runs the test automation, verifies the results and checks fixes, in a checkout pinned to the commit under test",
+  fixer: "Fixes test failures at the root cause on its own branch",
 };
 
 /** Hub best-practice skills each role is asked to apply (mirrors the server's ROLE_SKILLS). */
 export const ROLE_SKILLS = {
+  planner: [],
   designer: ["system-design"],
   "design-reviewer": ["design-review"],
   writer: ["technical-writing"],
@@ -117,21 +135,59 @@ export const ROLE_SKILLS = {
   coder: ["coding-best-practices"],
   resolver: ["review-comment-resolution", "coding-best-practices"],
   "code-reviewer": ["code-review"],
+  executor: ["test-execution"],
+  fixer: ["test-fixing", "coding-best-practices"],
 };
 
 export const isReviewerRole = (role) => role === "design-reviewer" || role === "code-reviewer" || role === "doc-reviewer";
 
+/** Agents that work in a checkout pinned to a commit instead of on a branch of their own. */
+export const worksDetached = (role) => isReviewerRole(role) || role === "executor" || role === "planner";
+
+const STAGE_ROLES = {
+  design: ["designer", "design-reviewer"],
+  coding: ["coder", "code-reviewer", "resolver"],
+  testing: ["executor", "fixer"],
+  document: ["writer", "doc-reviewer"],
+};
+
+const KIND_STAGES = {
+  auto: [],
+  coding: ["coding"],
+  design: ["design"],
+  document: ["document"],
+  testing: ["testing"],
+  "design-coding": ["design", "coding"],
+};
+
+/** Sub-agents of the given stages, in workflow order. */
+export function rolesForStages(stages) {
+  return [...new Set(stages.flatMap((stage) => STAGE_ROLES[stage] ?? []))];
+}
+
 /** Sub-agents a task kind uses, in workflow order. */
 export function rolesFor(kind) {
-  if (kind === "design") return ["designer", "design-reviewer"];
-  if (kind === "document") return ["writer", "doc-reviewer"];
-  if (kind === "design-coding") return ["designer", "design-reviewer", "coder", "code-reviewer", "resolver"];
-  return ["coder", "code-reviewer", "resolver"];
+  return kind === "auto" ? ["planner"] : rolesForStages(KIND_STAGES[kind] ?? ["coding"]);
+}
+
+/** Sub-agents of a task: for Auto tasks the manager's planner plus the agents of the planned stages. */
+export function rolesForTask(task) {
+  if (task.kind !== "auto") return rolesFor(task.kind);
+  const stages = task.plan?.stages ?? task.stages?.map((stage) => stage.kind) ?? [];
+  return ["planner", ...rolesForStages(stages)];
 }
 
 /** Stage a role works in. */
 export const stageOfRole = (role) =>
-  role === "designer" || role === "design-reviewer" ? "design" : role === "writer" || role === "doc-reviewer" ? "document" : "coding";
+  role === "designer" || role === "design-reviewer"
+    ? "design"
+    : role === "writer" || role === "doc-reviewer"
+      ? "document"
+      : role === "executor" || role === "fixer"
+        ? "testing"
+        : role === "planner"
+          ? null
+          : "coding";
 
 export function agentStatusInfo(agent) {
   if (!agent) return { label: "Not started", cls: "neutral" };
@@ -151,11 +207,21 @@ export function agentStatusInfo(agent) {
   }
 }
 
-export const KIND_LABELS = { coding: "Coding", design: "Design", document: "Document", "design-coding": "Design → Coding" };
-export const STAGE_LABELS = { design: "Design", document: "Document", coding: "Coding" };
+export const KIND_LABELS = {
+  auto: "Auto (manager plans)",
+  coding: "Coding",
+  design: "Design",
+  document: "Document",
+  testing: "Execute & verify",
+  "design-coding": "Design → Coding",
+};
+export const STAGE_LABELS = { design: "Design", document: "Document", coding: "Coding", testing: "Execute & verify" };
 export const isDocStage = (stage) => stage === "design" || stage === "document";
 
 export function phaseLabel(stage, phase) {
+  if (phase === "planning") return "Planning";
+  if (stage === "testing" && phase === "reviewing") return "Running tests";
+  if (stage === "testing" && (phase === "authoring" || phase === "revising")) return "Fixing test failures";
   const noun = stage === "design" ? "design" : stage === "document" ? "document" : "code";
   switch (phase) {
     case "authoring":
@@ -185,6 +251,8 @@ export function statusInfo(task) {
       return { label: "Needs your input", cls: "attention" };
     case "completed": {
       const approved = task.approved ?? task.result?.approved;
+      const testsLast = (task.plan?.stages ?? task.stages?.map((stage) => stage.kind) ?? []).at(-1) === "testing";
+      if (testsLast) return approved ? { label: "Tests pass", cls: "success" } : { label: "Done · tests failing", cls: "warning" };
       return approved ? { label: "Approved", cls: "success" } : { label: "Done · not approved", cls: "warning" };
     }
     case "failed":

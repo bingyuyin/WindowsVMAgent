@@ -18,6 +18,8 @@ export type PolicyDecision = { kind: "approve-once" } | { kind: "reject"; feedba
 
 export interface PolicyOptions {
   readOnly: boolean;
+  /** Test executor: may run build/test commands (which write build output), but must not edit files or change git state. */
+  executeOnly?: boolean;
   workingDirectory: string;
   /** Agent scratch space outside the repository (the runtime's session-state folder). */
   scratchRoots?: readonly string[];
@@ -49,6 +51,11 @@ export function evaluatePermission(request: PermissionRequestLike, options: Poli
       if (target && inScratch(target, options)) return APPROVE;
       if (options.readOnly) {
         return reject("You are a read-only reviewer: do not create or modify files. Report problems as review comments in submit_review.");
+      }
+      if (options.executeOnly) {
+        return reject(
+          "You are the test executor: do not create or modify files. Report each failure with submit_test_results; the test fixer agent fixes them.",
+        );
       }
       if (target && !isInside(cwd, target)) {
         return reject(`Writes are only allowed inside the task worktree (${cwd}).`);
@@ -88,7 +95,11 @@ function evaluateShell(request: PermissionRequestLike, options: PolicyOptions): 
   for (const segment of segments) {
     const gitCommand = parseGitCommand(segment);
     if (!gitCommand) continue;
-    const problem = options.readOnly ? reviewerGitProblem(gitCommand) : authorGitProblem(gitCommand);
+    const problem = options.readOnly
+      ? reviewerGitProblem(gitCommand)
+      : options.executeOnly
+        ? executorGitProblem(gitCommand)
+        : authorGitProblem(gitCommand);
     if (problem) return reject(problem);
   }
 
@@ -190,6 +201,14 @@ function reviewerGitProblem({ subcommand, args }: GitCommand): string | null {
   if (subcommand === "remote" && (args.length === 0 || ["-v", "show", "get-url"].includes(args[0] ?? ""))) return null;
   if (subcommand === "config" && args.some((arg) => arg.startsWith("--get") || arg === "-l" || arg === "--list")) return null;
   return `Read-only reviewer: 'git ${subcommand}' is not allowed. Use read-only git commands such as git diff, git log, git show, git status.`;
+}
+
+/** The executor runs tests at a pinned commit: read-only git, plus fetching submodules/LFS content tests may need. */
+function executorGitProblem(command: GitCommand): string | null {
+  if (command.subcommand === "submodule" || command.subcommand === "lfs") return null;
+  return reviewerGitProblem(command)
+    ? `Test executor: 'git ${command.subcommand}' is not allowed. Your checkout is pinned to the commit under test; use read-only git commands (git diff, git log, git show, git status).`
+    : null;
 }
 
 function isGitIdentifier(token: string): boolean {

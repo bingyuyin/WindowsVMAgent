@@ -1,29 +1,33 @@
 # Copilot Agent Hub
 
 A local web service that runs **teams of sub-agents** on your repositories with the
-[GitHub Copilot SDK](https://docs.github.com/en/copilot/how-tos/copilot-sdk), iterating author ↔ reviewer
-until the reviewer approves.
+[GitHub Copilot SDK](https://docs.github.com/en/copilot/how-tos/copilot-sdk). A **manager agent** reads your
+request, decides which sub-agents to create, assigns their work and monitors them; the sub-agents iterate
+author ↔ reviewer (or execute ↔ fix) until the work is approved or the tests pass.
 
 | Task type | Sub-agents |
 | --- | --- |
+| **Auto** (default) | The **manager's planner** reads the request and the repository, picks the stages below (for example *Coding → Execute & verify*), writes each team's assignment, and the hub creates those sub-agents |
 | **Coding** | **Coder** implements the request · **Code reviewer** reviews each commit · **Comment resolver** fixes review comments (same model as the coder by default) |
+| **Execute & verify** | **Test executor** runs the test automation and verifies the results · **Test fixer** fixes failures at the root cause · the executor re-runs and checks the fixes are legitimate, until everything passes |
 | **Design** | **Designer** writes the design document and revises it · **Design reviewer** critiques it until a finalized version is approved |
 | **Document** | **Technical writer** writes documentation grounded in the repository · **Doc reviewer** checks accuracy and clarity until it is approved |
 | **Design → Coding** | Designer + design reviewer finalize the design, then coder + code reviewer + comment resolver implement it |
 
-Every sub-agent works on **its own branch** (reviewers in their own read-only worktree pinned to the
-commit under review), and every task has its own branches and worktrees, so **several tasks can run on
-the same repository at the same time** without touching your checkout. Agents use the repository's own
-guidance (instruction files, guides, design docs, skills, build/test commands) and fall back to the hub's
-best-practice skills for coding, code review, system design and technical writing. Design and document
-deliverables are **light-themed HTML pages** with Mermaid diagrams, rendered in the UI.
+Every sub-agent works on **its own branch** (reviewers and the test executor in their own worktree pinned
+to the commit under review/test), and every task has its own branches and worktrees, so **several tasks
+can run on the same repository at the same time** without touching your checkout. Agents use the
+repository's own guidance (instruction files, guides, CI pipelines, design docs, skills, build/test
+commands) and fall back to the hub's best-practice skills for coding, code review, test execution and
+fixing, system design and technical writing. Design and document deliverables are **light-themed HTML
+pages** with Mermaid diagrams, rendered in the UI.
 
 You sign in with GitHub in the browser, choose the LLMs, register repositories or folders, submit tasks,
-and watch each one live: which agent is working, what it is doing right now (coding, reviewing,
-resolving comments), its latest message, streaming output and tool calls; when it finishes, the result.
-The **Agents** page shows the same work from the agents' side: a live hierarchy (or pipeline) of the
-manager, the tasks and their sub-agents, and the manager's conversation with them. Everything (settings,
-repositories, each task's last state and history) is saved on local disk and survives restarts.
+and watch each one live: which agent is working, what it is doing right now (planning, coding, reviewing,
+running tests, fixing failures), its latest message, streaming output and tool calls; when it finishes,
+the result. The **Agents** page shows the same work from the agents' side: a live hierarchy (or pipeline)
+of the manager, the tasks and their sub-agents, and the manager's conversation with them. Everything
+(settings, repositories, each task's last state and history) is saved on local disk and survives restarts.
 
 ## Quick start
 
@@ -31,6 +35,7 @@ Requirements: Node.js **22.18+** (the TypeScript sources run directly), `git` on
 Copilot subscription. The SDK ships its own Copilot runtime, so no separate CLI install is needed.
 
 ```powershell
+cd agent-hub         # this folder of the WindowsVMAgent repository
 npm install
 npm start            # http://localhost:4600
 ```
@@ -38,12 +43,13 @@ npm start            # http://localhost:4600
 1. **Sign in**: click **Sign in with GitHub** and approve access in the GitHub tab that opens.
    Approve right away; the runtime only waits a limited time.
 2. **Choose models**: pick the author model (designer/writer/coder) and the reviewer model. Using a different
-   model for reviews gives a genuine second opinion. The comment resolver uses the author model unless
-   you pick another one in Settings.
+   model for reviews gives a genuine second opinion. The comment resolver / test fixer and the manager
+   use the author model unless you pick others in Settings.
 3. **Repositories**: register a local git repository, clone one from a URL, or register a plain folder
    and opt in to "initialize git" (git init + an initial commit of its current files).
-4. **New task**: choose the type, repository, base branch and description, and optionally per-task
-   models and the maximum number of review rounds.
+4. **New task**: keep **Auto** to let the manager decide which agents to create, or choose a type; pick the
+   repository, base branch and description, and optionally per-task models and the maximum number of
+   review rounds / test runs.
 
 ## How a task runs
 
@@ -51,23 +57,32 @@ npm start            # http://localhost:4600
 flowchart LR
   UI[Browser UI] -- REST + SSE --> API[HTTP API]
   API --> Runner[Task runner = manager<br/>queue · parallel tasks · monitoring · resume]
-  Runner --> Ctx[Context discovery<br/>instructions · guides · skills · build/test]
+  Runner --> Ctx[Context discovery<br/>instructions · guides · CI · skills · build/test]
   Runner --> Engine[Workflow engine]
+  Engine -- Auto tasks --> P[Planner<br/>read-only checkout]
+  P -- plan: stages + assignments --> Engine
   Engine -- round 1 --> C[Coder / Designer / Writer<br/>own branch]
   Engine -- review --> R[Reviewer<br/>own read-only worktree]
   Engine -- round 2+ --> F[Comment resolver / Designer / Writer<br/>own branch]
-  C & F -- commit + fast-forward --> TB[(task branch<br/>agent-hub/t-NNN-*)]
-  C & R & F --> SDK[Copilot SDK sessions] --> RT[Copilot runtime]
+  Engine -- run tests --> X[Test executor<br/>own pinned checkout]
+  Engine -- failures --> TF[Test fixer<br/>own branch]
+  C & F & TF -- commit + fast-forward --> TB[(task branch<br/>agent-hub/t-NNN-*)]
+  P & C & R & F & X & TF --> SDK[Copilot SDK sessions] --> RT[Copilot runtime]
   Runner -. manager log .-> Disk[(data/ on local disk)]
 ```
 
+0. **Plan** (Auto tasks): the manager's planner inspects the repository read-only and calls `submit_plan`
+   with the stages to run (design, coding, testing, document; they always run in that order), its
+   rationale, and an assignment for each stage's team (scope, acceptance criteria, the exact test
+   commands). The hub creates the corresponding sub-agents and gives each its assignment. If the planner
+   does not submit a plan, the hub derives the stages from keywords in the request.
 1. **Context**: at the task's base commit the hub looks for instruction files (`AGENTS.md`,
    `.github/copilot-instructions.md`, `.github/instructions/*.instructions.md`, `CLAUDE.md`), guides
-   (`CONTRIBUTING.md`, `ARCHITECTURE.md`, `README.md`, …), design docs/ADRs, repository skills
-   (`.github/skills`, `.copilot/skills`, `.claude/skills`, `skills`) and build/test commands (package
-   scripts, .NET, Go, Rust, Python, Maven/Gradle, Makefile). Instruction files are loaded by the runtime
-   automatically; the rest is listed in each agent's first prompt, and repository skills are passed to
-   every agent. See the **Context** tab of a task.
+   (`CONTRIBUTING.md`, `ARCHITECTURE.md`, `TESTING.md`, `README.md`, CI pipelines, …), design docs/ADRs,
+   repository skills (`.github/skills`, `.copilot/skills`, `.claude/skills`, `skills`) and build/test
+   commands (package scripts, .NET, Go, Rust, Python, Maven/Gradle, Makefile, Pester). Instruction files
+   are loaded by the runtime automatically; the rest is listed in each agent's first prompt, and
+   repository skills are passed to every agent. See the **Context** tab of a task.
 2. **Author turn**: the coder (round 1), the comment resolver (rounds with open code comments), the
    designer or the technical writer works on its own branch and finishes by calling the `submit_work`
    tool with a summary, the validation it ran, and a response (`addressed` or `declined` plus a note) for
@@ -85,14 +100,42 @@ flowchart LR
    their author) until the reviewer approves or the round budget is used up. **Continue review loop**
    runs more rounds later in fresh sessions; **Retry** resumes failed, cancelled or interrupted tasks from
    the last completed step.
-6. **Result**: the task branch, commits, diff stat and final summary, with ready-to-copy `git` commands
-   to inspect and merge. Design and document tasks keep every document version (v1, v2, … final).
+6. **Result**: the task branch, commits, diff stat, test results and final summary (one section per stage),
+   with ready-to-copy `git` commands to inspect and merge. Design and document tasks keep every document
+   version (v1, v2, … final).
 
-Each agent keeps one Copilot session per stage, so it remembers earlier rounds; a comment resolver that
-starts fresh gets the request, the previous summary and the diff so far. If an agent ends a turn
+Each agent keeps one Copilot session per stage, so it remembers earlier rounds; a comment resolver or test
+fixer that starts fresh gets the request, the previous summary and the diff so far. If an agent ends a turn
 without calling its submit tool, the hub nudges it, and after two attempts derives the result from its
-last message. If an agent asks a question (`ask_user`), the task shows **Needs your input**; answer in
-the UI, or after the configured timeout the agent proceeds on its own judgment.
+last message (a test run without structured results counts as *blocked*, never as passed). If an agent
+asks a question (`ask_user`), the task shows **Needs your input**; answer in the UI, or after the
+configured timeout the agent proceeds on its own judgment.
+
+## Execute & verify: running test automation
+
+The testing stage (the **Execute & verify** task type, or chosen by the manager for Auto tasks) loops
+between two agents:
+
+1. **Test executor** — works in its own checkout pinned to the commit under test, may run any setup,
+   build and test command (installing dependencies is fine) but may not edit files or move git state. It
+   finds the right commands (the request and the manager's assignment first, then package scripts,
+   Makefiles, test projects, Pester tests, CI pipelines), runs the complete suite, and **verifies** the
+   outcome instead of trusting exit codes: zero tests discovered is a failure, skipped tests are noted,
+   suspected flaky tests are re-run. It reports through `submit_test_results`: status (`passed`,
+   `failed`, `blocked`), the exact commands, counts, an output excerpt, and one entry per failure with
+   the error and a triage category — `product-bug`, `test-bug`, `environment`, `flaky` or `integrity` —
+   plus a suggested fix. Failures get IDs `T1`, `T2`, …
+2. **Test fixer** — on its own branch, fixes each failure at its root cause (the product code when its
+   behavior is wrong, the test only when the test itself is wrong, with a justification), re-runs the
+   failing tests, and responds to every failure ID (`addressed`, or `declined` with what is needed, for
+   example a missing tool or credential).
+3. **Verification** — the executor re-runs the **complete** suite at the fixer's commit and inspects the
+   fixer's diff: deleted or skipped tests, weakened assertions, swallowed errors or hard-coded results are
+   reported as `integrity` failures. The stage passes only when everything requested ran and passed.
+
+If the fixer declines every failure without changing anything, the stage stops instead of re-running
+unchanged code. **Continue fixing** runs more fix-and-verify rounds later (for example after you install
+a missing tool).
 
 ## Agents view: the manager and its sub-agents
 
@@ -100,16 +143,17 @@ The **Agents** page shows the work from the agents' side, updated live over Serv
 
 - **Stats**: whether the manager is online, running/queued tasks against the parallel-task capacity,
   how many sub-agents are working or waiting for their turn, and recent message volume.
-- **Hierarchy** diagram: *You → Manager agent → tasks → sub-agents*. Each agent node shows its model,
-  status, what it is doing now, its last instruction from (↓) or report to (↑) the manager, and a
-  heartbeat (♥). Active links animate, and every message travels along the edges as a colored pulse
-  (manager → agent assignments, agent → manager submissions, review verdicts). Click a node to open the
-  task.
-- **Pipeline** mode: one row per task with its stage lanes (author → reviewer ↺ comment resolver), the
-  current step highlighted and each round's outcome.
-- **Manager ↔ agents** feed: every message the manager exchanges — session starts, assignments,
-  submissions, review requests, verdicts, nudges, monitoring check-ins, questions/answers and releases —
-  filterable by task.
+- **Hierarchy** diagram: *You → Manager agent → tasks → sub-agents*. For Auto tasks the manager's
+  **planner** appears first under the task, followed by the agents it decided to create. Each agent
+  node shows its model, status, what it is doing now, its last instruction from (↓) or report to (↑) the
+  manager, and a heartbeat (♥). Active links animate, and every message travels along the edges as a
+  colored pulse (plans, manager → agent assignments, agent → manager submissions, verdicts and test
+  results). Click a node to open the task.
+- **Pipeline** mode: one row per task with its stage lanes (author → reviewer ↺ comment resolver;
+  test executor ↺ test fixer), the current step highlighted and each round's outcome.
+- **Manager ↔ agents** feed: every message the manager exchanges — plans, session starts, assignments,
+  submissions, review requests, verdicts, test results, nudges, monitoring check-ins, questions/answers
+  and releases — filterable by task.
 - **Sub-agents by role**: how many agents of each role are working, waiting or done, and which tasks
   each is handling.
 
@@ -134,9 +178,10 @@ Designs go to `docs/designs/` and documents to `docs/` by default (both configur
 | What | Where |
 | --- | --- |
 | Task branch (the result you merge) | `agent-hub/<task>-<slug>`, fast-forwarded after every author round |
-| Author agents' own branches | `agent-hub/<task>-<slug>--coder`, `--resolver`, `--designer`, `--writer` |
+| Author agents' own branches | `agent-hub/<task>-<slug>--coder`, `--resolver`, `--designer`, `--writer`, `--fixer` |
 | Author worktree | `data/worktrees/<task>/author` (authors switch to their own branch for their turn, so installed dependencies and build output are reused) |
-| Reviewer worktree | `data/worktrees/<task>/review`, detached at the commit under review |
+| Reviewer / planner worktree | `data/worktrees/<task>/review`, detached at the commit under review (the base commit for the planner) |
+| Test executor worktree | `data/worktrees/<task>/run`, detached at the commit under test; kept across runs so installed dependencies and build output are reused |
 
 Set **Agent isolation** to "own worktree and branch per agent" to give every sub-agent its own worktree
 (`data/worktrees/<task>/<role>`) at the cost of more disk and per-agent dependency installs. Tasks never
@@ -152,9 +197,11 @@ repository instructions and skills always take precedence:
 
 | Skill | Used by |
 | --- | --- |
-| `coding-best-practices` | Coder, comment resolver |
+| `coding-best-practices` | Coder, comment resolver, test fixer |
 | `review-comment-resolution` | Comment resolver |
 | `code-review` | Code reviewer |
+| `test-execution` | Test executor |
+| `test-fixing` | Test fixer |
 | `system-design` | Designer |
 | `design-review` | Design reviewer |
 | `technical-writing` | Technical writer |
@@ -177,16 +224,18 @@ store. After a successful sign-in the hub restarts its runtime to load the new c
 
 ## Safety model
 
-- **Read-only reviewers**: file writes are rejected. Shell commands are limited to read-only tools and
-  read-only git subcommands (`diff`, `log`, `show`, `status`, …).
+- **Read-only reviewers and planner**: file writes are rejected. Shell commands are limited to read-only
+  tools and read-only git subcommands (`diff`, `log`, `show`, `status`, …).
+- **Test executor**: may run any build/test command in its own pinned checkout, but file edits are
+  rejected and git is limited to read-only subcommands (plus `submodule`/`lfs` to fetch test content).
 - **Authors** may write only inside their own worktree. `git push`, branch switching (`checkout <branch>`,
   `switch`), `rebase`, `reset --hard`, worktree/remote changes and global git config are rejected.
   Reads outside the worktree and persistent memory are denied. Each agent may still use its own
   session scratch folder under `<copilot home>/session-state` (for example for plans) and read the
   skill folders it was given.
 - These are guardrails enforced through the SDK permission callback, **not a sandbox**: author agents
-  run build/test commands on your machine with your user account. Only register repositories you are
-  comfortable letting an agent work on.
+  and the test executor run build/test commands on your machine with your user account. Only register
+  repositories you are comfortable letting an agent work on.
 - The server binds to `127.0.0.1` and checks the `Host` header (DNS-rebinding protection) and the
   `Origin` + JSON `Content-Type` of mutating requests (CSRF protection). It has no login of its own, so
   don't expose it beyond localhost.
@@ -203,11 +252,12 @@ Environment variables:
 | `HUB_COPILOT_HOME` | `<data>/copilot-home` | Copilot runtime home (sessions, sign-in) |
 | `HUB_RUNTIME_LOG_LEVEL` | `error` | Copilot runtime log level |
 
-Settings page: default author, comment-resolver and reviewer models, agent isolation (own branch per
-agent, or own worktree per agent), worktree cleanup on completion, max review rounds (default 3),
-parallel tasks (default 2), agent turn timeout, question timeout, resuming interrupted tasks after a
-restart (default on), document format (HTML or Markdown) and the design (`docs/designs`) and document
-(`docs`) folders. The **Storage** section shows where each kind of data is saved.
+Settings page: default manager, author, comment-resolver/test-fixer and reviewer/test-executor models,
+agent isolation (own branch per agent, or own worktree per agent), worktree cleanup on completion, max
+review rounds / test runs (default 3), parallel tasks (default 2), agent turn timeout, question timeout,
+resuming interrupted tasks after a restart (default on), document format (HTML or Markdown) and the
+design (`docs/designs`) and document (`docs`) folders. The **Storage** section shows where each kind of
+data is saved.
 
 ## Data layout
 
@@ -224,7 +274,8 @@ data/
   tasks/<id>/events.jsonl    timeline (append-only)
   tasks/<id>/doc-rN.html     design/document snapshot for round N (.md for Markdown documents)
   worktrees/<id>/author/     author agents' worktree (or <id>/<role>/ with per-agent worktrees)
-  worktrees/<id>/review/     reviewer worktree, detached at the reviewed commit
+  worktrees/<id>/review/     reviewer (and planner) worktree, detached at the reviewed commit
+  worktrees/<id>/run/        test executor worktree, detached at the commit under test
   repos/                     repositories cloned from a URL
   copilot-home/              Copilot runtime home
 ```
@@ -245,7 +296,7 @@ deletes the task branch.
 | `GET /api/models` | Models available to the signed-in account |
 | `GET/PUT /api/settings` · `GET /api/storage` | Settings and where data is stored |
 | `GET/POST /api/repos` · `DELETE /api/repos/:id` · `GET /api/repos/:id/branches` | Repository registry |
-| `GET/POST /api/tasks` · `GET/DELETE /api/tasks/:id` | Tasks |
+| `GET/POST /api/tasks` · `GET/DELETE /api/tasks/:id` | Tasks (`kind`: `auto`, `coding`, `testing`, `design`, `document`, `design-coding`; optional `managerModel` for Auto) |
 | `POST /api/tasks/:id/cancel` · `POST /api/tasks/:id/retry` · `POST /api/tasks/:id/input` | Control and answers |
 | `GET /api/tasks/:id/diff?from=&to=` | Changes |
 | `GET /api/tasks/:id/doc?round=` · `GET /api/tasks/:id/doc/view?round=` | Design/document versions (JSON, or the sandboxed HTML page) |
@@ -257,7 +308,7 @@ Mutating requests must send `Content-Type: application/json`.
 ## Development
 
 ```powershell
-npm test             # node:test – workflow engine (scripted agents + real git), concurrency, documents, manager log, storage, policy
+npm test             # node:test – workflow engine (scripted agents + real git), planning, test execution, concurrency, documents, manager log, storage, policy
 npm run typecheck    # tsc for src and tests
 npm run dev          # restart on file changes
 ```
@@ -267,7 +318,7 @@ src/
   main.ts                 wiring and graceful shutdown
   copilot/service.ts      CopilotClient lifecycle, sign-in flows, model catalog
   agents/                 driver interface, Copilot SDK driver, prompts, submit tools, permission policy
-  workflow/               runner (manager: queue, workspaces, monitoring, resume), engine (sub-agent loop), validation
+  workflow/               runner (manager: queue, workspaces, monitoring, resume), engine (planning + sub-agent loops), validation
   http/                   dependency-free router, SSE, API routes, sandboxed document viewer
   context.ts              repository context discovery and hub skills
   docs.ts                 HTML document templates, validation and viewer preparation

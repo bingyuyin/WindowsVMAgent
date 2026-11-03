@@ -9,6 +9,7 @@ export function settingsView(root) {
   const authorSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const reviewerSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const resolverSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
+  const managerSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const settings = state.settings ?? {};
   const isolation = h(
     "select",
@@ -45,10 +46,11 @@ export function settingsView(root) {
       h("div", { class: "row between" }, h("h2", { class: "section-title" }, "Models"), refreshButton),
       h(
         "div",
-        { class: "grid-3" },
+        { class: "grid-2" },
+        field("Manager model", managerSelect, "Plans Auto tasks: reads the request and repository and decides which sub-agents to create. Defaults to the author model."),
         field("Author model (designer, writer, coder)", authorSelect),
-        field("Comment resolver model", resolverSelect, "Resolves code review comments; defaults to the author model."),
-        field("Reviewer model (all reviewers)", reviewerSelect, "A different model for reviews gives a second opinion."),
+        field("Comment resolver / test fixer model", resolverSelect, "Resolves code review comments and fixes test failures; defaults to the author model."),
+        field("Reviewer / test executor model", reviewerSelect, "Reviews and verifies the authors' work. A different model gives a second opinion."),
       ),
       h("h2", { class: "section-title" }, "Workspaces"),
       h(
@@ -67,7 +69,7 @@ export function settingsView(root) {
       h(
         "div",
         { class: "grid-3" },
-        field("Max review rounds", rounds, "Default per task: author/review iterations before stopping."),
+        field("Max review rounds / test runs", rounds, "Default per task: author/review iterations (or test runs) before stopping."),
         field("Parallel tasks", concurrency, "How many tasks run at the same time."),
         field("Agent turn timeout (minutes)", turnTimeout, "Fails a turn that runs longer than this."),
         field("Question timeout (minutes)", inputTimeout, "When an agent asks you something and you don't answer in time, it proceeds on its own."),
@@ -138,6 +140,7 @@ export function settingsView(root) {
       setContent(authorSelect, modelOptions(models, state.settings?.authorModel));
       setContent(reviewerSelect, modelOptions(models, state.settings?.reviewerModel));
       setContent(resolverSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.resolverModel));
+      setContent(managerSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.managerModel));
       if (force) toast("Model list refreshed", "success");
     } catch (error) {
       toast(`Could not load models: ${error.message}`, "error");
@@ -154,6 +157,7 @@ export function settingsView(root) {
         authorModel: authorSelect.value,
         reviewerModel: reviewerSelect.value,
         resolverModel: resolverSelect.value || null,
+        managerModel: managerSelect.value || null,
         isolation: isolation.value,
         cleanupWorktrees: cleanup.checked,
         resumeInterruptedTasks: resume.checked,

@@ -2,7 +2,15 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { AgentDriver, AgentHandle, AgentSpec, ReviewSubmissionInput, WorkSubmissionInput } from "../src/agents/driver.ts";
+import type {
+  AgentDriver,
+  AgentHandle,
+  AgentSpec,
+  PlanSubmissionInput,
+  ReviewSubmissionInput,
+  TestRunSubmissionInput,
+  WorkSubmissionInput,
+} from "../src/agents/driver.ts";
 import { Bus } from "../src/bus.ts";
 import type { HubSkills } from "../src/context.ts";
 import type { DocTemplates } from "../src/docs.ts";
@@ -78,6 +86,30 @@ export const submitReview =
   async (spec) => {
     if (spec.submit.kind !== "review") throw new Error(`${spec.role} cannot submit a review`);
     await spec.submit.onSubmit({ verdict, summary: `${verdict} summary`, comments });
+  };
+
+export const submitTests =
+  (
+    status: TestRunSubmissionInput["status"],
+    failures: TestRunSubmissionInput["failures"] = [],
+    extra: Partial<TestRunSubmissionInput> = {},
+  ): Step =>
+  async (spec) => {
+    if (spec.submit.kind !== "test") throw new Error(`${spec.role} cannot submit test results`);
+    await spec.submit.onSubmit({
+      status,
+      summary: `Tests ${status}`,
+      commands: status === "blocked" ? [] : ["npm test"],
+      failures,
+      ...extra,
+    });
+  };
+
+export const submitPlan =
+  (stages: string[], instructions: Record<string, string>, rationale = "Fits the request"): Step =>
+  async (spec) => {
+    if (spec.submit.kind !== "plan") throw new Error(`${spec.role} cannot submit a plan`);
+    await spec.submit.onSubmit({ stages, rationale, instructions } as unknown as PlanSubmissionInput);
   };
 
 /** Extracts the design/document path the hub asked the author to write. */

@@ -5,10 +5,22 @@ import { loadModels, modelOptions } from "./models.js";
 
 const TYPES = [
   {
+    id: "auto",
+    title: "Auto",
+    text: "The manager agent reads your request and the repository, then decides which sub-agents to create (design, coding, test execution & fixing, documentation), gives each its assignment and monitors them.",
+    placeholder: "Describe what you need in plain words, e.g. \"Add retry support to the uploader and make sure the Pester tests pass\" or \"Run the end-to-end automation and fix the failures\"…",
+  },
+  {
     id: "coding",
     title: "Coding",
     text: "Agents: a coder implements the request, a code reviewer reviews each commit, and a comment resolver fixes review comments, round by round until approval.",
     placeholder: "Describe the change: what to build or fix, acceptance criteria, constraints, files or areas involved…",
+  },
+  {
+    id: "testing",
+    title: "Execute & verify",
+    text: "Agents: a test executor runs the test automation and verifies the results; a test fixer fixes failures at the root cause; the executor re-runs and checks the fixes are legitimate, until everything passes.",
+    placeholder: "Describe the automation to run and verify, e.g. \"Run the Pester tests in tests/ (Invoke-Pester) and fix any failures\" or \"Run npm test and the e2e suite (npm run e2e)\"…",
   },
   {
     id: "design",
@@ -31,7 +43,7 @@ const TYPES = [
 ];
 
 export function newTaskView(root) {
-  let kind = "coding";
+  let kind = "auto";
   const typeButtons = h("div", { class: "seg", role: "radiogroup", "aria-label": "Task type" });
   const typeHelp = h("p", { class: "muted small" });
   const repoSelect = h("select", { class: "input", required: true });
@@ -41,7 +53,9 @@ export function newTaskView(root) {
   const authorSelect = h("select", { class: "input" });
   const reviewerSelect = h("select", { class: "input" });
   const resolverSelect = h("select", { class: "input" });
-  const resolverField = h("label", { class: "field" }, h("span", { class: "field-label" }, "Comment resolver model"), resolverSelect);
+  const managerSelect = h("select", { class: "input" });
+  const resolverField = h("label", { class: "field" }, h("span", { class: "field-label" }, "Comment resolver / test fixer model"), resolverSelect);
+  const managerField = h("label", { class: "field" }, h("span", { class: "field-label" }, "Manager model (plans the task)"), managerSelect);
   const roundsInput = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(state.settings?.maxRounds ?? 3) });
   const submitButton = h("button", { class: "btn btn-primary", type: "submit" }, "Create task");
 
@@ -64,10 +78,11 @@ export function newTaskView(root) {
       h(
         "div",
         { class: "grid-2" },
+        managerField,
         h("label", { class: "field" }, h("span", { class: "field-label" }, "Author model (designer / writer / coder)"), authorSelect),
         resolverField,
-        h("label", { class: "field" }, h("span", { class: "field-label" }, "Reviewer model"), reviewerSelect),
-        h("label", { class: "field" }, h("span", { class: "field-label" }, "Max review rounds"), roundsInput),
+        h("label", { class: "field" }, h("span", { class: "field-label" }, "Reviewer / test executor model"), reviewerSelect),
+        h("label", { class: "field" }, h("span", { class: "field-label" }, "Max review rounds / test runs"), roundsInput),
       ),
     ),
     h("div", { class: "row end" }, h("a", { class: "btn", href: "#/tasks" }, "Cancel"), submitButton),
@@ -103,6 +118,7 @@ export function newTaskView(root) {
     typeHelp.textContent = type.text;
     description.placeholder = type.placeholder;
     resolverField.hidden = kind === "design" || kind === "document";
+    managerField.hidden = kind !== "auto";
   }
 
   function renderRepos() {
@@ -140,6 +156,7 @@ export function newTaskView(root) {
       setContent(authorSelect, modelOptions(models, state.settings?.authorModel));
       setContent(reviewerSelect, modelOptions(models, state.settings?.reviewerModel));
       setContent(resolverSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.resolverModel));
+      setContent(managerSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.managerModel));
     } catch (error) {
       toast(`Could not load models: ${error.message}`, "error");
     }
@@ -163,6 +180,7 @@ export function newTaskView(root) {
         authorModel: authorSelect.value || undefined,
         reviewerModel: reviewerSelect.value || undefined,
         resolverModel: kind === "design" || kind === "document" ? undefined : resolverSelect.value || undefined,
+        managerModel: kind === "auto" ? managerSelect.value || undefined : undefined,
         maxRounds: Number(roundsInput.value) || undefined,
       });
       toast(`Created ${task.id}`, "success");

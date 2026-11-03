@@ -6,7 +6,17 @@ import { describeTool } from "../src/agents/copilotDriver.ts";
 import { systemPromptFor } from "../src/agents/prompts.ts";
 import { docForPrompt, docForViewer, documentProblem, formatOfPath, loadDocTemplates, renderDocTemplate } from "../src/docs.ts";
 import { parseSettingsPatch } from "../src/http/api.ts";
-import { fallbackReview, normalizeReview, normalizeWork } from "../src/workflow/submissions.ts";
+import { rolesFor, rolesForStages, stageKindsOf, worksDetached } from "../src/types.ts";
+import { describeTestRun } from "../src/workflow/engine.ts";
+import {
+  fallbackReview,
+  fallbackTestRun,
+  heuristicPlan,
+  normalizePlan,
+  normalizeReview,
+  normalizeTestRun,
+  normalizeWork,
+} from "../src/workflow/submissions.ts";
 
 const cwd = path.resolve("/work/tree");
 const author = { readOnly: false, workingDirectory: cwd };
@@ -135,6 +145,120 @@ describe("tool labels", () => {
     assert.equal(describeTool("submit_review", { verdict: "request_changes" }, cwd), "Submitting review (request changes)");
     assert.equal(describeTool("skill", { skill: "code-review" }, cwd), "Loading skill: code-review");
     assert.equal(describeTool("skill", {}, cwd), "Loading a skill");
+    assert.equal(describeTool("submit_test_results", { status: "failed" }, cwd), "Submitting test results (failed)");
+    assert.equal(describeTool("submit_plan", { stages: ["coding", "testing"] }, cwd), "Submitting plan (coding → testing)");
+  });
+});
+
+describe("test runs (executor)", () => {
+  const failure = { test: "adds", file: "test\\calc.test.js", line: 3, error: "expected 3", category: "regression" };
+
+  test("normalizes statuses, categories and paths", () => {
+    const run = normalizeTestRun({ status: "FAIL", summary: "1 failing", commands: [" npm test ", ""], total: 2, failed: 1, failures: [failure] });
+    assert.equal(run.status, "failed");
+    assert.deepEqual(run.commands, ["npm test"]);
+    assert.equal(run.failures[0]!.category, "product-bug");
+    assert.equal(run.failures[0]!.file, "test/calc.test.js");
+    assert.equal(normalizeTestRun({ status: "success", summary: "ok", commands: ["npm test"], failures: [], total: 5 }).status, "passed");
+    assert.equal(normalizeTestRun({ status: "blocked", summary: "no pester", failures: [{ test: "setup", error: "missing", category: "infra" }] }).failures[0]!.category, "environment");
+  });
+
+  test("rejects results that cannot be trusted", () => {
+    const base = { summary: "s", commands: ["npm test"] };
+    assert.throws(() => normalizeTestRun({ ...base, status: "passed", failures: [failure] }), /status is passed but failures are listed/);
+    assert.throws(() => normalizeTestRun({ ...base, status: "passed", failures: [], total: 0 }), /No tests ran/);
+    assert.throws(() => normalizeTestRun({ ...base, status: "passed", failures: [], failed: 2 }), /`failed` is greater than 0/);
+    assert.throws(() => normalizeTestRun({ ...base, status: "failed", failures: [] }), /requires at least one entry/);
+    assert.throws(() => normalizeTestRun({ summary: "s", status: "failed", commands: [], failures: [failure] }), /`commands` is required/);
+    assert.throws(() => normalizeTestRun({ ...base, status: "green-ish", failures: [] }), /Invalid status/);
+    assert.throws(() => normalizeTestRun({ ...base, status: "failed", failures: [{ test: "x", category: "flaky" }] }), /error is required/);
+  });
+
+  test("a missing submission is treated as blocked, never as passed", () => {
+    const run = fallbackTestRun("All 12 tests passed!");
+    assert.equal(run.status, "blocked");
+    assert.equal(run.failures.length, 1);
+  });
+
+  test("describes runs for the manager log", () => {
+    const comments = [
+      { id: "T1", severity: "blocker", body: "", status: "open", category: "product-bug" },
+      { id: "T2", severity: "blocker", body: "", status: "open", category: "test-bug" },
+    ] as const;
+    assert.equal(describeTestRun({ status: "passed", commands: [], total: 12, skipped: 1 }, []), "Passed: 12 tests, 1 skipped");
+    assert.equal(describeTestRun({ status: "failed", commands: [], total: 12, failed: 2 }, [...comments]), "Failed: 2 of 12 (1 product-bug, 1 test-bug)");
+    assert.match(describeTestRun({ status: "blocked", commands: [] }, [{ ...comments[0], test: "Pester missing" }]), /^Blocked: Pester missing/);
+  });
+});
+
+describe("manager plans", () => {
+  test("normalizes and orders stages and requires an assignment for each", () => {
+    const plan = normalizePlan({
+      stages: ["docs", "implementation", "verify", "implementation"],
+      rationale: "why",
+      instructions: { document: "Document it", coding: "Build it", testing: "Run npm test", design: "ignored" },
+    });
+    assert.deepEqual(plan.stages, ["coding", "testing", "document"]);
+    assert.deepEqual(plan.instructions, { coding: "Build it", testing: "Run npm test", document: "Document it" });
+    assert.throws(() => normalizePlan({ stages: ["deploy"], rationale: "r", instructions: {} }), /Unknown stage 'deploy'/);
+    assert.throws(() => normalizePlan({ stages: [], rationale: "r", instructions: {} }), /non-empty array/);
+    assert.throws(() => normalizePlan({ stages: ["coding"], rationale: "", instructions: { coding: "x" } }), /rationale/);
+    assert.throws(() => normalizePlan({ stages: ["testing"], rationale: "r", instructions: {} }), /instructions\.testing is required.*commands or suites/);
+  });
+
+  test("falls back to keywords when no plan is submitted", () => {
+    assert.deepEqual(heuristicPlan("Run the test automation in tests/ and verify the results").stages, ["testing"]);
+    assert.deepEqual(heuristicPlan("Design and implement a retry policy, then document it").stages, ["design", "coding", "document"]);
+    assert.deepEqual(heuristicPlan("Something vague").stages, ["coding"]);
+  });
+
+  test("roles follow the plan; the planner and executor work in pinned checkouts", () => {
+    assert.deepEqual(rolesFor("auto"), ["planner"]);
+    assert.deepEqual(rolesFor("testing"), ["executor", "fixer"]);
+    assert.deepEqual(rolesForStages(["coding", "testing"]), ["coder", "code-reviewer", "resolver", "executor", "fixer"]);
+    assert.deepEqual(stageKindsOf({ kind: "auto", plan: undefined }), []);
+    assert.deepEqual(stageKindsOf({ kind: "auto", plan: { stages: ["testing"], rationale: "", instructions: {}, plannedAt: "" } }), ["testing"]);
+    assert.equal(worksDetached("executor"), true);
+    assert.equal(worksDetached("planner"), true);
+    assert.equal(worksDetached("fixer"), false);
+  });
+});
+
+describe("executor permissions", () => {
+  const executor = { readOnly: false, executeOnly: true, workingDirectory: cwd };
+
+  test("may run build and test commands but not edit files or move git state", () => {
+    assert.equal(evaluatePermission(shell("npm ci; npm test", [{ identifier: "npm", readOnly: false }]), executor).kind, "approve-once");
+    assert.equal(evaluatePermission(shell("Invoke-Pester -Path tests > results.txt", [{ identifier: "Invoke-Pester", readOnly: false }], { hasWriteFileRedirection: true }), executor).kind, "approve-once");
+    assert.equal(evaluatePermission(shell("git submodule update --init", [{ identifier: "git", readOnly: false }]), executor).kind, "approve-once");
+    assert.equal(evaluatePermission(shell("git diff HEAD~1", [{ identifier: "git", readOnly: true }]), executor).kind, "approve-once");
+    const commit = evaluatePermission(shell("git commit -am wip", [{ identifier: "git", readOnly: false }]), executor);
+    assert.equal(commit.kind, "reject");
+    assert.match(commit.kind === "reject" ? commit.feedback : "", /Test executor: 'git commit'/);
+    assert.equal(evaluatePermission(shell("git checkout main", [{ identifier: "git", readOnly: false }]), executor).kind, "reject");
+    const write = evaluatePermission({ kind: "write", fileName: path.join(cwd, "src/a.ts") }, executor);
+    assert.equal(write.kind, "reject");
+    assert.match(write.kind === "reject" ? write.feedback : "", /test fixer agent fixes them/);
+  });
+});
+
+describe("new agent prompts", () => {
+  const env = { worktree: cwd, branch: null, taskBranch: "t", baseSha: "abc1234567" };
+
+  test("executor, fixer and planner know their jobs and limits", () => {
+    const executor = systemPromptFor("executor", env, ["test-execution"]);
+    assert.match(executor, /never edit, create or delete source files/);
+    assert.match(executor, /zero tests run is a failure/);
+    assert.match(executor, /integrity/);
+    assert.match(executor, /load the `test-execution` skill/);
+    assert.match(executor, /`submit_test_results`/);
+    const fixer = systemPromptFor("fixer", { ...env, branch: "t--fixer" }, ["test-fixing"]);
+    assert.match(fixer, /Never make tests pass by deleting or skipping them/);
+    assert.match(fixer, /own branch `t--fixer`/);
+    const planner = systemPromptFor("planner", env);
+    assert.match(planner, /You are the MANAGER/);
+    assert.match(planner, /- testing: a test executor runs the test automation/);
+    assert.match(planner, /`submit_plan`/);
   });
 });
 

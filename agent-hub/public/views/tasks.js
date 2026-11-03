@@ -7,7 +7,7 @@ import {
   relTime,
   ROLE_LABELS,
   roleTag,
-  rolesFor,
+  rolesForTask,
   setContent,
   STAGE_LABELS,
   statusInfo,
@@ -24,8 +24,12 @@ const FILTERS = [
 
 let currentFilter = "all";
 
-/** Compact stage/round pipeline: one pill per stage, one dot per review round. */
+/** Compact stage/round pipeline: one pill per stage, one dot per review round (or test run). */
 export function pipelineMini(task) {
+  if (!task.stages.length && task.kind === "auto") {
+    const planning = ["running", "needs-input"].includes(task.status);
+    return h("div", { class: "pipeline-mini" }, h("span", { class: "pm-stage pm-running" }, h("span", { class: "pm-label" }, planning ? "Manager is planning…" : "Not planned yet")));
+  }
   return h(
     "div",
     { class: "pipeline-mini" },
@@ -40,11 +44,12 @@ export function pipelineMini(task) {
           : stage.rounds.map((round) => {
               const live = task.currentStage === stage.kind && task.currentRound === round.n && ["running", "needs-input"].includes(task.status);
               const cls = round.verdict === "approve" ? "pm-approved" : round.verdict === "request_changes" ? "pm-changes" : live ? "pm-live" : "pm-pending";
+              const noun = stage.kind === "testing" ? "failure" : "comment";
               const title =
                 round.verdict === "approve"
-                  ? `Round ${round.n}: approved`
+                  ? `Round ${round.n}: ${stage.kind === "testing" ? "tests passed" : "approved"}`
                   : round.verdict === "request_changes"
-                    ? `Round ${round.n}: ${round.comments} comment(s)`
+                    ? `Round ${round.n}: ${round.testStatus === "blocked" ? "blocked" : `${round.comments} ${noun}(s)`}`
                     : `Round ${round.n}: in progress`;
               return h("span", { class: `pm-dot ${cls}`, title }, round.verdict === "request_changes" ? String(round.comments) : round.verdict === "approve" ? "✓" : "");
             }),
@@ -64,7 +69,7 @@ export function tasksView(root) {
         "div",
         {},
         h("h1", {}, "Tasks"),
-        h("p", { class: "muted" }, "Coding tasks run a coder, a code reviewer and a comment resolver; design tasks a designer and a design reviewer; document tasks a technical writer and a doc reviewer. Each agent works on its own branch."),
+        h("p", { class: "muted" }, "Pick a task type, or choose Auto and the manager agent reads your request and decides which sub-agents to create: designers, coders, reviewers, test executors and fixers, technical writers. Each agent works on its own branch."),
       ),
       h("a", { class: "btn btn-primary", href: "#/tasks/new" }, "+ New task"),
     ),
@@ -173,7 +178,7 @@ export function agentStrip(task) {
   return h(
     "div",
     { class: "agent-strip" },
-    rolesFor(task.kind).map((role) => {
+    rolesForTask(task).map((role) => {
       const agent = byRole.get(role);
       const label = !agent && task.status === "completed" ? "Not needed" : agentStatusInfo(agent).label;
       return h(
@@ -205,12 +210,18 @@ function liveLine(task) {
 
 function resultLine(task) {
   if (task.status === "completed") {
+    const tests = task.tests;
+    const testsLast = (task.plan?.stages ?? task.stages.map((stage) => stage.kind)).at(-1) === "testing";
+    const testText = tests
+      ? ` · tests ${tests.status}${tests.total !== undefined ? ` (${tests.passed ?? tests.total - (tests.failed ?? 0)}/${tests.total})` : ""}`
+      : "";
     return h(
       "div",
       { class: `task-result ${task.approved ? "ok" : "warn"}` },
-      task.approved ? "✓ Approved" : "Not approved",
+      testsLast ? (task.approved ? "✓ Tests pass" : "Tests failing") : task.approved ? "✓ Approved" : "Not approved",
       task.shortStat ? h("span", { class: "muted" }, ` · ${task.shortStat}`) : null,
-      !task.approved && task.openComments ? h("span", { class: "muted" }, ` · ${task.openComments} open comment(s)`) : null,
+      testText ? h("span", { class: "muted" }, testText) : null,
+      !task.approved && task.openComments ? h("span", { class: "muted" }, ` · ${task.openComments} ${testsLast ? "failure" : "open comment"}(s)`) : null,
     );
   }
   return task.error ? h("div", { class: "task-activity danger ellipsis" }, task.error) : null;

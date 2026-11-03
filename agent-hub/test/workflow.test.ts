@@ -17,6 +17,8 @@ import {
   git,
   steps,
   submitReview,
+  submitPlan,
+  submitTests,
   submitWork,
   TEMPLATES_DIR,
   waitFor,
@@ -745,6 +747,179 @@ describe("legacy tasks", () => {
       assert.equal(fs.existsSync(root), false);
       assert.equal(branchExists(h.repoPath, "agent-hub/t-009-old"), false);
       assert.equal(git(h.repoPath, "worktree", "list").split("\n").length, 1);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("execute & verify", () => {
+  const BUGGY = "export const add = (a, b) => a - b;\n";
+  const FIXED = "export const add = (a, b) => a + b;\n";
+  // Worktrees honor the machine's core.autocrlf, so compare file contents without line-ending differences.
+  const read = (spec: { workingDirectory: string }, file: string) => fs.readFileSync(path.join(spec.workingDirectory, file), "utf8").replace(/\r\n/g, "\n");
+
+  test("the executor runs and triages, the fixer fixes on its own branch, and a re-run verifies the fix", async () => {
+    const h = createHarness(
+      {
+        executor: [
+          steps((spec, prompt) => {
+            assert.match(prompt, /## Run 1: run the test automation and verify the results/);
+            assert.equal(read(spec, "calc.js"), BUGGY, "the executor tests the task branch as it is");
+          }, submitTests(
+            "failed",
+            [{ test: "add adds two numbers", file: "calc.test.js", line: 3, error: "Expected 3, received -1", category: "product-bug", suggestion: "add() subtracts" }],
+            { total: 2, passed: 1, failed: 1 },
+          )),
+          steps((spec, prompt) => {
+            assert.match(prompt, /## Run 2: verify the test fixer's fixes/);
+            assert.match(prompt, /\+export const add = \(a, b\) => a \+ b;/, "the executor sees the fix diff to check its integrity");
+            assert.match(prompt, /\[T1\] \(product-bug\) add adds two numbers\n  -> addressed: Use \+/);
+            assert.equal(read(spec, "calc.js"), FIXED, "the re-run is pinned to the fixer's commit");
+          }, submitTests("passed", [], { total: 2, passed: 2, failed: 0 })),
+        ],
+        fixer: [
+          steps((_spec, prompt) => {
+            assert.match(prompt, /## Round 2: fix the test failures/);
+            assert.match(prompt, /\[T1\] \(product-bug\) add adds two numbers - calc\.test\.js:3/);
+            assert.match(prompt, /Expected 3, received -1/);
+            assert.match(prompt, /Commands the executor ran:\n```\nnpm test/);
+          }, writeFile("calc.js", FIXED), submitWork("Fixed add()", [{ comment_id: "T1", status: "addressed", note: "Use +" }])),
+        ],
+      },
+      { files: { "calc.js": BUGGY, "calc.test.js": "// tests\n" } },
+    );
+    try {
+      const created = await h.runner.submit({ description: "Run the unit tests and fix any failures", kind: "testing", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(task.result?.approved, true);
+      assert.deepEqual(task.result?.tests, { status: "passed", commands: ["npm test"], total: 2, passed: 2, failed: 0, skipped: undefined, logExcerpt: undefined });
+      assert.equal(task.result?.openComments, 0);
+      const [first, second] = task.stages[0]!.rounds;
+      assert.equal(first!.author, undefined, "round 1 is a run only");
+      assert.equal(first!.review!.testRun!.status, "failed");
+      assert.deepEqual(
+        first!.review!.comments.map(({ id, category, test, status, severity }) => ({ id, category, test, status, severity })),
+        [{ id: "T1", category: "product-bug", test: "add adds two numbers", status: "addressed", severity: "blocker" }],
+      );
+      assert.equal(second!.author!.role, "fixer");
+      assert.equal(second!.review!.verdict, "approve");
+      assert.equal(branchHead(h.repoPath, `${task.branch}--fixer`), branchHead(h.repoPath, task.branch!));
+      assert.equal(git(h.repoPath, "show", `${task.branch}:calc.js`), FIXED.trim());
+      assert.deepEqual((task.agents ?? []).map((agent) => agent.role), ["executor", "fixer"]);
+      const [executor] = h.driver.specsFor("executor");
+      const [fixer] = h.driver.specsFor("fixer");
+      assert.equal(executor!.executeOnly, true);
+      assert.equal(executor!.readOnly, false);
+      assert.equal(path.basename(executor!.workingDirectory), "run", "the executor has its own checkout");
+      assert.equal(path.basename(fixer!.workingDirectory), "author");
+      assert.equal(executor!.submit.kind, "test");
+      assert.equal(executor!.model, "fake-reviewer", "the executor verifies with the reviewer model");
+      assert.match(executor!.systemPrompt, /ROLE: TEST EXECUTOR AND VERIFIER/);
+      assert.match(fixer!.systemPrompt, /ROLE: TEST FIXER/);
+      const verdicts = h.store.recentComm({ taskId: task.id }).filter((entry) => entry.kind === "verdict").map((entry) => entry.text);
+      assert.match(verdicts[0]!, /^Failed: 1 of 2 \(1 product-bug\)/);
+      assert.match(verdicts[1]!, /^Passed: 2 tests/);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("stops instead of re-running unchanged code when the fixer can only decline", async () => {
+    const h = createHarness({
+      executor: [submitTests("blocked", [{ test: "Pester tests", error: "Invoke-Pester is not recognized", category: "environment" }])],
+      fixer: [submitWork("Needs Pester", [{ comment_id: "T1", status: "declined", note: "Install the Pester module on the runner" }])],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Run the Pester tests", kind: "testing", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(task.result?.approved, false);
+      assert.equal(task.stages[0]!.status, "not-approved");
+      assert.equal(task.result?.openComments, 1, "declined failures still count as failing");
+      assert.equal(task.result?.tests?.status, "blocked");
+      assert.equal(h.driver.prompts.executor!.length, 1, "no pointless re-run");
+      assert.ok(h.store.recentComm({ taskId: task.id }).some((entry) => /could not fix the remaining 1 failure/.test(entry.text)));
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("manager planning (auto tasks)", () => {
+  test("the manager plans the stages, creates those agents and hands each its assignment", async () => {
+    const h = createHarness(
+      {
+        planner: [
+          steps((spec, prompt) => {
+            assert.equal(spec.readOnly, true);
+            assert.equal(spec.submit.kind, "plan");
+            assert.match(spec.systemPrompt, /You are the MANAGER/);
+            assert.match(prompt, /## Plan this task/);
+            assert.match(prompt, /`npm test`/, "the planner sees the detected test commands");
+          }, submitPlan(["tests", "implementation"], { coding: "Add mul(a, b) to calc.js with a unit test", testing: "Run `npm test`; all tests must pass" })),
+        ],
+        coder: [
+          steps((_spec, prompt) => {
+            assert.match(prompt, /## Manager's assignment for this stage\n\nAdd mul\(a, b\) to calc\.js/);
+          }, writeFile("calc.js", "export const mul = (a, b) => a * b;\n"), submitWork("Added mul()")),
+        ],
+        "code-reviewer": [submitReview("approve")],
+        executor: [
+          steps((_spec, prompt) => {
+            assert.match(prompt, /## Manager's assignment for this stage\n\nRun `npm test`; all tests must pass/);
+            assert.match(prompt, /calc\.js \| 1 \+/, "the executor knows what changed on the task branch");
+          }, submitTests("passed", [], { total: 3 })),
+        ],
+      },
+      { files: { "package.json": JSON.stringify({ scripts: { test: "node --test" } }) } },
+    );
+    try {
+      const created = await h.runner.submit({ description: "Add multiplication support and make sure the tests pass", kind: "auto", repoId: "sample" });
+      assert.deepEqual(h.store.getTask(created.id)!.stages, [], "stages are unknown until the manager plans");
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.deepEqual(task.plan?.stages, ["coding", "testing"], "aliases are normalized and stages ordered");
+      assert.equal(task.plan?.fallback, undefined);
+      assert.deepEqual(task.stages.map((stage) => [stage.kind, stage.status]), [["coding", "approved"], ["testing", "approved"]]);
+      assert.deepEqual((task.agents ?? []).map((agent) => [agent.role, agent.status]), [
+        ["planner", "done"],
+        ["coder", "done"],
+        ["code-reviewer", "done"],
+        ["executor", "done"],
+      ]);
+      assert.equal(task.managerModel, "fake-author", "the manager plans with the author model by default");
+      assert.equal(path.basename(h.driver.specsFor("planner")[0]!.workingDirectory), "review");
+      assert.equal(task.result?.approved, true);
+      assert.match(task.result?.summary ?? "", /\*\*Coding:\*\* Added mul\(\)/);
+      assert.match(task.result?.summary ?? "", /\*\*Execute & verify:\*\* Tests passed/);
+      const comm = h.store.recentComm({ taskId: task.id });
+      assert.ok(comm.some((entry) => entry.kind === "plan" && entry.from === "planner" && /^Plan: Coding → Execute & verify/.test(entry.text)));
+      assert.ok(comm.some((entry) => /^Creating sub-agents: Coder, Code reviewer, Test executor; on demand: Comment resolver, Test fixer$/.test(entry.text)));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("falls back to a keyword plan when the planner never submits one", async () => {
+    const h = createHarness({
+      planner: [() => {}, () => {}, () => {}],
+      writer: [steps((spec, prompt) => writeFile(designPathFrom(prompt), "# API guide\n")(spec, prompt), submitWork("Wrote the guide"))],
+      "doc-reviewer": [submitReview("approve")],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Write documentation for the public API", kind: "auto", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(h.driver.prompts.planner!.length, 3, "the planner was nudged twice");
+      assert.deepEqual(task.plan?.stages, ["document"]);
+      assert.equal(task.plan?.fallback, true);
+      assert.equal(task.result?.approved, true);
     } finally {
       h.cleanup();
     }

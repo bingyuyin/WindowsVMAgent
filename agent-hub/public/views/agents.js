@@ -9,22 +9,24 @@ import {
   ROLE_ICONS,
   ROLE_LABELS,
   roleTag,
-  rolesFor,
+  rolesForTask,
   s,
   setContent,
   STAGE_LABELS,
+  stageOfRole,
   statusInfo,
 } from "../lib/dom.js";
 import { state, subscribe } from "../lib/store.js";
 
 const ACTIVE = ["queued", "running", "needs-input"];
 const PREFS_KEY = "agent-hub.agents-view";
-const AUTHOR = { design: "designer", document: "writer", coding: "coder" };
-const REVIEWER = { design: "design-reviewer", document: "doc-reviewer", coding: "code-reviewer" };
-const RESOLVER = { design: "designer", document: "writer", coding: "resolver" };
-const ROLE_ORDER = ["designer", "design-reviewer", "writer", "doc-reviewer", "coder", "code-reviewer", "resolver"];
+const AUTHOR = { design: "designer", document: "writer", coding: "coder", testing: "fixer" };
+const REVIEWER = { design: "design-reviewer", document: "doc-reviewer", coding: "code-reviewer", testing: "executor" };
+const RESOLVER = { design: "designer", document: "writer", coding: "resolver", testing: "fixer" };
+const ROLE_ORDER = ["planner", "designer", "design-reviewer", "coder", "code-reviewer", "resolver", "executor", "fixer", "writer", "doc-reviewer"];
 const COMM_KINDS = {
   lifecycle: "status",
+  plan: "plan",
   spawn: "start session",
   assign: "assign",
   submit: "submit",
@@ -103,28 +105,38 @@ function agentState(task, role) {
 }
 
 function pendingHint(task, role) {
-  if (!ACTIVE.includes(task.status)) return role === "resolver" ? "approved without comments to resolve" : "not used by this run";
+  if (!ACTIVE.includes(task.status)) {
+    return role === "resolver" ? "approved without comments to resolve" : role === "fixer" ? "tests passed without failures to fix" : "not used by this run";
+  }
+  if (role === "planner") return "plans the task first";
   if (role === "resolver") return "joins if the reviewer requests changes";
+  if (role === "fixer") return "joins if a test run fails";
+  if (role === "executor") return "runs the tests when the stage starts";
   if (REVIEWER[stageOfRole(role)] === role) return "starts after the first submission";
   if (task.kind === "design-coding" && stageOfRole(role) === "coding") return "starts after the design is final";
+  if (task.kind === "auto") return "starts when its stage begins";
   return "starts when the task begins";
 }
 
-function stageOfRole(role) {
-  if (role === "designer" || role === "design-reviewer") return "design";
-  if (role === "writer" || role === "doc-reviewer") return "document";
-  return "coding";
+function modelForRole(task, role) {
+  if (role === "planner") return task.managerModel || task.authorModel;
+  if (REVIEWER[stageOfRole(role)] === role) return task.reviewerModel;
+  if (role === "resolver" || role === "fixer") return task.resolverModel || task.authorModel;
+  return task.authorModel;
 }
 
 function taskLine(task) {
   if (task.status === "queued") return "Queued: waiting for a free slot";
   if (task.status === "needs-input") return "Waiting for your answer";
   if (task.status === "running") {
+    if (task.phase === "planning") return "Manager is planning the sub-agents";
     const budget = task.roundsBudget ?? task.maxRounds;
     return `${phaseLabel(task.currentStage, task.phase)}${task.currentRound ? ` · round ${task.currentRound}/${Math.max(budget, task.currentRound)}` : ""}`;
   }
   if (task.status === "completed") {
     const rounds = task.stages.at(-1)?.rounds.length ?? 0;
+    const testsLast = task.stages.at(-1)?.kind === "testing";
+    if (testsLast) return task.approved ? `Tests pass after ${rounds} run${rounds === 1 ? "" : "s"}` : `Tests failing (${task.openComments ?? 0} failure(s))`;
     return task.approved ? `Approved after ${rounds} round${rounds === 1 ? "" : "s"}` : `Finished without approval (${task.openComments ?? 0} open)`;
   }
   return statusInfo(task).label;
@@ -293,7 +305,14 @@ export function agentsView(root) {
     return JSON.stringify([
       prefs.mode,
       Boolean(state.auth?.authenticated),
-      tasks.map((task) => [task.id, task.status, task.kind, task.approved, (task.agents ?? []).map((agent) => [agent.role, agent.status, agent.model])]),
+      tasks.map((task) => [
+        task.id,
+        task.status,
+        task.kind,
+        task.approved,
+        task.plan?.stages,
+        (task.agents ?? []).map((agent) => [agent.role, agent.status, agent.model]),
+      ]),
     ]);
   }
 
@@ -302,7 +321,7 @@ export function agentsView(root) {
     const groups = [];
     let top = G.pad;
     for (const task of tasks) {
-      const roles = rolesFor(task.kind);
+      const roles = rolesForTask(task);
       const height = roles.length * G.agentH + (roles.length - 1) * G.agentGap;
       groups.push({ task, roles, top, height });
       top += height + G.groupGap;
@@ -472,7 +491,7 @@ export function agentsView(root) {
       s("circle", { class: `node-icon role-${role}`, cx: 28, cy: 26, r: 15 }),
       s("text", { class: `node-icon-text role-${role}`, x: 28, y: 31, "text-anchor": "middle" }, ROLE_ICONS[role]),
       s("text", { class: "node-title", x: 52, y: 23 }, ROLE_LABELS[role]),
-      s("text", { class: "node-sub mono", x: 52, y: 40 }, clip(info.agent?.model ?? (role.endsWith("reviewer") ? task.reviewerModel : task.authorModel), 26)),
+      s("text", { class: "node-sub mono", x: 52, y: 40 }, clip(info.agent?.model ?? modelForRole(task, role), 26)),
       pill(G.agentW - 12, 8, info.label, info.cls),
       heartbeat,
       activity,
@@ -499,7 +518,15 @@ export function agentsView(root) {
       tooltip.textContent = [
         `${ROLE_LABELS[role]} (${task.id}) - ${ROLE_DESCRIPTIONS[role]}`,
         agent?.model ? `Model: ${agent.model}` : null,
-        agent?.branch ? `Branch: ${agent.branch}` : role.endsWith("reviewer") ? "Read-only worktree pinned to the reviewed commit" : null,
+        agent?.branch
+          ? `Branch: ${agent.branch}`
+          : role === "executor"
+            ? "Own checkout pinned to the commit under test (runs commands, cannot edit files)"
+            : role === "planner"
+              ? "Read-only checkout at the base commit"
+              : role.endsWith("reviewer")
+                ? "Read-only worktree pinned to the reviewed commit"
+                : null,
         agent?.assignment ? `Assignment: ${agent.assignment}` : null,
         agent?.lastActivity ? `Last activity: ${agent.lastActivity}` : null,
         comm ? `Last message (${partyLabel(comm.from)} → ${partyLabel(comm.to)}): ${comm.text}` : null,
@@ -582,7 +609,20 @@ export function agentsView(root) {
             h(
               "div",
               { class: "pipe-flow" },
-              h("div", { class: `pipe-step pipe-manager ${state.auth?.authenticated ? "st-working" : "st-stopped"}`, title: "The manager assigns each round, relays results between the agents and monitors them" }, h("span", { class: "pipe-icon" }, "◆"), h("div", {}, h("div", { class: "pipe-role" }, "Manager"), h("div", { class: "pipe-sub" }, "assigns · relays"))),
+              h(
+                "div",
+                { class: `pipe-step pipe-manager ${state.auth?.authenticated ? "st-working" : "st-stopped"}`, title: "The manager plans Auto tasks, assigns each round, relays results between the agents and monitors them" },
+                h("span", { class: "pipe-icon" }, "◆"),
+                h(
+                  "div",
+                  {},
+                  h("div", { class: "pipe-role" }, "Manager"),
+                  h("div", { class: "pipe-sub" }, task.kind === "auto" ? (task.plan ? "planned · assigns" : task.phase === "planning" ? "planning…" : "plans first") : "assigns · relays"),
+                ),
+              ),
+              !task.stages.length
+                ? [h("span", { class: "pipe-arrow pipe-arrow-stage" }, "→"), h("div", { class: "pipe-lane current" }, h("div", { class: "pipe-lane-head" }, h("span", {}, "Planning"), h("span", { class: "muted small" }, "agents are created from the plan")))]
+                : null,
               task.stages.map((stage, index) => [h("span", { class: "pipe-arrow pipe-arrow-stage" }, index ? "⇒" : "→"), stageLane(task, stage)]),
             ),
           );
@@ -592,32 +632,62 @@ export function agentsView(root) {
   }
 
   function stageLane(task, stage) {
+    const testing = stage.kind === "testing";
     const author = AUTHOR[stage.kind];
     const reviewer = REVIEWER[stage.kind];
     const resolver = RESOLVER[stage.kind];
-    const roles = resolver === author ? [author, reviewer] : [author, reviewer, resolver];
+    // Testing starts with a run; the fixer loops back into the next run.
+    const roles = testing ? [reviewer, author] : resolver === author ? [author, reviewer] : [author, reviewer, resolver];
     const current = ACTIVE.includes(task.status) && task.currentStage === stage.kind;
     const budget = task.roundsBudget ?? task.maxRounds;
     const rounds = stage.rounds ?? [];
+    const noun = testing ? "run" : "round";
     return h(
       "div",
       { class: `pipe-lane ${current ? "current" : ""} lane-${stage.status}` },
-      h("div", { class: "pipe-lane-head" }, h("span", {}, `${STAGE_LABELS[stage.kind]} stage`), h("span", { class: "muted small" }, stage.status === "pending" ? "pending" : stage.status.replace("-", " "))),
+      h(
+        "div",
+        { class: "pipe-lane-head" },
+        h("span", {}, `${STAGE_LABELS[stage.kind]} stage`),
+        h(
+          "span",
+          { class: "muted small" },
+          stage.status === "pending"
+            ? "pending"
+            : testing && stage.status === "approved"
+              ? "tests pass"
+              : testing && stage.status === "not-approved"
+                ? "tests failing"
+                : stage.status.replace("-", " "),
+        ),
+      ),
       h(
         "div",
         { class: "pipe-steps" },
-        roles.map((role, index) => [index ? h("span", { class: "pipe-arrow" }, index === 2 ? "↺" : "→") : null, pipeStep(task, role)]),
+        roles.map((role, index) => [index ? h("span", { class: "pipe-arrow" }, index === 2 || testing ? "↺" : "→") : null, pipeStep(task, role)]),
       ),
       h(
         "div",
         { class: "pipe-loop" },
-        h("span", { class: "muted small" }, rounds.length ? `round ${rounds.length} of ${Math.max(budget, rounds.length)}` : `up to ${budget} round${budget === 1 ? "" : "s"}`),
+        h("span", { class: "muted small" }, rounds.length ? `${noun} ${rounds.length} of ${Math.max(budget, rounds.length)}` : `up to ${budget} ${noun}${budget === 1 ? "" : "s"}`),
         rounds.map((round) =>
           h(
             "span",
             {
               class: `round-dot ${round.verdict === "approve" ? "ok" : round.verdict === "request_changes" ? "changes" : "open"}`,
-              title: `Round ${round.n}: ${round.verdict === "approve" ? "approved" : round.verdict === "request_changes" ? `${round.comments} comment(s)` : "in progress"}`,
+              title: `Round ${round.n}: ${
+                round.verdict === "approve"
+                  ? testing
+                    ? "tests passed"
+                    : "approved"
+                  : round.verdict === "request_changes"
+                    ? testing
+                      ? round.testStatus === "blocked"
+                        ? "blocked"
+                        : `${round.comments} failure(s)`
+                      : `${round.comments} comment(s)`
+                    : "in progress"
+              }`,
             },
             round.verdict === "approve" ? "✓" : round.verdict === "request_changes" ? String(round.comments) : "…",
           ),
@@ -648,7 +718,7 @@ export function agentsView(root) {
 
   function renderRoster(tasks) {
     const rows = ROLE_ORDER.map((role) => {
-      const entries = tasks.filter((task) => rolesFor(task.kind).includes(role)).map((task) => ({ task, info: agentState(task, role) }));
+      const entries = tasks.filter((task) => rolesForTask(task).includes(role)).map((task) => ({ task, info: agentState(task, role) }));
       return { role, entries };
     }).filter((row) => row.entries.length);
     if (!rows.length) {
