@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Copilot Agent Hub</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#/tasks"><span class="brand-mark" aria-hidden="true">◆</span> Copilot Agent Hub</a>
+      <nav id="nav" class="nav" hidden>
+        <a href="#/tasks" data-nav="tasks">Tasks</a>
+        <a href="#/repos" data-nav="repos">Repositories</a>
+        <a href="#/settings" data-nav="settings">Settings</a>
+      </nav>
+      <div id="account" class="account"></div>
+    </header>
+    <main id="app" class="container"></main>
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+  </body>
+</html>

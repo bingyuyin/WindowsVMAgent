@@ -1,0 +1,27 @@
+{
+  "name": "copilot-agent-hub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local web service that orchestrates GitHub Copilot SDK author/reviewer agents for coding and design tasks",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "dev": "node --watch src/main.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "^1.0.28"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  },
+  "overrides": {
+    "zod": "^4.6.7"
+  }
+}
