@@ -128,6 +128,8 @@ interface UnitTestRun {
   durationMs: number;
   exitCode: number | null;
   stopped?: UnitTestCheck["stopped"];
+  /** Commands that failed once and passed when run again. */
+  flaky?: string[];
 }
 
 const MAX_SUBMIT_NUDGES = 2;
@@ -874,9 +876,10 @@ export class WorkflowEngine {
       this.throwIfAborted();
       const report = current.input.unit_tests;
       const counts = { total: report?.total, passed: report?.passed, failed: report?.failed, skipped: report?.skipped };
+      const unrelated = report?.unrelated_failures?.length ? { unrelatedFailures: report.unrelated_failures } : {};
       if (report?.status === "blocked") {
         hooks.emit({ type: "warning", role, text: `${label} reports that the unit tests cannot pass (${truncate(report.reason ?? "", 400)}); the reviewer weighs the reason.` });
-        return { submission: current, unitTests: { status: "blocked", commands: report.commands, ...counts, reason: report.reason, fixAttempts: attempt } };
+        return { submission: current, unitTests: { status: "blocked", commands: report.commands, ...counts, ...unrelated, reason: report.reason, fixAttempts: attempt } };
       }
       const commands = report?.commands.length ? report.commands : this.knownUnitTestCommands(stage);
       if (!commands.length) {
@@ -891,8 +894,10 @@ export class WorkflowEngine {
         status: run.passed ? "passed" : "failed",
         commands,
         ...counts,
+        ...unrelated,
         verified: run.passed,
         fixAttempts: attempt,
+        ...(run.flaky?.length ? { flaky: run.flaky } : {}),
         exitCode: run.exitCode,
         durationMs: run.durationMs,
         stopped: run.stopped,
@@ -900,7 +905,8 @@ export class WorkflowEngine {
       };
       const list = commands.map((command) => `\`${command}\``).join(", ");
       if (run.passed) {
-        hooks.emit({ type: "info", text: `Unit tests pass: ${list} (${Math.round(run.durationMs / 1000)} s). Round ${round.n} goes to review.` });
+        const left = report?.unrelated_failures?.length ? `; ${plural(report.unrelated_failures.length, "failing test")} unrelated to the change left for their owners` : "";
+        hooks.emit({ type: "info", text: `Unit tests pass: ${list} (${Math.round(run.durationMs / 1000)} s)${left}. Round ${round.n} goes to review.` });
         hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", text: `Unit tests pass for round ${round.n} (${commands.join(", ")}); handing it to the reviewer` });
         return { submission: current, unitTests };
       }
@@ -963,25 +969,49 @@ export class WorkflowEngine {
     const runCommand = this.options.runCommand ?? runShellCommand;
     // A temp folder per task, emptied before every run, so leftovers of other tasks' runs cannot affect this one.
     const tempDir = path.join(workspace.root, "tmp");
-    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
-    await fsp.mkdir(tempDir, { recursive: true });
+    const freshTempDir = async () => {
+      await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+      await fsp.mkdir(tempDir, { recursive: true });
+    };
+    await freshTempDir();
     const env = testRunEnv(ws.path, tempDir);
     const before = await ws.changedPaths();
+    const discarded = new Set<string>();
+    const flaky: string[] = [];
     let durationMs = 0;
+    const run = async (command: string) => {
+      const result = await runCommand(command, {
+        cwd: ws.path,
+        timeoutMs: settings.turnTimeoutMinutes * 60_000,
+        silenceMs: settings.stuckAgentMinutes * 60_000,
+        signal: hooks.signal,
+        env,
+      });
+      durationMs += result.durationMs;
+      return result;
+    };
     try {
       for (const command of commands) {
         // The hub runs what the agent reported, so the agent's own command restrictions (no push, no global installs) apply.
         const policy = evaluatePermission({ kind: "shell", fullCommandText: command }, { readOnly: false, workingDirectory: ws.path });
-        if (policy.kind === "reject") return { passed: false, command, problem: `was not run: ${policy.feedback}`, output: "", durationMs, exitCode: null };
+        if (policy.kind === "reject") return { passed: false, command, problem: `was not run: ${policy.feedback}`, output: "", durationMs, exitCode: null, flaky };
         hooks.emit({ type: "info", text: `Running the unit tests to verify them before review: ${command}` });
-        const result = await runCommand(command, {
-          cwd: ws.path,
-          timeoutMs: settings.turnTimeoutMinutes * 60_000,
-          silenceMs: settings.stuckAgentMinutes * 60_000,
-          signal: hooks.signal,
-          env,
-        });
-        durationMs += result.durationMs;
+        let result = await run(command);
+        let again = false;
+        if (!result.stopped && result.exitCode !== 0) {
+          // Flaky tests must not send the agent into fix cycles: run the command once more from a clean state first.
+          hooks.emit({ type: "info", text: `\`${command}\` exited with code ${result.exitCode}; running it again to rule out a flaky test.` });
+          for (const file of await ws.discardChangesSince(before)) discarded.add(file);
+          await freshTempDir();
+          const retry = await run(command);
+          if (!retry.stopped && retry.exitCode === 0) {
+            flaky.push(command);
+            hooks.emit({ type: "warning", text: `\`${command}\` passed when run again: a flaky test, so it is not sent back to the agent. The reviewer is told.` });
+            continue;
+          }
+          result = retry;
+          again = true;
+        }
         if (result.stopped || result.exitCode !== 0) {
           const problem =
             result.stopped === "silent"
@@ -990,14 +1020,14 @@ export class WorkflowEngine {
                 ? `ran longer than ${settings.turnTimeoutMinutes} min and was stopped`
                 : result.stopped === "cancelled"
                   ? "was cancelled"
-                  : `exited with code ${result.exitCode} after ${Math.round(result.durationMs / 1000)} s`;
-          return { passed: false, command, problem, output: result.output, durationMs, exitCode: result.exitCode, stopped: result.stopped };
+                  : `exited with code ${result.exitCode} after ${Math.round(result.durationMs / 1000)} s${again ? ", twice in a row" : ""}`;
+          return { passed: false, command, problem, output: result.output, durationMs, exitCode: result.exitCode, stopped: result.stopped, flaky };
         }
       }
-      return { passed: true, command: commands.at(-1)!, problem: "", output: "", durationMs, exitCode: 0 };
+      return { passed: true, command: commands.at(-1)!, problem: "", output: "", durationMs, exitCode: 0, flaky };
     } finally {
-      const discarded = await ws.discardChangesSince(before);
-      if (discarded.length) hooks.emit({ type: "info", text: `Discarded ${discarded.length} file(s) the test run created or changed: ${truncate(discarded.join(", "), 300)}` });
+      for (const file of await ws.discardChangesSince(before)) discarded.add(file);
+      if (discarded.size) hooks.emit({ type: "info", text: `Discarded ${discarded.size} file(s) the test run created or changed: ${truncate([...discarded].join(", "), 300)}` });
     }
   }
 
@@ -1049,6 +1079,7 @@ export class WorkflowEngine {
       failed: input.failed,
       skipped: input.skipped,
       logExcerpt: input.log_excerpt,
+      ...(input.unrelated_failures?.length ? { unrelatedFailures: input.unrelated_failures } : {}),
     };
     return {
       verdict: input.status === "passed" ? "approve" : "request_changes",
@@ -1459,14 +1490,17 @@ function stageSummary(stage: Stage): string {
 
 /** "Passed: 12 tests" / "Failed: 2 of 12 (1 product-bug, 1 test-bug)" / "Blocked: ...". */
 export function describeTestRun(run: TestRunInfo, failures: readonly ReviewComment[]): string {
-  if (run.status === "passed") return `Passed${run.total !== undefined ? `: ${run.total} test${run.total === 1 ? "" : "s"}` : ""}${run.skipped ? `, ${run.skipped} skipped` : ""}`;
+  const left = run.unrelatedFailures?.length ? `; ${plural(run.unrelatedFailures.length, "unrelated failure")} left for their owners` : "";
+  if (run.status === "passed") return `Passed${run.total !== undefined ? `: ${run.total} test${run.total === 1 ? "" : "s"}` : ""}${run.skipped ? `, ${run.skipped} skipped` : ""}${left}`;
   const counts = new Map<string, number>();
   for (const failure of failures) counts.set(failure.category ?? "unknown", (counts.get(failure.category ?? "unknown") ?? 0) + 1);
   const breakdown = [...counts].map(([category, count]) => `${count} ${category}`).join(", ");
   if (run.status === "blocked") return `Blocked: ${truncate(failures[0]?.test ?? "the automation could not run", 120)}`;
   const failed = run.failed ?? failures.length;
-  return `Failed: ${failed}${run.total !== undefined ? ` of ${run.total}` : ""} (${breakdown})`;
+  return `Failed: ${failed}${run.total !== undefined ? ` of ${run.total}` : ""} (${breakdown})${left}`;
 }
+
+const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`;
 
 function describeComments(comments: readonly ReviewComment[]): string {
   if (!comments.length) return "no specific comments";

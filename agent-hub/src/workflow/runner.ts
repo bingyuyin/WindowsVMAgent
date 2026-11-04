@@ -1068,6 +1068,11 @@ export function pullRequestBody(task: Task): string {
         `**Unit tests:** ${result.unitTests.status}${result.unitTests.verified ? ", re-run by the hub before the review" : ""}${commands ? ` · ${commands}` : ""}`,
       );
     }
+    const unrelated = [...(result.unitTests?.unrelatedFailures ?? []), ...(result.tests?.unrelatedFailures ?? [])];
+    if (unrelated.length) {
+      const names = [...new Set(unrelated.map((failure) => `\`${failure.test}\``))];
+      lines.push(`**Failing tests unrelated to this change** (not fixed here): ${names.slice(0, 5).join(", ")}${names.length > 5 ? `, … (${names.length - 5} more)` : ""}`);
+    }
   }
   const agents = (task.agents ?? []).filter((agent) => agent.turns > 0);
   if (agents.length) lines.push(`**Agents:** ${agents.map((agent) => `${ROLE_LABELS[agent.role]} (${agent.model})`).join(", ")}`);

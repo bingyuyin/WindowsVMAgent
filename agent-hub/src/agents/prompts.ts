@@ -116,7 +116,13 @@ const USER_REQUESTS_REVIEWER =
 
 /** How coding agents finish a round: their unit tests must pass, and the manager re-runs them before the review. */
 const UNIT_TEST_GATE =
-  "Run the unit tests and iterate until they all pass, then report them in `unit_tests` (status and the exact commands): the manager re-runs those commands before the review and sends any failure back to you.";
+  "Run the unit tests that cover your change and iterate until they pass, then report them in `unit_tests` (status and the exact commands): the manager re-runs those commands before the review and sends any failure back to you. Failing tests unrelated to your change are not yours to fix: list them in `unit_tests.unrelated_failures`.";
+
+/** Coding agents change only what the request needs; failing tests it has nothing to do with belong to their owners. */
+const STAY_IN_SCOPE = [
+  "- Stay within the request: change only the code, tests and docs it needs. Do not refactor, reformat, rename or tidy up unrelated code, and do not touch unrelated tests.",
+  "- A failing test that has nothing to do with your change is not yours to fix: it fails without your change too, or it is flaky, in code and tests you did not touch. Do not fix, skip, delete or keep re-running it. Leave it for its owners, list it in `unit_tests.unrelated_failures` with the reason, and report commands that cover your change without it (a test file, project or filter).",
+];
 
 export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: string[] = [], options: SystemPromptOptions = {}): string {
   const intro =
@@ -185,8 +191,9 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- Work only inside the working directory. Follow the repository's conventions, architecture and instruction files.",
         ...skillsLine(skills),
         "- Make focused, complete changes and update directly related documentation.",
+        ...STAY_IN_SCOPE,
         "- Unit tests are part of the change: add or update unit tests for the new or changed behavior (main path, edge cases, failure modes) with the repository's test framework and conventions.",
-        "- Before submitting, run the build, linters and unit tests (install dependencies if needed) and fix every failure until all unit tests pass. Report the exact unit test commands in `unit_tests`: the manager re-runs them before the review and sends failures back to you, so a round only reaches the reviewer with passing tests.",
+        "- Before submitting, run the build, linters and unit tests (install dependencies if needed) and fix every failure your change causes until the tests that cover it pass. Report the exact unit test commands in `unit_tests`: the manager re-runs them before the review and sends failures back to you, so a round only reaches the reviewer with passing tests.",
         "- Do not leave temporary files, logs or build outputs in the tree unless they belong in the repository.",
         "- Finish by calling the `submit_work` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
@@ -198,8 +205,9 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- Start by understanding the change so far: read the diff against the base commit and the files the comments refer to.",
         ...skillsLine(skills),
         "- Address every comment ID: fix the code at the root cause (preferred) or decline with a concrete technical justification. Keep fixes focused; do not rewrite unrelated code.",
+        ...STAY_IN_SCOPE,
         USER_REQUESTS_AUTHOR,
-        "- Add or adjust unit tests for behavioral fixes, then run the build and the unit tests again until they all pass, and report them in `unit_tests` (the manager re-runs them before the next review).",
+        "- Add or adjust unit tests for behavioral fixes, then run the build and the unit tests again until the tests that cover the change pass, and report them in `unit_tests` (the manager re-runs them before the next review).",
         "- Finish every round by calling the `submit_work` tool exactly once, with a response for every open comment ID. Never end your turn without calling it.",
       ].join("\n");
     case "code-reviewer":
@@ -210,6 +218,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         ...skillsLine(skills),
         "- Do not comment on pure formatting or style unless it violates repository conventions. Prefer a few high-signal comments over many trivial ones.",
         "- The manager re-runs the author's unit tests before every review and tells you the result. Check that the change (and the fixes for your comments) is covered by meaningful unit tests, and request them where they are missing. Never approve while the unit tests fail.",
+        "- Review the requested change only. Do not ask for changes to unrelated code, and do not ask the author to fix failing or flaky tests unrelated to the change (the author lists them as unrelated failures) unless the change actually causes them. Do flag edits outside the request (unrelated refactoring or reformatting, changed or skipped unrelated tests) and ask to revert them.",
         "- Each comment: file and line when applicable, a clear description of the problem and the expected fix. Severities: blocker, major, minor, nit.",
         "- Approve when no blocker or major issues remain.",
         "- On re-review, verify each previous comment was addressed by inspecting the new changes, accept reasonable declines, and raise new issues only if they are significant.",
@@ -227,9 +236,10 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- Verify instead of trusting exit codes: read the runner's output, check that the expected tests were actually discovered and executed (zero tests run is a failure), and notice skipped/ignored tests, crashes, timeouts and errors outside test bodies.",
         "- For every failure record the full test name, file/line, the key error (assertion with expected vs actual, exception and the relevant stack lines) and a category: product-bug, test-bug, environment, flaky or integrity. Read the test and the code under test to suggest where the root cause most likely is.",
         "- Suspected flaky test: re-run just that test up to two times; report it as flaky only if the result changes.",
+        `- Failures the requested change has nothing to do with - they fail without it too, or they are flaky, in code and tests the change does not touch (compare with git diff ${short(env.baseSha)}..HEAD) - go in \`unrelated_failures\` with the reason, not in \`failures\`: they are reported to the user and left for their owners, so the fixer does not change unrelated code. When the request itself is to run and fix the tests, every failure in the requested tests is related.`,
         "- After a fix round, inspect the fixer's diff: report an `integrity` failure for any change that makes tests pass without fixing the cause (deleted or skipped tests, weakened or removed assertions, swallowed exceptions, hard-coded results, expectations changed to match a bug) unless the fixer's justification is convincing.",
         "- When the user requested changes after the task finished (IDs U1, U2, ...), verify they were carried out; changes the user explicitly asked for are not integrity problems.",
-        "- status: passed only when everything requested ran and passed with no integrity problems; blocked when the automation cannot run at all (say exactly what is missing); failed otherwise.",
+        "- status: passed when everything requested ran and no failure related to the request and no integrity problem remains (unrelated failures may be listed); blocked when the automation cannot run at all (say exactly what is missing); failed otherwise.",
         ...skillsLine(skills),
         "- Finish EVERY run by calling the `submit_test_results` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
@@ -241,7 +251,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- Start from the evidence: read each failure's error, the failing test, the code under test and the request (and design, if any). Reproduce a failure locally before changing code when that is practical.",
         "- Decide what is wrong. Fix the product code when its behavior is wrong (product-bug). Change a test only when the test itself is wrong - an expectation that contradicts the specification, a brittle timing assumption, broken setup - and explain why in your response.",
         "- Never make tests pass by deleting or skipping them, weakening or removing assertions, catching and ignoring errors, or hard-coding results. The executor inspects your diff and reports such changes as integrity failures.",
-        "- Keep fixes focused on the failures; follow the repository's conventions. Run the previously failing tests (and closely related ones) before submitting, and report exactly what you ran and the results in `validation`.",
+        "- Fix only the listed failures, following the repository's conventions; do not change unrelated code or tests, even ones that fail. Run the previously failing tests (and closely related ones) before submitting, and report exactly what you ran and the results in `validation`.",
         "- A failure you cannot fix in code (environment, missing credential or service): decline it with a precise description of what is needed.",
         USER_REQUESTS_AUTHOR,
         ...skillsLine(skills),
@@ -262,7 +272,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "Rules:",
         "- You are read-only: never create, modify or delete files and never run commands with side effects. Inspect the repository with view/grep/glob and read-only git commands.",
         "- Choose the smallest set of stages that fully covers the request. Do not add design or documentation the request does not need; do add testing when the request asks to verify behavior or when code changes and runnable tests exist.",
-        "- For each chosen stage write a concrete assignment: what to do, scope (files, areas), acceptance criteria, for coding the unit test commands that must pass before each review, and for testing the exact commands or suites to run (verify they exist in the repository).",
+        "- For each chosen stage write a concrete assignment: what to do, scope (files, areas), acceptance criteria, for coding the unit test commands that cover the change and must pass before each review, and for testing the exact commands or suites to run (verify they exist in the repository).",
         "- Write a `briefing` that every sub-agent starts with, so none of them has to rediscover the repository: the architecture and the modules/files relevant to this request, the conventions to follow, how to build and test (commands you verified), and pitfalls. Make it specific to this request; the agents already get the repository context and best-practice skills.",
         "- Be quick: a few minutes of targeted inspection is enough. Finish by calling the `submit_plan` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
@@ -574,13 +584,23 @@ export function reviewPrompt(input: ReviewPromptInput): string {
 function unitTestsBlock(check: UnitTestCheck): string {
   const commands = check.commands.map((command) => `\`${command}\``).join(", ");
   const counts = check.total !== undefined ? ` (the author reported ${check.total} tests${check.failed ? `, ${check.failed} failed` : ""})` : "";
+  const notes = [
+    ...(check.flaky?.length ? [`Flaky: ${check.flaky.map((command) => `\`${command}\``).join(", ")} failed once and passed when the manager ran it again.`] : []),
+    ...(check.unrelatedFailures?.length
+      ? [
+          "Failing tests the author reports as unrelated to the change (left for their owners, not part of this task; request changes only if the change actually causes one):",
+          ...check.unrelatedFailures.map((failure) => `- ${failure.test}: ${failure.reason}`),
+        ]
+      : []),
+  ];
   switch (check.status) {
     case "passed":
-      return `Unit tests: all pass. The manager re-ran ${commands} in the author's worktree before this review${counts}.`;
+      return [`Unit tests: all pass. The manager re-ran ${commands} in the author's worktree before this review${counts}.`, ...notes].join("\n");
     case "blocked":
       return [
         `Unit tests: NOT PASSING - the author reports they cannot run or pass: ${check.reason ?? "(no reason given)"}`,
         "Check that reason against the code (and the base commit when it claims pre-existing failures). Request changes with a blocker comment if the tests should be able to pass.",
+        ...notes,
       ].join("\n");
     default:
       return [
@@ -589,6 +609,7 @@ function unitTestsBlock(check: UnitTestCheck): string {
           : `Unit tests: NOT VERIFIED - ${check.reason ?? "the author did not report its unit tests"}.`,
         ...(check.logExcerpt ? ["Output excerpt:", "```", truncate(check.logExcerpt, 4000), "```"] : []),
         "You cannot approve this round: request changes with a blocker comment about the unit tests.",
+        ...notes,
       ].join("\n");
   }
 }
@@ -630,7 +651,7 @@ export function executionPrompt(input: ExecutionPromptInput): string {
     parts.push(
       "",
       "Run the test automation the request asks for (set it up first if needed), verify the results and triage every failure.",
-      "Then call `submit_test_results` with the status, the exact commands, the counts and one entry per failure.",
+      "Then call `submit_test_results` with the status, the exact commands, the counts and one entry per failure (failures unrelated to the requested change go in `unrelated_failures`).",
     );
     return parts.join("\n");
   }
@@ -671,7 +692,7 @@ export function executionPrompt(input: ExecutionPromptInput): string {
           "Changes the user explicitly asked for are not integrity problems. If a requested change was not carried out, report it as a failure (category `unknown`) that names the request ID.",
         ]
       : []),
-    "Then call `submit_test_results` with the status, the exact commands, the counts and one entry per remaining failure.",
+    "Then call `submit_test_results` with the status, the exact commands, the counts and one entry per remaining failure (failures unrelated to the requested change go in `unrelated_failures`).",
   );
   return parts.join("\n");
 }
@@ -693,13 +714,15 @@ export function plannerPrompt(task: Task, context: RepoContext | undefined): str
 /** The manager re-ran the author's unit tests before the review and they failed: hand them back to be fixed. */
 export function unitTestFailurePrompt(failure: { command: string; problem: string; output: string }, attempt: number, maxAttempts: number): string {
   return [
-    "## The unit tests fail: fix them before the review",
+    "## The unit tests fail: resolve this before the review",
     "",
     `Before handing your round to the reviewer, the manager re-ran your unit tests in your working directory: \`${failure.command}\` ${failure.problem}.`,
     ...(failure.output.trim() ? ["", "Output (last lines):", "```", truncate(failure.output.trim(), 6000), "```"] : []),
     "",
-    "Fix the cause - in the code, or in a test that is itself wrong (say why) - and run the unit tests until they all pass. Never skip, delete or weaken tests to make them pass.",
-    "Then call `submit_work` again with `unit_tests` and a short summary of what you fixed (comment responses you already gave need not be repeated). If the tests cannot pass for a reason outside your change, report status `blocked` with the reason.",
+    "First decide whether your change causes the failure:",
+    "- It does (including tests you added or changed): fix the cause - in the code, or in a test that is itself wrong (say why) - and run the tests again. Never skip, delete or weaken tests to make them pass.",
+    "- It does not (it fails without your change too, or it is flaky, in code and tests you did not touch): leave it alone, it is for its owners to fix. Report commands that cover your change without it (a test file, project or filter) and list it in `unit_tests.unrelated_failures` with the reason.",
+    "Then call `submit_work` again with `unit_tests` and a short summary of what you did (comment responses you already gave need not be repeated). If the tests that cover your change cannot run at all, report status `blocked` with the reason.",
     `This is fix attempt ${attempt} of ${maxAttempts}; after that the round goes to the reviewer with the failing tests.`,
   ].join("\n");
 }

@@ -1,5 +1,5 @@
 import type { PlanSubmissionInput, ReviewSubmissionInput, TestRunSubmissionInput, UnitTestsInput, WorkSubmissionInput } from "../agents/driver.ts";
-import { FAILURE_CATEGORIES, SEVERITIES, STAGE_ORDER, type FailureCategory, type Severity, type StageKind, type TestStatus, type Verdict } from "../types.ts";
+import { FAILURE_CATEGORIES, SEVERITIES, STAGE_ORDER, type FailureCategory, type Severity, type StageKind, type TestStatus, type UnrelatedFailure, type Verdict } from "../types.ts";
 import { truncate } from "../util.ts";
 
 /**
@@ -112,7 +112,7 @@ export function normalizeUnitTests(input: unknown): UnitTestsInput {
   const status = normalizeTestStatus(raw.status);
   if (status === "failed") {
     throw new Error(
-      "The unit tests still fail. Fix the cause (in the code, or in a test that is itself wrong) and run them until they all pass, then submit again. If they cannot pass for a reason outside your change, report status blocked with the reason.",
+      "The unit tests still fail. Fix the cause when your change causes the failure (in the code, or in a test that is itself wrong) and run them until they pass. A failure unrelated to your change (it fails without your change too, or it is flaky, in code you did not touch) is not yours to fix: leave it alone, report commands that cover your change without it and list it in `unit_tests.unrelated_failures` with status passed.",
     );
   }
   if (raw.commands !== undefined && !Array.isArray(raw.commands)) throw new Error("`unit_tests.commands` must be an array of strings.");
@@ -127,14 +127,32 @@ export function normalizeUnitTests(input: unknown): UnitTestsInput {
   const failed = count(raw.failed, "unit_tests.failed");
   const skipped = count(raw.skipped, "unit_tests.skipped");
   const reason = typeof raw.reason === "string" && raw.reason.trim() ? truncate(raw.reason.trim(), 2000) : undefined;
+  const unrelated = normalizeUnrelatedFailures(raw.unrelated_failures, "unit_tests.unrelated_failures");
   if (status === "passed") {
     if (!commands.length) throw new Error("`unit_tests.commands` is required: list the exact unit test commands you ran; the manager re-runs them before the review.");
-    if (failed) throw new Error("`unit_tests.failed` is greater than 0, so the unit tests do not pass yet. Fix them and run them again before submitting.");
+    if (failed && !unrelated.length) {
+      throw new Error(
+        "`unit_tests.failed` is greater than 0, so tests still fail. Fix the ones your change causes; list failures unrelated to your change in `unit_tests.unrelated_failures` and leave them out of your commands.",
+      );
+    }
     if (total === 0) throw new Error("No unit tests ran (total is 0). Run the tests that cover your change, or report status blocked with the reason.");
   } else if (!reason) {
     throw new Error("`unit_tests.reason` is required when status is blocked: say what prevents the tests from running or passing.");
   }
-  return { status, commands, total, passed, failed, skipped, reason };
+  return { status, commands, total, passed, failed, skipped, reason, ...(unrelated.length ? { unrelated_failures: unrelated } : {}) };
+}
+
+function normalizeUnrelatedFailures(value: unknown, key: string): UnrelatedFailure[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error(`\`${key}\` must be an array.`);
+  return value.slice(0, 30).map((item, index) => {
+    const entry = (item ?? {}) as Record<string, unknown>;
+    const test = typeof entry.test === "string" ? entry.test.trim() : "";
+    const reason = typeof entry.reason === "string" ? entry.reason.trim() : "";
+    if (!test) throw new Error(`${key}[${index}].test is required: name the failing test.`);
+    if (!reason) throw new Error(`${key}[${index}].reason is required: say why the failure is unrelated to the requested change.`);
+    return { test: truncate(test, 400), reason: truncate(reason, 1000) };
+  });
 }
 
 /** A resubmission after the manager sent failing unit tests back: the new report wins, earlier comment responses stay unless revised. */
@@ -263,21 +281,37 @@ export function normalizeTestRun(input: unknown): TestRunSubmissionInput {
   const passed = count(raw.passed, "passed");
   const failed = count(raw.failed, "failed");
   const skipped = count(raw.skipped, "skipped");
+  const unrelated = normalizeUnrelatedFailures(raw.unrelated_failures, "unrelated_failures");
   if (status === "passed") {
     if (failures.length) {
-      throw new Error("status is passed but failures are listed. Use status failed, or remove entries that are not failures.");
+      throw new Error(
+        "status is passed but failures are listed. Use status failed, move failures unrelated to the request to `unrelated_failures`, or remove entries that are not failures.",
+      );
     }
     if (total === 0) {
       throw new Error(
         "No tests ran (total is 0). A run without tests cannot pass: find and run the requested tests, or report status blocked with the reason.",
       );
     }
-    if (failed) throw new Error("status is passed but `failed` is greater than 0. Use status failed and list each failure.");
+    if (failed && !unrelated.length) {
+      throw new Error("status is passed but `failed` is greater than 0. Use status failed and list each failure (failures unrelated to the request go in `unrelated_failures`).");
+    }
   } else if (!failures.length) {
     throw new Error(`status ${status} requires at least one entry in \`failures\` describing what failed or what blocked the run.`);
   }
   const logExcerpt = typeof raw.log_excerpt === "string" && raw.log_excerpt.trim() ? truncate(raw.log_excerpt.trim(), 6000) : undefined;
-  return { status, summary: truncate(summary, 8000), commands, total, passed, failed, skipped, failures, log_excerpt: logExcerpt };
+  return {
+    status,
+    summary: truncate(summary, 8000),
+    commands,
+    total,
+    passed,
+    failed,
+    skipped,
+    failures,
+    ...(unrelated.length ? { unrelated_failures: unrelated } : {}),
+    log_excerpt: logExcerpt,
+  };
 }
 
 /** When the executor never called submit_test_results: treat the run as blocked so nothing is reported as passing. */

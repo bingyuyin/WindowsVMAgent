@@ -1,4 +1,4 @@
-import type { AgentRole, FailureCategory, Severity, StageKind, TestStatus, Verdict } from "../types.ts";
+import type { AgentRole, FailureCategory, Severity, StageKind, TestStatus, UnrelatedFailure, Verdict } from "../types.ts";
 
 /** Arguments of the `submit_work` tool called by author agents (designer / writer / coder / resolver / fixer). */
 export interface WorkSubmissionInput {
@@ -17,6 +17,7 @@ export interface UnitTestsInput {
   failed?: number;
   skipped?: number;
   reason?: string;
+  unrelated_failures?: UnrelatedFailure[];
 }
 
 /** Arguments of the `submit_review` tool called by reviewer agents. */
@@ -36,6 +37,7 @@ export interface TestRunSubmissionInput {
   failed?: number;
   skipped?: number;
   failures: Array<{ test: string; file?: string; line?: number; error: string; category: FailureCategory; suggestion?: string }>;
+  unrelated_failures?: UnrelatedFailure[];
   log_excerpt?: string;
 }
 

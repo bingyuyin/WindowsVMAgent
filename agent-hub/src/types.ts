@@ -142,6 +142,14 @@ export interface TestRunInfo {
   skipped?: number;
   /** Relevant output (failure messages, summary lines). */
   logExcerpt?: string;
+  /** Failing tests the requested change has nothing to do with: reported, and left for their owners to fix. */
+  unrelatedFailures?: UnrelatedFailure[];
+}
+
+export interface UnrelatedFailure {
+  test: string;
+  /** Why it is unrelated, e.g. it fails without the change too, or it is flaky in code the change does not touch. */
+  reason: string;
 }
 
 /**
@@ -156,6 +164,8 @@ export interface UnitTestCheck extends TestRunInfo {
   verified?: boolean;
   /** How often failing tests went back to the author before the review. */
   fixAttempts: number;
+  /** Commands that failed once and passed when the manager ran them again (flaky tests, not sent back to the author). */
+  flaky?: string[];
   /** The manager's last run: exit code (null when it had to stop the command), duration and why it stopped. */
   exitCode?: number | null;
   durationMs?: number;

@@ -81,16 +81,28 @@ const excerpt = (text, max = 280) => {
   const flat = String(text ?? "").replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 };
-/** "12 tests · 11 passed · 1 failed · 2 skipped" */
+/** "12 tests · 11 passed · 1 failed · 2 skipped · 1 unrelated failure" */
 const testCounts = (run) =>
   [
     run.total !== undefined ? `${run.total} test${run.total === 1 ? "" : "s"}` : null,
     run.passed !== undefined ? `${run.passed} passed` : null,
     run.failed ? `${run.failed} failed` : null,
     run.skipped ? `${run.skipped} skipped` : null,
+    run.unrelatedFailures?.length ? `${run.unrelatedFailures.length} unrelated failure${run.unrelatedFailures.length === 1 ? "" : "s"}` : null,
   ]
     .filter(Boolean)
     .join(" · ") || "no counts reported";
+
+/** Failing tests the change has nothing to do with: reported, not fixed by the task. */
+const unrelatedFailuresBlock = (failures) =>
+  failures?.length
+    ? h(
+        "details",
+        { class: "sub-block" },
+        h("summary", { class: "label" }, `Unrelated failing tests, left for their owners (${failures.length})`),
+        h("ul", { class: "small" }, failures.map((failure) => h("li", {}, h("span", { class: "mono" }, failure.test), ` — ${failure.reason}`))),
+      )
+    : null;
 
 export function taskDetailView(root, { params }) {
   const id = params[0];
@@ -1142,6 +1154,7 @@ export function taskDetailView(root, { params }) {
               ? h("div", { class: "sub-block" }, h("div", { class: "label" }, "Commands run"), h("pre", { class: "pre-wrap test-commands" }, run.commands.join("\n")))
               : null,
             run?.logExcerpt ? h("details", { class: "sub-block" }, h("summary", { class: "label" }, "Output excerpt"), h("pre", { class: "pre-wrap" }, run.logExcerpt)) : null,
+            unrelatedFailuresBlock(run?.unrelatedFailures),
             review.comments.length && run ? h("div", { class: "label sub-block" }, `Failures (${review.comments.length})`) : null,
             review.comments.map((comment) => commentCard(comment)),
           )
@@ -1166,10 +1179,13 @@ export function taskDetailView(root, { params }) {
         check.verified ? h("span", { class: "muted" }, "re-run by the manager before the review") : null,
         check.total !== undefined ? h("span", {}, testCounts(check)) : null,
         check.fixAttempts ? h("span", { class: "muted" }, `${check.fixAttempts} fix attempt(s) after failing runs`) : null,
+        check.flaky?.length ? chip("flaky", "warning") : null,
       ),
+      check.flaky?.length ? h("p", { class: "small muted" }, `Failed once, passed when the manager ran it again: ${check.flaky.join(", ")}`) : null,
       check.reason ? h("p", { class: "small" }, check.reason) : null,
       check.commands?.length ? h("pre", { class: "pre-wrap test-commands" }, check.commands.join("\n")) : null,
       check.logExcerpt ? h("details", {}, h("summary", { class: "label" }, "Output of the failing run"), h("pre", { class: "pre-wrap" }, check.logExcerpt)) : null,
+      unrelatedFailuresBlock(check.unrelatedFailures),
     );
   }
 

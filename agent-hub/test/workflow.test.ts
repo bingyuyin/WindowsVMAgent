@@ -13,6 +13,7 @@ import { createHttpServer } from "../src/http/server.ts";
 import type { PullRequestCreator, PullRequestRequest } from "../src/remote.ts";
 import type { RepoService } from "../src/repos.ts";
 import { runShellCommand, type CommandRunner } from "../src/shell.ts";
+import { pullRequestBody } from "../src/workflow/runner.ts";
 import { summarizeTask } from "../src/workflow/summary.ts";
 import {
   addRemote,
@@ -375,24 +376,25 @@ describe("coding workflow", () => {
 describe("coding: unit tests pass before every review", () => {
   test("code, then passing unit tests, then review; review fixes are tested again before the next review", async () => {
     let runs = 0;
-    const runCommand: CommandRunner = async () => {
+    const runCommand: CommandRunner = async (_command, { cwd }) => {
       runs++;
-      return runs === 1 ? { exitCode: 1, durationMs: 40, output: "FAIL add.test.js\n  expected 3, received -1" } : { exitCode: 0, durationMs: 40, output: "ok" };
+      const buggy = fs.readFileSync(path.join(cwd, "add.js"), "utf8").includes("a - b");
+      return buggy ? { exitCode: 1, durationMs: 40, output: "FAIL add.test.js\n  expected 3, received -1" } : { exitCode: 0, durationMs: 40, output: "ok" };
     };
     const h = createHarness(
       {
         coder: [
           steps(writeFile("add.js", "export const add = (a, b) => a - b;\n"), submitWork("Added add()")),
           steps((_spec, prompt) => {
-            assert.match(prompt, /## The unit tests fail: fix them before the review/);
-            assert.match(prompt, /`npm test` exited with code 1/);
+            assert.match(prompt, /## The unit tests fail: resolve this before the review/);
+            assert.match(prompt, /`npm test` exited with code 1 after 0 s, twice in a row/);
             assert.match(prompt, /expected 3, received -1/);
             assert.match(prompt, /fix attempt 1 of 3/);
           }, writeFile("add.js", "export const add = (a, b) => a + b;\n"), submitWork("Fixed the sign in add()")),
         ],
         resolver: [
           steps((_spec, prompt) => {
-            assert.match(prompt, /run the unit tests and iterate until they all pass/i);
+            assert.match(prompt, /run the unit tests that cover your change and iterate until they pass/i);
           }, writeFile("add.js", "export const add = (a, b) => Number(a) + Number(b);\n"), submitWork("Coerce inputs", [{ comment_id: "C1", status: "addressed", note: "Coerced" }])),
         ],
         "code-reviewer": [
@@ -413,7 +415,7 @@ describe("coding: unit tests pass before every review", () => {
       const task = h.store.getTask(created.id)!;
       assert.equal(task.status, "completed");
       assert.equal(task.result?.approved, true);
-      assert.equal(runs, 3, "round 1 ran twice (fail, then pass), round 2 once");
+      assert.equal(runs, 4, "round 1 failed twice in a row (not a flake), then passed after the fix; round 2 passed");
       const [round1, round2] = task.stages[0]!.rounds;
       assert.deepEqual(
         [round1!.author!.unitTests?.status, round1!.author!.unitTests?.verified, round1!.author!.unitTests?.fixAttempts],
@@ -543,6 +545,68 @@ describe("coding: unit tests pass before every review", () => {
       assert.ok(files.includes("check.js") && files.includes("ready.txt"));
       assert.ok(!files.includes("run-artifact.txt"), "files the test run created are not committed");
       assert.equal(git(h.repoPath, "show", `${task.branch}:README.md`), "# Sample", "files the test run changed are restored");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a test that fails once and passes when run again is flaky: the reviewer is told, the coder is not sent back", async () => {
+    let runs = 0;
+    const h = createHarness(
+      {
+        coder: [submitWork("Added add()")],
+        "code-reviewer": [
+          steps((_spec, prompt) => {
+            assert.match(prompt, /Unit tests: all pass/);
+            assert.match(prompt, /Flaky: `npm test` failed once and passed when the manager ran it again/);
+          }, submitReview("approve")),
+        ],
+      },
+      { runCommand: async () => (++runs === 1 ? { exitCode: 1, durationMs: 5, output: "ECONNRESET" } : { exitCode: 0, durationMs: 5, output: "ok" }) },
+    );
+    try {
+      const created = await h.runner.submit({ description: "Add an add() helper", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.result?.approved, true);
+      assert.equal(runs, 2);
+      assert.equal(h.driver.prompts.coder!.length, 1, "no fix cycle for a flaky test");
+      const unitTests = task.stages[0]!.rounds[0]!.author!.unitTests!;
+      assert.deepEqual([unitTests.status, unitTests.fixAttempts, unitTests.flaky], ["passed", 0, ["npm test"]]);
+      const events = await h.store.readEvents(task.id);
+      assert.ok(events.some((event) => /`npm test` passed when run again: a flaky test/.test(event.text)));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("failing tests unrelated to the change are left for their owners and named in the pull request", async () => {
+    const tests = {
+      status: "passed" as const,
+      commands: ["npm test -- add.test.js"],
+      total: 4,
+      passed: 3,
+      failed: 1,
+      unrelated_failures: [{ test: "date.test.js > formats local dates", reason: "Fails without this change too; date.js is untouched" }],
+    };
+    const h = createHarness({
+      coder: [steps(writeFile("add.js", "export const add = (a, b) => a + b;\n"), submitWork("Added add()", [], tests))],
+      "code-reviewer": [
+        steps((_spec, prompt) => {
+          assert.match(prompt, /Failing tests the author reports as unrelated to the change/);
+          assert.match(prompt, /- date\.test\.js > formats local dates: Fails without this change too/);
+        }, submitReview("approve")),
+      ],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Add an add() helper", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.result?.approved, true);
+      assert.equal(h.driver.prompts.coder!.length, 1);
+      assert.deepEqual(h.commands.map((entry) => entry.command), ["npm test -- add.test.js"]);
+      assert.deepEqual(task.result?.unitTests?.unrelatedFailures?.map((failure) => failure.test), ["date.test.js > formats local dates"]);
+      assert.match(pullRequestBody(task), /\*\*Failing tests unrelated to this change\*\* \(not fixed here\): `date\.test\.js > formats local dates`/);
     } finally {
       h.cleanup();
     }
@@ -1299,6 +1363,30 @@ describe("execute & verify", () => {
       assert.equal(task.result?.tests?.status, "blocked");
       assert.equal(h.driver.prompts.executor!.length, 1, "no pointless re-run");
       assert.ok(h.store.recentComm({ taskId: task.id }).some((entry) => /could not fix the remaining 1 failure/.test(entry.text)));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("failures unrelated to the requested change are reported but never sent to the fixer", async () => {
+    const unrelated = [{ test: "legacy > parses v1 config", reason: "Fails at the base commit too; config.js is untouched" }];
+    const h = createHarness({
+      executor: [
+        steps((_spec, prompt) => {
+          assert.match(prompt, /failures unrelated to the requested change go in `unrelated_failures`/);
+        }, submitTests("passed", [], { total: 5, passed: 4, failed: 1, unrelated_failures: unrelated })),
+      ],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Verify the new parser", kind: "testing", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(task.result?.approved, true);
+      assert.equal(h.driver.prompts.fixer, undefined, "the fixer is never involved");
+      assert.deepEqual(task.result?.tests?.unrelatedFailures, unrelated);
+      const verdicts = h.store.recentComm({ taskId: task.id }).filter((entry) => entry.kind === "verdict").map((entry) => entry.text);
+      assert.match(verdicts[0]!, /^Passed: 5 tests; 1 unrelated failure left for their owners/);
     } finally {
       h.cleanup();
     }

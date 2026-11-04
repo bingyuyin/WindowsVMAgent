@@ -34,6 +34,20 @@ export const submitWorkSchema = {
   required: ["summary"],
 } as const;
 
+const unrelatedFailuresSchema = {
+  type: "array",
+  description:
+    "Failing tests the requested change has nothing to do with: they fail without it too, or they are flaky, in code and tests the change does not touch. They are reported to the user and left for their owners, not fixed in this task. When the request itself is to make these tests pass, they are not unrelated.",
+  items: {
+    type: "object",
+    properties: {
+      test: { type: "string", description: "Full test name (and file)." },
+      reason: { type: "string", description: "Why it is unrelated, e.g. fails the same way without the change, or flaky: the result changes on re-run." },
+    },
+    required: ["test", "reason"],
+  },
+} as const;
+
 export const unitTestsSchema = {
   type: "object",
   description:
@@ -43,12 +57,12 @@ export const unitTestsSchema = {
       type: "string",
       enum: ["passed", "failed", "blocked"],
       description:
-        "passed: every command ran and all tests passed. failed: tests still fail - fix them before you submit. blocked: the tests cannot run or pass for a reason outside your change (a missing tool or service, failures that already happen at the base commit, no unit tests can cover this change); explain in reason.",
+        "passed: the tests that cover your change pass and every command exits 0 (failing tests unrelated to your change go in unrelated_failures). failed: tests your change affects still fail - fix them before you submit. blocked: the tests that cover your change cannot run (a missing tool or service, unrelated failures that no command can leave out, no unit tests can cover this change); explain in reason.",
     },
     commands: {
       type: "array",
       description:
-        "The exact unit test commands you ran, one per entry and as you ran them in your shell: no install or setup steps, no chaining. Each must exit non-zero when a test fails (for example Invoke-Pester -CI).",
+        "The exact unit test commands you ran, one per entry and as you ran them in your shell: no install or setup steps, no chaining. They cover your change (the affected test files or projects, or the whole suite) and leave out tests that fail for reasons unrelated to it. Each must exit non-zero when a test fails (for example Invoke-Pester -CI).",
       items: { type: "string" },
     },
     total: { type: "integer", description: "Number of tests that ran." },
@@ -56,6 +70,7 @@ export const unitTestsSchema = {
     failed: { type: "integer" },
     skipped: { type: "integer" },
     reason: { type: "string", description: "Required when status is blocked: what prevents the tests from running or passing." },
+    unrelated_failures: unrelatedFailuresSchema,
   },
   required: ["status", "commands"],
 } as const;
@@ -101,7 +116,7 @@ export const submitTestResultsSchema = {
       type: "string",
       enum: ["passed", "failed", "blocked"],
       description:
-        "passed: everything requested ran and passed, and no integrity problem was found. failed: one or more tests failed (or a fix is not legitimate). blocked: the automation could not run (missing tool, dependency, credential or environment).",
+        "passed: everything requested ran, and no failure related to the request and no integrity problem remains (failures unrelated to the request go in unrelated_failures). failed: one or more tests related to the request failed (or a fix is not legitimate). blocked: the automation could not run (missing tool, dependency, credential or environment).",
     },
     summary: { type: "string", description: "What you ran and what you found, in a few sentences." },
     commands: {
@@ -115,7 +130,7 @@ export const submitTestResultsSchema = {
     skipped: { type: "integer" },
     failures: {
       type: "array",
-      description: "One entry per failing test or blocking problem. Required (non-empty) unless status is passed.",
+      description: "One entry per failure the test fixer must fix, or per blocking problem. Required (non-empty) unless status is passed.",
       items: {
         type: "object",
         properties: {
@@ -134,6 +149,7 @@ export const submitTestResultsSchema = {
         required: ["test", "error", "category"],
       },
     },
+    unrelated_failures: unrelatedFailuresSchema,
     log_excerpt: { type: "string", description: "Short excerpt of the runner output: the summary lines and key failure output." },
   },
   required: ["status", "summary", "commands", "failures"],

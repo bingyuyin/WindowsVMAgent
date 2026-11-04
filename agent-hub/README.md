@@ -97,15 +97,22 @@ flowchart LR
    tool with a summary, the validation it ran, and a response (`addressed` or `declined` plus a note) for
    **every** open comment ID. Submissions that skip a comment are rejected so the agent must fix them.
 3. **Unit tests** (coding rounds): the coder and the comment resolver write or update unit tests for
-   their change and run them until they all pass; `submit_work` must report them (`unit_tests`: status
-   and the exact commands), and a report of failing tests is rejected until they are fixed. The manager
-   then **re-runs those commands itself** in the author's worktree (in the agent's shell, non-interactively,
-   one task at a time per repository, stopping a run that goes silent) and sends any failure - the command, its exit code and the end of its
-   output - back to the same agent to fix, up to 3 times, so the reviewer only gets rounds whose unit
-   tests pass. Files the manager's run creates or changes are discarded so they never land in the commit.
+   their change and run the tests that cover it until they pass; `submit_work` must report them
+   (`unit_tests`: status and the exact commands), and a report of failing tests is rejected until they are
+   fixed. Agents stay within the request (no refactoring or reformatting of unrelated code, no edits to
+   unrelated tests), and a failing test the change has nothing to do with - it fails without the change
+   too, or it is flaky, in code the change doesn't touch - is **left for its owners**: the agent lists it
+   under `unrelated_failures` and reports commands that cover its change without it, reviewers don't ask
+   for it to be fixed (unless the change actually causes it), and the pull request description names it.
+   The manager then **re-runs those commands itself** in the author's worktree (in the agent's shell, non-interactively,
+   one task at a time per repository, stopping a run that goes silent). A command that fails is run once
+   more from a clean state: if it passes, it is a flaky test, noted for the reviewer and not sent back.
+   Any other failure - the command, its exit code and the end of its output - goes back to the same agent,
+   up to 3 times, so the reviewer only gets rounds whose unit tests pass. Files the manager's run creates
+   or changes are discarded so they never land in the commit.
    If the tests still fail, the round goes to review flagged and the reviewer **cannot approve** it; if
-   the author reports them as *blocked* (a missing tool or service, failures that already exist at the base
-   commit), the reviewer weighs the reason. The **Rounds** tab shows each round's unit tests.
+   the author reports them as *blocked* (a missing tool or service), the reviewer weighs the reason. The
+   **Rounds** tab shows each round's unit tests.
 4. **Commit**: the hub commits the agent's work on the agent's branch and fast-forwards the task branch
    to it (one commit per round). Round commits skip repository commit hooks (`--no-verify`) so a hook
    cannot stall the loop; agents run the project's build/tests themselves, and your normal hooks still
@@ -166,14 +173,19 @@ between two agents:
    suspected flaky tests are re-run. It reports through `submit_test_results`: status (`passed`,
    `failed`, `blocked`), the exact commands, counts, an output excerpt, and one entry per failure with
    the error and a triage category — `product-bug`, `test-bug`, `environment`, `flaky` or `integrity` —
-   plus a suggested fix. Failures get IDs `T1`, `T2`, …
-2. **Test fixer** — on its own branch, fixes each failure at its root cause (the product code when its
-   behavior is wrong, the test only when the test itself is wrong, with a justification), re-runs the
-   failing tests, and responds to every failure ID (`addressed`, or `declined` with what is needed, for
-   example a missing tool or credential).
+   plus a suggested fix. Failures get IDs `T1`, `T2`, … Failures the requested change has nothing to do
+   with (they fail without it too, or are flaky, in code the change doesn't touch) are reported separately
+   as *unrelated failures*: they show in the run and the pull request description, never go to the fixer
+   and don't keep the stage from passing. When the request itself is to run and fix the tests, every
+   failure in the requested tests counts.
+2. **Test fixer** — on its own branch, fixes each listed failure at its root cause (the product code when
+   its behavior is wrong, the test only when the test itself is wrong, with a justification) without
+   touching unrelated code or tests, re-runs the failing tests, and responds to every failure ID
+   (`addressed`, or `declined` with what is needed, for example a missing tool or credential).
 3. **Verification** — the executor re-runs the **complete** suite at the fixer's commit and inspects the
    fixer's diff: deleted or skipped tests, weakened assertions, swallowed errors or hard-coded results are
-   reported as `integrity` failures. The stage passes only when everything requested ran and passed.
+   reported as `integrity` failures. The stage passes when everything requested ran and no failure related
+   to the request remains.
 
 If the fixer declines every failure without changing anything, the stage stops instead of re-running
 unchanged code. **Continue fixing** runs more fix-and-verify rounds later (for example after you install

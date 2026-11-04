@@ -423,8 +423,37 @@ describe("unit-test gate", () => {
     assert.match(prompt, /fix attempt 2 of 3/);
     const env = { worktree: cwd, branch: "t--coder", taskBranch: "t", baseSha: "abc1234567" };
     assert.match(systemPromptFor("coder", env), /Unit tests are part of the change/);
-    assert.match(systemPromptFor("resolver", { ...env, branch: "t--resolver" }), /run the build and the unit tests again until they all pass/);
+    assert.match(systemPromptFor("resolver", { ...env, branch: "t--resolver" }), /run the build and the unit tests again until the tests that cover the change pass/);
     assert.match(systemPromptFor("code-reviewer", { ...env, branch: null }), /Never approve while the unit tests fail/);
+  });
+
+  test("failing tests unrelated to the change are reported for their owners, not fixed", () => {
+    const report = normalizeUnitTests({
+      status: "passed",
+      commands: ["npm test -- add.test.js"],
+      total: 3,
+      passed: 3,
+      failed: 1,
+      unrelated_failures: [{ test: " date.test.js > formats local dates ", reason: " fails without the change too " }],
+    });
+    assert.deepEqual(report.unrelated_failures, [{ test: "date.test.js > formats local dates", reason: "fails without the change too" }]);
+    assert.throws(() => normalizeUnitTests({ status: "passed", commands: ["npm test"], unrelated_failures: [{ test: "x" }] }), /unrelated_failures\[0\]\.reason is required/);
+    assert.throws(() => normalizeUnitTests({ status: "passed", commands: ["npm test"], unrelated_failures: "x" }), /must be an array/);
+    assert.throws(() => normalizeUnitTests({ status: "failed", commands: ["npm test"] }), /list it in `unit_tests\.unrelated_failures`/);
+
+    const run = normalizeTestRun({ status: "passed", summary: "ok", commands: ["npm test"], total: 3, passed: 2, failed: 1, failures: [], unrelated_failures: [{ test: "legacy", reason: "flaky" }] });
+    assert.deepEqual(run.unrelated_failures, [{ test: "legacy", reason: "flaky" }]);
+    assert.equal(describeTestRun({ status: "passed", commands: [], total: 3, unrelatedFailures: run.unrelated_failures }, []), "Passed: 3 tests; 1 unrelated failure left for their owners");
+
+    const prompt = unitTestFailurePrompt({ command: "npm test", problem: "exited with code 1 after 4 s, twice in a row", output: "FAIL date.test.js" }, 1, 3);
+    assert.match(prompt, /First decide whether your change causes the failure/);
+    assert.match(prompt, /leave it alone, it is for its owners to fix/);
+    const env = { worktree: cwd, branch: "t--coder", taskBranch: "t", baseSha: "abc1234567" };
+    assert.match(systemPromptFor("coder", env), /Stay within the request/);
+    assert.match(systemPromptFor("resolver", { ...env, branch: "t--resolver" }), /is not yours to fix/);
+    assert.match(systemPromptFor("code-reviewer", { ...env, branch: null }), /do not ask the author to fix failing or flaky tests unrelated to the change/);
+    assert.match(systemPromptFor("executor", { ...env, branch: null }), /go in `unrelated_failures` with the reason, not in `failures`/);
+    assert.match(systemPromptFor("fixer", { ...env, branch: "t--fixer" }), /do not change unrelated code or tests, even ones that fail/);
   });
 
   test("the manager runs commands in the agents' shell, with their exit code, output and a stop for silent runs", async () => {
