@@ -14,7 +14,7 @@ export type AgentRole =
   | "code-reviewer"
   | "executor"
   | "fixer";
-export type Phase = "queued" | "preparing" | "planning" | "authoring" | "reviewing" | "revising" | "finalizing" | "done";
+export type Phase = "queued" | "preparing" | "planning" | "authoring" | "verifying" | "reviewing" | "revising" | "finalizing" | "done";
 export type Severity = "blocker" | "major" | "minor" | "nit";
 export type Verdict = "approve" | "request_changes";
 export type CommentStatus = "open" | "addressed" | "declined";
@@ -112,6 +112,8 @@ export interface AuthorSubmission {
   shortStat?: string;
   /** Artifact file name holding the design document snapshot for this round. */
   docSnapshot?: string;
+  /** Coding rounds: the author's unit tests, re-run by the manager before the review. */
+  unitTests?: UnitTestCheck;
   at: string;
 }
 
@@ -140,6 +142,24 @@ export interface TestRunInfo {
   skipped?: number;
   /** Relevant output (failure messages, summary lines). */
   logExcerpt?: string;
+}
+
+/**
+ * Unit tests of a coding round: the author's report, checked by the manager re-running the commands in the
+ * author's worktree before the review. passed: the manager's run passed; failed: it still failed after the
+ * fix attempts; blocked: the author says the tests cannot run or pass for a reason outside the change.
+ */
+export interface UnitTestCheck extends TestRunInfo {
+  /** Why the tests could not pass (blocked) or could not be checked. */
+  reason?: string;
+  /** True when the manager's own run of the commands passed. */
+  verified?: boolean;
+  /** How often failing tests went back to the author before the review. */
+  fixAttempts: number;
+  /** The manager's last run: exit code (null when it had to stop the command), duration and why it stopped. */
+  exitCode?: number | null;
+  durationMs?: number;
+  stopped?: "timeout" | "silent" | "cancelled";
 }
 
 export interface Round {
@@ -207,6 +227,8 @@ export interface TaskResult {
   docFormat?: DocFormat;
   /** Latest test run of the testing stage. */
   tests?: TestRunInfo;
+  /** Unit tests of the last coding round. */
+  unitTests?: UnitTestCheck;
   openComments: number;
 }
 

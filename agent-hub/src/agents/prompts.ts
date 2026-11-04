@@ -13,6 +13,7 @@ import {
   type ReviewSubmission,
   type StageKind,
   type Task,
+  type UnitTestCheck,
 } from "../types.ts";
 import { truncate } from "../util.ts";
 
@@ -63,8 +64,13 @@ function environmentBlock(role: AgentRole, env: AgentEnvironment): string {
     ...workspace,
     "- There is no human watching this conversation. Work autonomously; use the ask_user tool only if you are truly blocked by an ambiguity that changes the outcome, and otherwise state your assumptions.",
     "- The manager monitors your activity and interrupts or restarts an agent that stops making progress. Run commands non-interactively and with timeouts, and never leave servers, watchers or interactive prompts running in the foreground.",
+    ...(isReviewerRole(role) || role === "planner" ? [] : [ISOLATION]),
   ].join("\n");
 }
+
+/** Other tasks share the machine (and sometimes the repository, in their own worktrees). */
+const ISOLATION =
+  "- Other tasks run on this machine at the same time, some on this repository in their own worktrees, so keep your work inside your working directory: install dependencies locally (node_modules, a `.venv` virtual environment in the working directory for Python, a local dotnet tool manifest), never globally; make tests use ephemeral ports and unique temp paths rather than fixed ones or shared databases; and stop every background process you start before you submit.";
 
 function skillsLine(skills: string[]): string[] {
   if (!skills.length) return [];
@@ -107,6 +113,10 @@ const USER_REQUESTS_AUTHOR =
   "- Change requests from the user (IDs U1, U2, ...) take priority over earlier review preferences: carry them out as asked, declining only when a request is impossible or harmful (explain why).";
 const USER_REQUESTS_REVIEWER =
   "- Change requests the user made after the task finished (IDs U1, U2, ...) must be carried out as asked: verify each one, and accept a decline only when the request is impossible or harmful and the author explains why.";
+
+/** How coding agents finish a round: their unit tests must pass, and the manager re-runs them before the review. */
+const UNIT_TEST_GATE =
+  "Run the unit tests and iterate until they all pass, then report them in `unit_tests` (status and the exact commands): the manager re-runs those commands before the review and sends any failure back to you.";
 
 export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: string[] = [], options: SystemPromptOptions = {}): string {
   const intro =
@@ -174,8 +184,9 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         ),
         "- Work only inside the working directory. Follow the repository's conventions, architecture and instruction files.",
         ...skillsLine(skills),
-        "- Make focused, complete changes. Add or update tests where the codebase has tests, and update directly related documentation.",
-        "- Validate your work: run the relevant build, linters and tests (install dependencies if needed) and fix failures caused by your change. Report exactly what you ran and the results.",
+        "- Make focused, complete changes and update directly related documentation.",
+        "- Unit tests are part of the change: add or update unit tests for the new or changed behavior (main path, edge cases, failure modes) with the repository's test framework and conventions.",
+        "- Before submitting, run the build, linters and unit tests (install dependencies if needed) and fix every failure until all unit tests pass. Report the exact unit test commands in `unit_tests`: the manager re-runs them before the review and sends failures back to you, so a round only reaches the reviewer with passing tests.",
         "- Do not leave temporary files, logs or build outputs in the tree unless they belong in the repository.",
         "- Finish by calling the `submit_work` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
@@ -188,7 +199,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         ...skillsLine(skills),
         "- Address every comment ID: fix the code at the root cause (preferred) or decline with a concrete technical justification. Keep fixes focused; do not rewrite unrelated code.",
         USER_REQUESTS_AUTHOR,
-        "- Add or adjust tests for behavioral fixes, then re-run the relevant build and tests and report the results.",
+        "- Add or adjust unit tests for behavioral fixes, then run the build and the unit tests again until they all pass, and report them in `unit_tests` (the manager re-runs them before the next review).",
         "- Finish every round by calling the `submit_work` tool exactly once, with a response for every open comment ID. Never end your turn without calling it.",
       ].join("\n");
     case "code-reviewer":
@@ -198,6 +209,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         `- Review the complete change against the base commit (git diff ${short(env.baseSha)}..HEAD) and the request (and the approved design when one is provided).`,
         ...skillsLine(skills),
         "- Do not comment on pure formatting or style unless it violates repository conventions. Prefer a few high-signal comments over many trivial ones.",
+        "- The manager re-runs the author's unit tests before every review and tells you the result. Check that the change (and the fixes for your comments) is covered by meaningful unit tests, and request them where they are missing. Never approve while the unit tests fail.",
         "- Each comment: file and line when applicable, a clear description of the problem and the expected fix. Severities: blocker, major, minor, nit.",
         "- Approve when no blocker or major issues remain.",
         "- On re-review, verify each previous comment was addressed by inspecting the new changes, accept reasonable declines, and raise new issues only if they are significant.",
@@ -250,7 +262,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "Rules:",
         "- You are read-only: never create, modify or delete files and never run commands with side effects. Inspect the repository with view/grep/glob and read-only git commands.",
         "- Choose the smallest set of stages that fully covers the request. Do not add design or documentation the request does not need; do add testing when the request asks to verify behavior or when code changes and runnable tests exist.",
-        "- For each chosen stage write a concrete assignment: what to do, scope (files, areas), acceptance criteria, and for testing the exact commands or suites to run (verify they exist in the repository).",
+        "- For each chosen stage write a concrete assignment: what to do, scope (files, areas), acceptance criteria, for coding the unit test commands that must pass before each review, and for testing the exact commands or suites to run (verify they exist in the repository).",
         "- Write a `briefing` that every sub-agent starts with, so none of them has to rediscover the repository: the architecture and the modules/files relevant to this request, the conventions to follow, how to build and test (commands you verified), and pitfalls. Make it specific to this request; the agents already get the repository context and best-practice skills.",
         "- Be quick: a few minutes of targeted inspection is enough. Finish by calling the `submit_plan` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
@@ -421,8 +433,8 @@ export function authorPrompt(input: AuthorPromptInput): string {
         ? "Make the changes, then run the test automation (at least the affected tests) to confirm it passes."
         : docStage
           ? `Update the ${noun} \`${input.docPath}\` accordingly.`
-          : "Make the changes in the code (add or update tests where it matters), then re-run the relevant validation.",
-      `Then call \`submit_work\` with a summary, ${docStage ? "" : "the validation you ran, "}and \`comment_responses\` covering exactly these IDs: ${ids} (addressed = done; declined only when a request is impossible or harmful, with the reason).`,
+          : `Make the changes in the code and add or update unit tests for them. ${UNIT_TEST_GATE}`,
+      `Then call \`submit_work\` with a summary, ${docStage ? "" : input.stage === "coding" ? "the validation you ran, `unit_tests` " : "the validation you ran, "}and \`comment_responses\` covering exactly these IDs: ${ids} (addressed = done; declined only when a request is impossible or harmful, with the reason).`,
     );
   } else if (input.stage === "testing") {
     parts.push(`## Round ${input.round}: fix the test failures`);
@@ -444,8 +456,8 @@ export function authorPrompt(input: AuthorPromptInput): string {
     parts.push(
       docStage
         ? `Update the ${noun} \`${input.docPath}\` to address every comment.`
-        : "Address every comment in the code, then re-run the relevant validation.",
-      `Then call \`submit_work\` with a summary, ${input.stage === "coding" ? "the validation you ran, " : ""}and \`comment_responses\` covering exactly these IDs: ${ids}.`,
+        : `Address every comment in the code, adding or adjusting unit tests for behavioral fixes. ${UNIT_TEST_GATE}`,
+      `Then call \`submit_work\` with a summary, ${input.stage === "coding" ? "the validation you ran, `unit_tests`, " : ""}and \`comment_responses\` covering exactly these IDs: ${ids}.`,
     );
   } else if (docStage) {
     parts.push(`## Round ${input.round}: write the ${noun}`, "");
@@ -463,8 +475,8 @@ export function authorPrompt(input: AuthorPromptInput): string {
     parts.push(
       `## Round ${input.round}: implement`,
       "",
-      "Implement the request in the working directory and validate it with the relevant build/tests.",
-      "When done, call `submit_work` with a summary of the change and the validation you ran.",
+      `Implement the request in the working directory, with unit tests for the new or changed behavior. ${UNIT_TEST_GATE}`,
+      "When done, call `submit_work` with a summary of the change, the validation you ran and `unit_tests`.",
     );
   }
   return parts.join("\n");
@@ -510,6 +522,7 @@ export function reviewPrompt(input: ReviewPromptInput): string {
   parts.push(`Your worktree is now pinned to commit ${short(input.headSha)}.`, "");
   parts.push(`${input.authorLabel} summary:`, input.submission.summary.trim() || "(none)");
   if (input.submission.validation?.trim()) parts.push("", "Validation reported by the author:", input.submission.validation.trim());
+  if (input.submission.unitTests) parts.push("", unitTestsBlock(input.submission.unitTests));
 
   if (input.previousComments.length && input.userRequests) {
     parts.push(
@@ -555,6 +568,29 @@ export function reviewPrompt(input: ReviewPromptInput): string {
   }
   parts.push("", "Review now and call `submit_review` with your verdict, summary and comments.");
   return parts.join("\n");
+}
+
+/** The unit-test result the reviewer gets with a coding round. */
+function unitTestsBlock(check: UnitTestCheck): string {
+  const commands = check.commands.map((command) => `\`${command}\``).join(", ");
+  const counts = check.total !== undefined ? ` (the author reported ${check.total} tests${check.failed ? `, ${check.failed} failed` : ""})` : "";
+  switch (check.status) {
+    case "passed":
+      return `Unit tests: all pass. The manager re-ran ${commands} in the author's worktree before this review${counts}.`;
+    case "blocked":
+      return [
+        `Unit tests: NOT PASSING - the author reports they cannot run or pass: ${check.reason ?? "(no reason given)"}`,
+        "Check that reason against the code (and the base commit when it claims pre-existing failures). Request changes with a blocker comment if the tests should be able to pass.",
+      ].join("\n");
+    default:
+      return [
+        check.commands.length
+          ? `Unit tests: FAILING - the manager's run of ${commands} still failed after ${check.fixAttempts} fix attempt(s)${check.exitCode !== undefined && check.exitCode !== null ? ` (exit code ${check.exitCode})` : check.stopped ? ` (stopped: ${check.stopped})` : ""}.`
+          : `Unit tests: NOT VERIFIED - ${check.reason ?? "the author did not report its unit tests"}.`,
+        ...(check.logExcerpt ? ["Output excerpt:", "```", truncate(check.logExcerpt, 4000), "```"] : []),
+        "You cannot approve this round: request changes with a blocker comment about the unit tests.",
+      ].join("\n");
+  }
 }
 
 export interface ExecutionPromptInput {
@@ -651,6 +687,20 @@ export function plannerPrompt(task: Task, context: RepoContext | undefined): str
     "Inspect the repository as much as you need to understand what the request involves (structure, relevant code, how it is built and tested).",
     `Every sub-agent you create starts with the repository context above, the instruction files and the hub's best-practice skills for its role${skills}. Your briefing adds what you learned that is specific to this request.`,
     "Then call `submit_plan` with the stages to run, your rationale, a concrete assignment for each stage's agents and the briefing.",
+  ].join("\n");
+}
+
+/** The manager re-ran the author's unit tests before the review and they failed: hand them back to be fixed. */
+export function unitTestFailurePrompt(failure: { command: string; problem: string; output: string }, attempt: number, maxAttempts: number): string {
+  return [
+    "## The unit tests fail: fix them before the review",
+    "",
+    `Before handing your round to the reviewer, the manager re-ran your unit tests in your working directory: \`${failure.command}\` ${failure.problem}.`,
+    ...(failure.output.trim() ? ["", "Output (last lines):", "```", truncate(failure.output.trim(), 6000), "```"] : []),
+    "",
+    "Fix the cause - in the code, or in a test that is itself wrong (say why) - and run the unit tests until they all pass. Never skip, delete or weaken tests to make them pass.",
+    "Then call `submit_work` again with `unit_tests` and a short summary of what you fixed (comment responses you already gave need not be repeated). If the tests cannot pass for a reason outside your change, report status `blocked` with the reason.",
+    `This is fix attempt ${attempt} of ${maxAttempts}; after that the round goes to the reviewer with the failing tests.`,
   ].join("\n");
 }
 

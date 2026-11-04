@@ -16,6 +16,7 @@ import type { HubSkills } from "../src/context.ts";
 import type { DocTemplates } from "../src/docs.ts";
 import { Store } from "../src/store.ts";
 import type { PullRequestCreator } from "../src/remote.ts";
+import type { CommandRunner } from "../src/shell.ts";
 import type { AgentRole, Settings } from "../src/types.ts";
 import { TaskRunner } from "../src/workflow/runner.ts";
 
@@ -85,11 +86,13 @@ export const writeFile =
     fs.writeFileSync(file, content);
   };
 
+export const PASSING_UNIT_TESTS: NonNullable<WorkSubmissionInput["unit_tests"]> = { status: "passed", commands: ["npm test"], total: 3, passed: 3, failed: 0 };
+
 export const submitWork =
-  (summary: string, responses: WorkSubmissionInput["comment_responses"] = []): Step =>
+  (summary: string, responses: WorkSubmissionInput["comment_responses"] = [], unitTests: WorkSubmissionInput["unit_tests"] = PASSING_UNIT_TESTS): Step =>
   async (spec) => {
     if (spec.submit.kind !== "work") throw new Error(`${spec.role} cannot submit work`);
-    await spec.submit.onSubmit({ summary, validation: "tests: ok", comment_responses: responses });
+    await spec.submit.onSubmit({ summary, validation: "tests: ok", comment_responses: responses, unit_tests: unitTests });
   };
 
 export const submitReview =
@@ -148,6 +151,8 @@ export interface Harness {
   driver: ScriptedDriver;
   repoPath: string;
   worktreesDir: string;
+  /** Commands the manager ran to verify unit tests (with the default fake runner, which passes them all). */
+  commands: Array<{ command: string; cwd: string }>;
   /** Simulates signing the Copilot runtime in or out. */
   setReady(ready: boolean): void;
   /** Creates a runner as a restarted hub would (same store and driver). */
@@ -162,6 +167,8 @@ export interface HarnessOptions {
   docTemplates?: DocTemplates | null;
   ready?: boolean;
   pullRequests?: PullRequestCreator;
+  /** How the manager runs unit test commands (default: a fake that records them and passes). */
+  runCommand?: CommandRunner;
 }
 
 export const TEMPLATES_DIR = path.join(import.meta.dirname, "..", "templates");
@@ -194,6 +201,13 @@ export function createHarness(script: Partial<Record<AgentRole, Step[]>>, option
   const driver = new ScriptedDriver(script);
   const worktreesDir = path.join(root, "data", "worktrees");
   let ready = options.ready ?? true;
+  const commands: Harness["commands"] = [];
+  const runCommand: CommandRunner =
+    options.runCommand ??
+    (async (command, { cwd }) => {
+      commands.push({ command, cwd });
+      return { exitCode: 0, durationMs: 1, output: "ok" };
+    });
   const newRunner = () =>
     new TaskRunner({
       store,
@@ -204,6 +218,7 @@ export function createHarness(script: Partial<Record<AgentRole, Step[]>>, option
       hubSkills: options.hubSkills,
       docTemplates: options.docTemplates,
       pullRequests: options.pullRequests,
+      runCommand,
     });
   const runner = newRunner();
   return {
@@ -214,6 +229,7 @@ export function createHarness(script: Partial<Record<AgentRole, Step[]>>, option
     driver,
     repoPath,
     worktreesDir,
+    commands,
     setReady: (value) => {
       ready = value;
     },

@@ -34,7 +34,8 @@ export function git(cwd: string, args: string[], options: GitOptions = {}): Prom
     execFile(
       "git",
       // A system-wide core.safecrlf=true makes `git add` fail on LF files that agents write; line endings still follow core.autocrlf.
-      ["-c", "core.safecrlf=false", ...args],
+      // No auto gc/maintenance: repacking refs while other tasks update theirs in the same repository makes their ref updates fail.
+      ["-c", "core.safecrlf=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false", ...args],
       {
         cwd,
         encoding: "utf8",
@@ -213,6 +214,10 @@ export interface AgentWorkspace {
   readFile(relativePath: string): Promise<string | null>;
   ensureDir(relativeDir: string): Promise<void>;
   writeFile(relativePath: string, content: string): Promise<void>;
+  /** Paths with uncommitted changes, untracked files included. */
+  changedPaths(): Promise<Set<string>>;
+  /** Undoes changes made since `before` was taken: removes new untracked files and restores tracked files that were clean. */
+  discardChangesSince(before: ReadonlySet<string>): Promise<string[]>;
 }
 
 /** Git state of one task: the task branch plus each sub-agent's own branch and worktree. */
@@ -435,6 +440,35 @@ export class GitAgentWorkspace implements AgentWorkspace {
     await fsp.mkdir(path.dirname(full), { recursive: true });
     await fsp.writeFile(full, content, "utf8");
   }
+
+  async changedPaths(): Promise<Set<string>> {
+    return new Set((await statusEntries(this.path)).map((entry) => entry.path));
+  }
+
+  async discardChangesSince(before: ReadonlySet<string>): Promise<string[]> {
+    const discarded: string[] = [];
+    for (const entry of await statusEntries(this.path)) {
+      if (before.has(entry.path)) continue;
+      if (entry.untracked) await fsp.rm(path.join(this.path, entry.path), { force: true, recursive: true });
+      else await git(this.path, ["checkout", "--", entry.path]);
+      discarded.push(entry.path);
+    }
+    return discarded;
+  }
+}
+
+async function statusEntries(dir: string): Promise<Array<{ path: string; untracked: boolean }>> {
+  const tokens = (await git(dir, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).stdout.split("\0");
+  const entries: Array<{ path: string; untracked: boolean }> = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index]!;
+    if (token.length < 4) continue;
+    const code = token.slice(0, 2);
+    entries.push({ path: token.slice(3), untracked: code === "??" });
+    // Renames and copies are followed by their original path.
+    if (code[0] === "R" || code[0] === "C") index++;
+  }
+  return entries;
 }
 
 export function isInside(parent: string, child: string): boolean {

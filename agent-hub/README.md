@@ -9,7 +9,7 @@ tests pass.
 | Task type | Sub-agents |
 | --- | --- |
 | **Auto** (default) | The **manager's planner** reads the request and the repository, picks the stages below (for example *Coding → Execute & verify*), writes each team's assignment, and the hub creates those sub-agents |
-| **Coding** | **Coder** implements the request · **Code reviewer** reviews each commit · **Comment resolver** fixes review comments (same model as the coder by default) |
+| **Coding** | **Coder** implements the request with unit tests and gets them passing · the **manager re-runs the unit tests** and only then hands the round to the **Code reviewer** · the **Comment resolver** fixes review comments (same model as the coder by default) and gets the unit tests passing again before the next review, until the reviewer approves |
 | **Execute & verify** | **Test executor** runs the test automation and verifies the results · **Test fixer** fixes failures at the root cause · the executor re-runs and checks the fixes are legitimate, until everything passes |
 | **Design** | **Designer** writes the design document and revises it · **Design reviewer** critiques it until a finalized version is approved |
 | **Document** | **Technical writer** writes documentation grounded in the repository · **Doc reviewer** checks accuracy and clarity until it is approved |
@@ -64,6 +64,7 @@ flowchart LR
   Engine -- Auto tasks --> P[Planner<br/>read-only checkout]
   P -- plan: stages + assignments --> Engine
   Engine -- round 1 --> C[Coder / Designer / Writer<br/>own branch]
+  C & F -- coding: unit tests --> UT[Manager re-runs the unit tests<br/>failures go back to the author]
   Engine -- review --> R[Reviewer<br/>own read-only worktree]
   Engine -- round 2+ --> F[Comment resolver / Designer / Writer<br/>own branch]
   Engine -- run tests --> X[Test executor<br/>own pinned checkout]
@@ -95,25 +96,35 @@ flowchart LR
    designer or the technical writer works on its own branch and finishes by calling the `submit_work`
    tool with a summary, the validation it ran, and a response (`addressed` or `declined` plus a note) for
    **every** open comment ID. Submissions that skip a comment are rejected so the agent must fix them.
-3. **Commit**: the hub commits the agent's work on the agent's branch and fast-forwards the task branch
+3. **Unit tests** (coding rounds): the coder and the comment resolver write or update unit tests for
+   their change and run them until they all pass; `submit_work` must report them (`unit_tests`: status
+   and the exact commands), and a report of failing tests is rejected until they are fixed. The manager
+   then **re-runs those commands itself** in the author's worktree (in the agent's shell, non-interactively,
+   one task at a time per repository, stopping a run that goes silent) and sends any failure - the command, its exit code and the end of its
+   output - back to the same agent to fix, up to 3 times, so the reviewer only gets rounds whose unit
+   tests pass. Files the manager's run creates or changes are discarded so they never land in the commit.
+   If the tests still fail, the round goes to review flagged and the reviewer **cannot approve** it; if
+   the author reports them as *blocked* (a missing tool or service, failures that already exist at the base
+   commit), the reviewer weighs the reason. The **Rounds** tab shows each round's unit tests.
+4. **Commit**: the hub commits the agent's work on the agent's branch and fast-forwards the task branch
    to it (one commit per round). Round commits skip repository commit hooks (`--no-verify`) so a hook
    cannot stall the loop; agents run the project's build/tests themselves, and your normal hooks still
    apply when you merge or push.
-4. **Review turn**: the reviewer's own worktree is pinned (detached) to the exact commit under review. It
-   gets the diff (the full diff, or the round's incremental diff on re-review) and the author's
-   responses, and finishes by calling `submit_review` with a verdict (`approve` / `request_changes`) and
-   comments (severity, file, line, body), which get IDs such as `C3` (code), `D2` (design) or `W1`
-   (document). It cannot approve while blocker/major comments remain.
-5. **Iterate**: open code comments go to the comment resolver (design and document comments back to
-   their author) until the reviewer approves or the round budget is used up. **Continue review loop**
-   runs more rounds later in fresh sessions; **Retry** resumes failed, cancelled or interrupted tasks from
-   the last completed step.
-6. **Result**: the task branch, commits, diff stat, test results and final summary (one section per stage),
-   with ready-to-copy `git` commands to inspect and merge. Design and document tasks keep every document
-   version (v1, v2, … final).
-7. **Push & pull request**: the hub pushes the task branch to the repository's remote and the task gets a
+5. **Review turn**: the reviewer's own worktree is pinned (detached) to the exact commit under review. It
+   gets the diff (the full diff, or the round's incremental diff on re-review), the author's responses
+   and, for code, the manager's unit-test result, and finishes by calling `submit_review` with a verdict
+   (`approve` / `request_changes`) and comments (severity, file, line, body), which get IDs such as `C3`
+   (code), `D2` (design) or `W1` (document). It cannot approve while blocker/major comments remain.
+6. **Iterate**: open code comments go to the comment resolver (design and document comments back to
+   their author), whose fixes are tested again before the next review, until the reviewer approves or the
+   round budget is used up. **Continue review loop** runs more rounds later in fresh sessions; **Retry**
+   resumes failed, cancelled or interrupted tasks from the last completed step.
+7. **Result**: the task branch, commits, diff stat, unit and test results and final summary (one section
+   per stage), with ready-to-copy `git` commands to inspect and merge. Design and document tasks keep
+   every document version (v1, v2, … final).
+8. **Push & pull request**: the hub pushes the task branch to the repository's remote and the task gets a
    **Create pull request** button (see [Pushing branches and pull requests](#pushing-branches-and-pull-requests)).
-8. **Request changes**: once finished (approved or not) you can ask for further changes or adjustments,
+9. **Request changes**: once finished (approved or not) you can ask for further changes or adjustments,
    as often as you like (see [Requesting changes after a task finishes](#requesting-changes-after-a-task-finishes)).
 
 Each agent keeps one Copilot session per stage, so it remembers earlier rounds; a comment resolver or test
@@ -248,6 +259,24 @@ ones wait. Git worktree operations on a repository are serialized. When a task c
 are removed (branches are kept) unless you turn **Cleanup** off; failed or cancelled tasks keep their
 worktrees for inspection or retry. Don't check out a task branch elsewhere while its task is running.
 
+Tasks running on the same repository don't affect each other's code or unit test results:
+
+- Each task codes, builds and tests in its own worktrees on its own branches, with its own installed
+  dependencies and build output.
+- The manager's unit test re-runs on a repository run **one at a time**: a task whose tests are ready
+  waits while another task's run finishes (its timeline says so), so tests that use a fixed port, a local
+  database or another machine-wide resource don't collide.
+- Each run gets the task's own temp folder (`TMP`/`TEMP`/`TMPDIR` = `data/worktrees/<task>/tmp`, emptied
+  before every run), the worktree's own `.venv` and `node_modules/.bin` first on `PATH`, and no MSBuild
+  nodes that outlive the build (`MSBUILDDISABLENODEREUSE=1`). Processes a run leaves behind (a test
+  server, a watcher) are stopped when it ends (its process group; a job object on Windows), so they can't
+  hold the next run's ports or files, and files the run creates or changes are discarded.
+- Agents can't install tools or packages machine-wide or change machine settings (see
+  [Safety model](#safety-model)); they are told to install project-locally, use ephemeral ports and unique
+  temp paths, and stop background processes they start.
+- The hub's own git commands never start automatic `gc`/maintenance, so they don't lock the repository
+  that all tasks' worktrees share.
+
 ## Pushing branches and pull requests
 
 - **Automatic push**: when a task completes, the hub pushes its task branch (only the task branch, not
@@ -330,6 +359,13 @@ store. After a successful sign-in the hub restarts its runtime to load the new c
   Reads outside the worktree and persistent memory are denied. Each agent may still use its own
   session scratch folder under `<copilot home>/session-state` (for example for plans) and read the
   skill folders it was given. Only the hub itself pushes, and only finished task branches, never forced.
+- **Machine-wide installs and settings** are rejected for authors and the test executor, since other
+  tasks share them: global npm/pnpm/yarn installs, `dotnet tool install -g`, `pip install --user`,
+  system package managers (winget, choco, scoop, apt, brew, ...), `msiexec`, `setx` and
+  `Install-Module -Scope AllUsers`. Project-local installs (`npm install`, a `.venv`, `dotnet tool restore`)
+  are fine, and so is `Install-Module -Scope CurrentUser` (module versions install side by side).
+- **Unit test re-runs**: the hub runs the unit test commands a coding agent reports in that agent's own
+  worktree, under the same restrictions as the agent's commands (no push, no branch switching, ...).
 - These are guardrails enforced through the SDK permission callback, **not a sandbox**: author agents
   and the test executor run build/test commands on your machine with your user account. Only register
   repositories you are comfortable letting an agent work on.
@@ -375,6 +411,7 @@ data/
   worktrees/<id>/author/     author agents' worktree (or <id>/<role>/ with per-agent worktrees)
   worktrees/<id>/review/     reviewer (and planner) worktree, detached at the reviewed commit
   worktrees/<id>/run/        test executor worktree, detached at the commit under test
+  worktrees/<id>/tmp/        temp folder of the manager's unit test runs (emptied before each run)
   repos/                     repositories cloned from a URL
   copilot-home/              Copilot runtime home
 ```
@@ -410,7 +447,7 @@ Mutating requests must send `Content-Type: application/json`.
 ## Development
 
 ```powershell
-npm test             # node:test – workflow engine (scripted agents + real git), planning, test execution, concurrency, documents, manager log, stuck-agent recovery, skills, storage, policy
+npm test             # node:test – workflow engine (scripted agents + real git), planning, unit-test gate, test execution, concurrency and isolation between tasks, documents, manager log, stuck-agent recovery, skills, storage, policy
 npm run typecheck    # tsc for src and tests
 npm run dev          # restart on file changes
 ```
@@ -420,11 +457,12 @@ src/
   main.ts                 wiring and graceful shutdown
   copilot/service.ts      CopilotClient lifecycle, sign-in flows, model catalog
   agents/                 driver interface, Copilot SDK driver, prompts, submit tools, permission policy
-  workflow/               runner (manager: queue, workspaces, monitoring, resume), engine (planning, sub-agent loops, stuck-agent recovery), validation
+  workflow/               runner (manager: queue, workspaces, monitoring, resume), engine (planning, sub-agent loops, unit-test gate, stuck-agent recovery), validation
   http/                   dependency-free router, SSE, API routes, sandboxed document viewer
   context.ts              repository context discovery and hub skills
   docs.ts                 HTML document templates, validation and viewer preparation
   git.ts                  task/agent workspaces: branches, worktrees, fast-forward, diffs
+  shell.ts                runs unit test commands in the agents' shell (timeouts, stops silent runs and leftover processes)
   store.ts                local-disk persistence (per-entity JSON files, logs, migration)
   repos.ts
 skills/                   bundled best-practice skills (SKILL.md)

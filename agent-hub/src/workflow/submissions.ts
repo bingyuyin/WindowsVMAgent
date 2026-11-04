@@ -1,4 +1,4 @@
-import type { PlanSubmissionInput, ReviewSubmissionInput, TestRunSubmissionInput, WorkSubmissionInput } from "../agents/driver.ts";
+import type { PlanSubmissionInput, ReviewSubmissionInput, TestRunSubmissionInput, UnitTestsInput, WorkSubmissionInput } from "../agents/driver.ts";
 import { FAILURE_CATEGORIES, SEVERITIES, STAGE_ORDER, type FailureCategory, type Severity, type StageKind, type TestStatus, type Verdict } from "../types.ts";
 import { truncate } from "../util.ts";
 
@@ -64,7 +64,14 @@ export function normalizeReview(input: unknown): ReviewSubmissionInput {
   return { verdict, summary: truncate(summary, 8000), comments };
 }
 
-export function normalizeWork(input: unknown, expectedCommentIds: readonly string[]): WorkSubmissionInput {
+export interface WorkRules {
+  /** Coding stage: `unit_tests` is required, and failing tests must be fixed before submitting. */
+  unitTests?: boolean;
+  /** A resubmission after test fixes: responses already given need not be repeated. */
+  partialResponses?: boolean;
+}
+
+export function normalizeWork(input: unknown, expectedCommentIds: readonly string[], rules: WorkRules = {}): WorkSubmissionInput {
   const raw = (input ?? {}) as Partial<Record<keyof WorkSubmissionInput, unknown>>;
   const summary = typeof raw.summary === "string" ? raw.summary.trim() : "";
   if (!summary) throw new Error("`summary` is required: describe what you did this round.");
@@ -87,13 +94,58 @@ export function normalizeWork(input: unknown, expectedCommentIds: readonly strin
   }
   const answered = new Set(responses.map((response) => response.comment_id));
   const missing = [...expected].filter((id) => !answered.has(id));
-  if (missing.length) {
+  if (missing.length && !rules.partialResponses) {
     throw new Error(
       `Missing comment_responses for: ${missing.join(", ")}. Respond to every open comment ID with status "addressed" or "declined" and a note.`,
     );
   }
   const validation = typeof raw.validation === "string" && raw.validation.trim() ? truncate(raw.validation.trim(), 8000) : undefined;
-  return { summary: truncate(summary, 12000), validation, comment_responses: responses };
+  const unitTests = rules.unitTests ? normalizeUnitTests(raw.unit_tests) : undefined;
+  return { summary: truncate(summary, 12000), validation, comment_responses: responses, ...(unitTests ? { unit_tests: unitTests } : {}) };
+}
+
+export function normalizeUnitTests(input: unknown): UnitTestsInput {
+  if (!input || typeof input !== "object") {
+    throw new Error("`unit_tests` is required: run the unit tests until they all pass and report the status and the exact commands you ran.");
+  }
+  const raw = input as Record<string, unknown>;
+  const status = normalizeTestStatus(raw.status);
+  if (status === "failed") {
+    throw new Error(
+      "The unit tests still fail. Fix the cause (in the code, or in a test that is itself wrong) and run them until they all pass, then submit again. If they cannot pass for a reason outside your change, report status blocked with the reason.",
+    );
+  }
+  if (raw.commands !== undefined && !Array.isArray(raw.commands)) throw new Error("`unit_tests.commands` must be an array of strings.");
+  const commands = ((raw.commands as unknown[] | undefined) ?? [])
+    .map((command) => (typeof command === "string" ? command.trim() : ""))
+    .filter(Boolean);
+  if (commands.length > 10) throw new Error("`unit_tests.commands` may list at most 10 commands.");
+  const tooLong = commands.find((command) => command.length > 500);
+  if (tooLong) throw new Error(`Unit test command is too long (max 500 characters): ${truncate(tooLong, 80)}`);
+  const total = count(raw.total, "unit_tests.total");
+  const passed = count(raw.passed, "unit_tests.passed");
+  const failed = count(raw.failed, "unit_tests.failed");
+  const skipped = count(raw.skipped, "unit_tests.skipped");
+  const reason = typeof raw.reason === "string" && raw.reason.trim() ? truncate(raw.reason.trim(), 2000) : undefined;
+  if (status === "passed") {
+    if (!commands.length) throw new Error("`unit_tests.commands` is required: list the exact unit test commands you ran; the manager re-runs them before the review.");
+    if (failed) throw new Error("`unit_tests.failed` is greater than 0, so the unit tests do not pass yet. Fix them and run them again before submitting.");
+    if (total === 0) throw new Error("No unit tests ran (total is 0). Run the tests that cover your change, or report status blocked with the reason.");
+  } else if (!reason) {
+    throw new Error("`unit_tests.reason` is required when status is blocked: say what prevents the tests from running or passing.");
+  }
+  return { status, commands, total, passed, failed, skipped, reason };
+}
+
+/** A resubmission after the manager sent failing unit tests back: the new report wins, earlier comment responses stay unless revised. */
+export function mergeWork(previous: WorkSubmissionInput, next: WorkSubmissionInput): WorkSubmissionInput {
+  const revised = new Set((next.comment_responses ?? []).map((response) => response.comment_id));
+  return {
+    summary: `${previous.summary}\n\n**Unit test fixes:** ${next.summary}`,
+    validation: next.validation ?? previous.validation,
+    comment_responses: [...(previous.comment_responses ?? []).filter((response) => !revised.has(response.comment_id)), ...(next.comment_responses ?? [])],
+    unit_tests: next.unit_tests,
+  };
 }
 
 /** Best-effort review when a reviewer never called submit_review. */

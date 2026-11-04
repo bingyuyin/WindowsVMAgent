@@ -65,6 +65,11 @@ export async function settledWithin(promise: Promise<unknown>, ms: number): Prom
 export class KeyedMutex {
   private readonly tails = new Map<string, Promise<unknown>>();
 
+  /** True while work for the key is running or queued. */
+  busy(key: string): boolean {
+    return this.tails.has(key);
+  }
+
   async run<T>(key: string, work: () => Promise<T>): Promise<T> {
     const previous = this.tails.get(key) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(work);

@@ -103,6 +103,13 @@ function evaluateShell(request: PermissionRequestLike, options: PolicyOptions): 
     if (problem) return reject(problem);
   }
 
+  if (!options.readOnly) {
+    for (const segment of segments) {
+      const problem = sharedInstallProblem(segment);
+      if (problem) return reject(problem);
+    }
+  }
+
   if (options.readOnly) {
     if (request.hasWriteFileRedirection) {
       return reject("Read-only reviewer: commands that write files (output redirection) are not allowed.");
@@ -213,6 +220,37 @@ function executorGitProblem(command: GitCommand): string | null {
 
 function isGitIdentifier(token: string): boolean {
   return executableName(token) === "git";
+}
+
+const SYSTEM_PACKAGE_MANAGERS = new Set(["winget", "choco", "scoop", "apt", "apt-get", "brew", "dnf", "yum", "zypper", "pacman", "snap"]);
+const NPM_INSTALL_VERBS = new Set(["install", "i", "add", "update", "up", "uninstall", "un", "remove", "rm", "link", "ln"]);
+const PS_INSTALL_CMDLETS = new Set(["install-module", "install-package", "install-psresource", "install-script"]);
+
+/** Installs that change tools or packages for the whole user or machine: other tasks on this machine would see them. */
+export function sharedInstallProblem(segment: string): string | null {
+  const tokens = tokenize(segment).filter((token) => token !== "&" && !/^\w+=/.test(token));
+  if (executableName(tokens[0] ?? "") === "sudo") tokens.shift();
+  if (!tokens.length) return null;
+  let executable = executableName(tokens[0]!).replace(/\.(cmd|bat|ps1)$/, "");
+  let args = tokens.slice(1).map((token) => token.toLowerCase());
+  if (["python", "python3", "py"].includes(executable) && args[0] === "-m" && ["pip", "pip3"].includes(args[1] ?? "")) {
+    executable = "pip";
+    args = args.slice(2);
+  }
+  const has = (...flags: string[]) => args.some((arg) => flags.includes(arg));
+  const verb = args.find((arg) => !arg.startsWith("-")) ?? "";
+  const shared =
+    ((executable === "npm" || executable === "pnpm") && NPM_INSTALL_VERBS.has(verb) && has("-g", "--global", "--location=global")) ||
+    (executable === "yarn" && args[0] === "global") ||
+    (executable === "dotnet" && args[0] === "tool" && ["install", "update", "uninstall"].includes(args[1] ?? "") && has("-g", "--global")) ||
+    ((executable === "pip" || executable === "pip3") && verb === "install" && has("--user")) ||
+    (SYSTEM_PACKAGE_MANAGERS.has(executable) && ["install", "upgrade", "uninstall", "remove", "add"].includes(verb)) ||
+    executable === "msiexec" ||
+    executable === "setx" ||
+    (PS_INSTALL_CMDLETS.has(executable) && args.some((arg, index) => arg === "-scope" && args[index + 1] === "allusers"));
+  return shared
+    ? `'${segment.trim()}' would change tools, packages or settings that other tasks on this machine share. Install dependencies inside your working directory instead (devDependencies run with npx, a .venv virtual environment, a local dotnet tool manifest); if something must be installed machine-wide, report it instead.`
+    : null;
 }
 
 /** Splits a command line on ; | && || and newlines that are outside quotes. */

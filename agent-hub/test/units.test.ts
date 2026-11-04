@@ -1,23 +1,29 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
 import { evaluatePermission, parseGitCommand, splitCommandText } from "../src/agents/policy.ts";
 import { describeTool } from "../src/agents/copilotDriver.ts";
-import { recoveryPrompt, restartNote, systemPromptFor } from "../src/agents/prompts.ts";
+import { recoveryPrompt, restartNote, systemPromptFor, unitTestFailurePrompt } from "../src/agents/prompts.ts";
 import { loadHubSkills, ROLE_SKILLS, skillsForRole, techSkillsFor } from "../src/context.ts";
 import { docForPrompt, docForViewer, documentProblem, formatOfPath, loadDocTemplates, renderDocTemplate } from "../src/docs.ts";
 import { parseSettingsPatch } from "../src/http/api.ts";
 import { branchWebUrl, parseRemote, pullRequestPageUrl, sanitizeRemoteUrl } from "../src/remote.ts";
+import { runShellCommand } from "../src/shell.ts";
 import { rolesFor, rolesForStages, stageKindsOf, worksDetached } from "../src/types.ts";
-import { describeTestRun } from "../src/workflow/engine.ts";
+import { describeTestRun, testRunEnv } from "../src/workflow/engine.ts";
+import { KeyedMutex } from "../src/util.ts";
 import { pullRequestBase } from "../src/workflow/runner.ts";
 import {
   fallbackReview,
   fallbackTestRun,
   heuristicPlan,
+  mergeWork,
   normalizePlan,
   normalizeReview,
   normalizeTestRun,
+  normalizeUnitTests,
   normalizeWork,
 } from "../src/workflow/submissions.ts";
 
@@ -370,6 +376,172 @@ describe("best-practice skills", () => {
     const stacks = ["Node.js", "TypeScript", ".NET", "Python", "Go", "Rust", "Java (Maven)", "JVM (Gradle)", "PowerShell", "C/C++"];
     for (const skill of [...Object.values(ROLE_SKILLS).flat(), ...techSkillsFor(stacks)]) assert.ok(names.includes(skill), `${skill} is missing`);
     assert.equal(techSkillsFor(stacks).length, 8);
+  });
+});
+
+describe("unit-test gate", () => {
+  test("coding agents must report passing unit tests, or say why they cannot pass", () => {
+    const report = normalizeUnitTests({ status: "PASS", commands: [" npm test ", ""], total: 12, passed: 12, failed: 0 });
+    assert.deepEqual(report, { status: "passed", commands: ["npm test"], total: 12, passed: 12, failed: 0, skipped: undefined, reason: undefined });
+    assert.throws(() => normalizeUnitTests({ status: "failed", commands: ["npm test"] }), /still fail\. Fix the cause/);
+    assert.throws(() => normalizeUnitTests({ status: "passed", commands: [] }), /commands` is required/);
+    assert.throws(() => normalizeUnitTests({ status: "passed", commands: ["npm test"], failed: 2 }), /`unit_tests.failed` is greater than 0/);
+    assert.throws(() => normalizeUnitTests({ status: "passed", commands: ["npm test"], total: 0 }), /No unit tests ran/);
+    assert.throws(() => normalizeUnitTests({ status: "blocked", commands: [] }), /reason` is required when status is blocked/);
+    assert.equal(normalizeUnitTests({ status: "blocked", commands: [], reason: "Needs a database" }).reason, "Needs a database");
+    assert.throws(() => normalizeUnitTests({ status: "passed", commands: Array(11).fill("npm test") }), /at most 10 commands/);
+
+    assert.throws(() => normalizeWork({ summary: "s" }, [], { unitTests: true }), /`unit_tests` is required/);
+    assert.equal(normalizeWork({ summary: "s", unit_tests: { status: "passed", commands: ["x"] } }, []).unit_tests, undefined, "other stages ignore unit tests");
+    assert.doesNotThrow(() => normalizeWork({ summary: "fixed the tests" }, ["C1"], { partialResponses: true }));
+  });
+
+  test("a resubmission after test fixes keeps the round's comment responses unless revised", () => {
+    const merged = mergeWork(
+      {
+        summary: "Added add()",
+        validation: "npm test",
+        comment_responses: [
+          { comment_id: "C1", status: "addressed", note: "done" },
+          { comment_id: "C2", status: "declined", note: "out of scope" },
+        ],
+        unit_tests: { status: "passed", commands: ["npm test"] },
+      },
+      { summary: "Fixed the sign", comment_responses: [{ comment_id: "C2", status: "addressed", note: "done after all" }], unit_tests: { status: "passed", commands: ["npm run test:unit"] } },
+    );
+    assert.equal(merged.summary, "Added add()\n\n**Unit test fixes:** Fixed the sign");
+    assert.equal(merged.validation, "npm test");
+    assert.deepEqual(merged.comment_responses?.map((response) => `${response.comment_id}:${response.status}`), ["C1:addressed", "C2:addressed"]);
+    assert.deepEqual(merged.unit_tests?.commands, ["npm run test:unit"]);
+  });
+
+  test("failing runs go back to the author with the command, the problem and the output", () => {
+    const prompt = unitTestFailurePrompt({ command: "npm test", problem: "exited with code 1 after 4 s", output: "FAIL add.test.js\nexpected 3, received -1\n" }, 2, 3);
+    assert.match(prompt, /`npm test` exited with code 1 after 4 s\./);
+    assert.match(prompt, /expected 3, received -1/);
+    assert.match(prompt, /Never skip, delete or weaken tests/);
+    assert.match(prompt, /fix attempt 2 of 3/);
+    const env = { worktree: cwd, branch: "t--coder", taskBranch: "t", baseSha: "abc1234567" };
+    assert.match(systemPromptFor("coder", env), /Unit tests are part of the change/);
+    assert.match(systemPromptFor("resolver", { ...env, branch: "t--resolver" }), /run the build and the unit tests again until they all pass/);
+    assert.match(systemPromptFor("code-reviewer", { ...env, branch: null }), /Never approve while the unit tests fail/);
+  });
+
+  test("the manager runs commands in the agents' shell, with their exit code, output and a stop for silent runs", async () => {
+    const options = { cwd: process.cwd(), timeoutMs: 60_000, silenceMs: 30_000 };
+    const passed = await runShellCommand(`node -e "console.log('hello from the test run')"`, options);
+    assert.equal(passed.exitCode, 0);
+    assert.match(passed.output, /hello from the test run/);
+    assert.equal((await runShellCommand(`node -e "process.exit(3)"`, options)).exitCode, 3);
+    if (process.platform === "win32") {
+      const chained = await runShellCommand(`node -e "process.exit(2)"; Write-Output "after the failure"`, options);
+      assert.equal(chained.exitCode, 2, "a failed native command fails the run even when a later statement succeeds");
+    }
+    const silent = await runShellCommand(`node -e "setTimeout(() => {}, 60000)"`, { ...options, silenceMs: 1500 });
+    assert.equal(silent.stopped, "silent");
+    assert.equal(silent.exitCode, null);
+    assert.ok(silent.durationMs < 20_000, `stopped after ${silent.durationMs} ms`);
+    const controller = new AbortController();
+    const cancelled = runShellCommand(`node -e "setTimeout(() => {}, 60000)"`, { ...options, signal: controller.signal });
+    setTimeout(() => controller.abort(), 500);
+    assert.equal((await cancelled).stopped, "cancelled");
+  });
+});
+
+describe("isolation between tasks", () => {
+  test("agents cannot install tools, packages or settings that every task on the machine shares", () => {
+    const executor = { readOnly: false, executeOnly: true, workingDirectory: cwd };
+    for (const command of [
+      "npm install -g typescript",
+      "npm i --global eslint",
+      "pnpm add -g vitest",
+      "yarn global add jest",
+      "dotnet tool install --global dotnet-ef",
+      "pip install --user requests",
+      "python -m pip install --user pytest",
+      "winget install Git.Git",
+      "choco install nodejs -y",
+      "sudo apt-get install -y libssl-dev",
+      "brew install jq",
+      "msiexec /i tool.msi /qn",
+      "setx PATH C:\\tools",
+      "Install-Module Pester -Scope AllUsers -Force",
+      "npm test; npm install -g rimraf",
+    ]) {
+      assert.equal(evaluatePermission(shell(command, []), author).kind, "reject", command);
+      assert.equal(evaluatePermission(shell(command, []), executor).kind, "reject", command);
+    }
+    for (const command of [
+      "npm install",
+      "npm ci",
+      "npm i -D jest",
+      "pip install -r requirements.txt",
+      "python -m venv .venv",
+      "dotnet tool install dotnet-ef",
+      "dotnet tool restore",
+      "Install-Module Pester -Scope CurrentUser -Force",
+      "go test ./...",
+      "npm run test -- --grep global",
+    ]) {
+      assert.equal(evaluatePermission(shell(command, []), author).kind, "approve-once", command);
+    }
+    const rejected = evaluatePermission(shell("npm install -g typescript", []), author);
+    assert.match(rejected.kind === "reject" ? rejected.feedback : "", /other tasks on this machine share/);
+  });
+
+  test("the per-repository test lock reports while another task holds it", async () => {
+    const mutex = new KeyedMutex();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const held = mutex.run("repo#tests", () => gate);
+    assert.equal(mutex.busy("repo#tests"), true);
+    assert.equal(mutex.busy("other-repo#tests"), false);
+    release();
+    await held;
+    assert.equal(mutex.busy("repo#tests"), false);
+  });
+
+  test("the manager's test runs get the task's own temp folder and the worktree's own toolchain first", () => {
+    const worktree = fs.mkdtempSync(path.join(os.tmpdir(), "agent-hub-env-"));
+    try {
+      const tempDir = path.join(worktree, "..", "tmp");
+      assert.deepEqual(testRunEnv(worktree, tempDir), { TMP: tempDir, TEMP: tempDir, TMPDIR: tempDir, MSBUILDDISABLENODEREUSE: "1" });
+      fs.mkdirSync(path.join(worktree, ".venv"));
+      fs.writeFileSync(path.join(worktree, ".venv", "pyvenv.cfg"), "home = /usr/bin\n");
+      fs.mkdirSync(path.join(worktree, "node_modules", ".bin"), { recursive: true });
+      const env = testRunEnv(worktree, tempDir);
+      assert.equal(env.VIRTUAL_ENV, path.join(worktree, ".venv"));
+      const [venvBin, nodeBin] = env.PATH!.split(path.delimiter);
+      assert.equal(venvBin, path.join(worktree, ".venv", process.platform === "win32" ? "Scripts" : "bin"));
+      assert.equal(nodeBin, path.join(worktree, "node_modules", ".bin"));
+    } finally {
+      fs.rmSync(worktree, { recursive: true, force: true });
+    }
+  });
+
+  test("a process a command leaves running is stopped and holds neither the run nor its result", async () => {
+    // Detached on Windows, so only the shell's job object can catch it once its parent has exited.
+    const leftover = `const c = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'inherit', detached: ${process.platform === "win32"} }); c.unref(); console.log('tests done, server ' + c.pid)`;
+    const result = await runShellCommand(`node -e "${leftover}"`, { cwd: process.cwd(), timeoutMs: 60_000, silenceMs: 30_000 });
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stopped, undefined);
+    assert.ok(result.durationMs < 10_000, `returned after ${result.durationMs} ms`);
+    const pid = Number(/tests done, server (\d+)/.exec(result.output)?.[1]);
+    assert.ok(pid > 0, result.output);
+    const alive = () => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (let waited = 0; alive() && waited < 3000; waited += 100) await new Promise((resolve) => setTimeout(resolve, 100));
+    try {
+      assert.equal(alive(), false, `process ${pid} still runs`);
+    } finally {
+      if (alive()) process.kill(pid);
+    }
   });
 });
 

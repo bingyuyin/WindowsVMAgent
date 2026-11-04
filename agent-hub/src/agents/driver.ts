@@ -5,6 +5,18 @@ export interface WorkSubmissionInput {
   summary: string;
   validation?: string;
   comment_responses?: Array<{ comment_id: string; status: "addressed" | "declined"; note: string }>;
+  /** Coding stage: the unit tests the author ran, which the manager re-runs before the review. */
+  unit_tests?: UnitTestsInput;
+}
+
+export interface UnitTestsInput {
+  status: TestStatus;
+  commands: string[];
+  total?: number;
+  passed?: number;
+  failed?: number;
+  skipped?: number;
+  reason?: string;
 }
 
 /** Arguments of the `submit_review` tool called by reviewer agents. */
@@ -41,7 +53,7 @@ export interface PlanSubmissionInput {
  * payload and throws a descriptive error when it is unacceptable, so the agent can retry.
  */
 export type SubmitChannel =
-  | { kind: "work"; onSubmit: (input: WorkSubmissionInput) => void | Promise<void> }
+  | { kind: "work"; onSubmit: (input: WorkSubmissionInput) => void | Promise<void>; unitTests?: boolean }
   | { kind: "review"; onSubmit: (input: ReviewSubmissionInput) => void | Promise<void> }
   | { kind: "test"; onSubmit: (input: TestRunSubmissionInput) => void | Promise<void> }
   | { kind: "plan"; onSubmit: (input: PlanSubmissionInput) => void | Promise<void> };

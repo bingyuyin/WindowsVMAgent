@@ -220,6 +220,7 @@ export const isDocStage = (stage) => stage === "design" || stage === "document";
 
 export function phaseLabel(stage, phase) {
   if (phase === "planning") return "Planning";
+  if (phase === "verifying") return "Verifying unit tests";
   if (stage === "testing" && phase === "reviewing") return "Running tests";
   if (stage === "testing" && (phase === "authoring" || phase === "revising")) return "Fixing test failures";
   const noun = stage === "design" ? "design" : stage === "document" ? "document" : "code";

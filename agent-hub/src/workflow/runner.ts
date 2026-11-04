@@ -5,6 +5,7 @@ import type { Bus } from "../bus.ts";
 import { describeContext, discoverContext, type HubSkills } from "../context.ts";
 import { formatOfPath, type DocTemplates } from "../docs.ts";
 import { branchWebUrl, primaryRemote, pullRequestPageUrl, pushBranch, sanitizeRemoteUrl, type PullRequestCreator } from "../remote.ts";
+import type { CommandRunner } from "../shell.ts";
 import {
   deleteBranch,
   deleteBranchesWithPrefix,
@@ -77,6 +78,8 @@ export interface RunnerDeps {
   monitorIntervalMs?: number;
   /** Silence after which the manager posts a check-in about a working agent (default 5 min). */
   stallAfterMs?: number;
+  /** Runs the coding agents' unit test commands when the manager verifies them (default: the real shell). */
+  runCommand?: CommandRunner;
 }
 
 interface RunningTask {
@@ -654,6 +657,7 @@ export class TaskRunner {
       task.context = await discoverContext(repo.path, task.baseSha!);
       this.emit(task, { type: "info", text: `Repository context: ${describeContext(task.context)}`, data: { context: true } });
       this.publish(task);
+      const testRunsKey = `${repo.path}#tests`;
       const engine = new WorkflowEngine(task, {
         driver,
         workspace,
@@ -661,6 +665,8 @@ export class TaskRunner {
         hooks,
         hubSkills: this.deps.hubSkills,
         docTemplates: this.deps.docTemplates,
+        runCommand: this.deps.runCommand,
+        testRuns: { busy: () => this.repoLocks.busy(testRunsKey), run: (work) => this.repoLocks.run(testRunsKey, work) },
       });
       entry.engine = engine;
       await engine.run();
@@ -1055,6 +1061,12 @@ export function pullRequestBody(task: Task): string {
       const counts = result.tests.total !== undefined ? ` (${result.tests.passed ?? "?"}/${result.tests.total} passed)` : "";
       const commands = result.tests.commands.length ? ` · ${result.tests.commands.slice(0, 3).map((command) => `\`${command}\``).join(", ")}` : "";
       lines.push(`**Tests:** ${result.tests.status}${counts}${commands}`);
+    }
+    if (result.unitTests) {
+      const commands = result.unitTests.commands.slice(0, 3).map((command) => `\`${command}\``).join(", ");
+      lines.push(
+        `**Unit tests:** ${result.unitTests.status}${result.unitTests.verified ? ", re-run by the hub before the review" : ""}${commands ? ` · ${commands}` : ""}`,
+      );
     }
   }
   const agents = (task.agents ?? []).filter((agent) => agent.turns > 0);

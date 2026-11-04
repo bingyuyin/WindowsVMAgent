@@ -12,6 +12,7 @@ import { createApiRouter } from "../src/http/api.ts";
 import { createHttpServer } from "../src/http/server.ts";
 import type { PullRequestCreator, PullRequestRequest } from "../src/remote.ts";
 import type { RepoService } from "../src/repos.ts";
+import { runShellCommand, type CommandRunner } from "../src/shell.ts";
 import { summarizeTask } from "../src/workflow/summary.ts";
 import {
   addRemote,
@@ -22,6 +23,7 @@ import {
   designPathFrom,
   git,
   hang,
+  PASSING_UNIT_TESTS,
   steps,
   submitReview,
   submitPlan,
@@ -282,11 +284,15 @@ describe("coding workflow", () => {
         async (spec) => {
           if (spec.submit.kind !== "work") throw new Error("unexpected");
           try {
-            await spec.submit.onSubmit({ summary: "no responses" });
+            await spec.submit.onSubmit({ summary: "no responses", unit_tests: PASSING_UNIT_TESTS });
           } catch (error) {
             rejection = error as Error;
           }
-          await spec.submit.onSubmit({ summary: "with responses", comment_responses: [{ comment_id: "C1", status: "addressed", note: "done" }] });
+          await spec.submit.onSubmit({
+            summary: "with responses",
+            comment_responses: [{ comment_id: "C1", status: "addressed", note: "done" }],
+            unit_tests: PASSING_UNIT_TESTS,
+          });
         },
       ],
       "code-reviewer": [submitReview("request_changes", [{ severity: "minor", body: "rename" }]), submitReview("approve")],
@@ -361,6 +367,244 @@ describe("coding workflow", () => {
       // Cancelled tasks keep their worktrees for inspection or retry.
       assert.ok(fs.existsSync(task.workspaceRoot!));
     } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("coding: unit tests pass before every review", () => {
+  test("code, then passing unit tests, then review; review fixes are tested again before the next review", async () => {
+    let runs = 0;
+    const runCommand: CommandRunner = async () => {
+      runs++;
+      return runs === 1 ? { exitCode: 1, durationMs: 40, output: "FAIL add.test.js\n  expected 3, received -1" } : { exitCode: 0, durationMs: 40, output: "ok" };
+    };
+    const h = createHarness(
+      {
+        coder: [
+          steps(writeFile("add.js", "export const add = (a, b) => a - b;\n"), submitWork("Added add()")),
+          steps((_spec, prompt) => {
+            assert.match(prompt, /## The unit tests fail: fix them before the review/);
+            assert.match(prompt, /`npm test` exited with code 1/);
+            assert.match(prompt, /expected 3, received -1/);
+            assert.match(prompt, /fix attempt 1 of 3/);
+          }, writeFile("add.js", "export const add = (a, b) => a + b;\n"), submitWork("Fixed the sign in add()")),
+        ],
+        resolver: [
+          steps((_spec, prompt) => {
+            assert.match(prompt, /run the unit tests and iterate until they all pass/i);
+          }, writeFile("add.js", "export const add = (a, b) => Number(a) + Number(b);\n"), submitWork("Coerce inputs", [{ comment_id: "C1", status: "addressed", note: "Coerced" }])),
+        ],
+        "code-reviewer": [
+          steps((_spec, prompt) => {
+            assert.match(prompt, /Unit tests: all pass\. The manager re-ran `npm test` in the author's worktree before this review/);
+            assert.match(prompt, /\*\*Unit test fixes:\*\* Fixed the sign in add\(\)/);
+          }, submitReview("request_changes", [{ severity: "major", body: "Coerce string inputs" }])),
+          steps((_spec, prompt) => {
+            assert.match(prompt, /Unit tests: all pass/);
+          }, submitReview("approve")),
+        ],
+      },
+      { runCommand },
+    );
+    try {
+      const created = await h.runner.submit({ description: "Add an add() helper", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(task.result?.approved, true);
+      assert.equal(runs, 3, "round 1 ran twice (fail, then pass), round 2 once");
+      const [round1, round2] = task.stages[0]!.rounds;
+      assert.deepEqual(
+        [round1!.author!.unitTests?.status, round1!.author!.unitTests?.verified, round1!.author!.unitTests?.fixAttempts],
+        ["passed", true, 1],
+      );
+      assert.deepEqual(round1!.author!.unitTests?.commands, ["npm test"]);
+      assert.equal(round2!.author!.unitTests?.status, "passed");
+      assert.equal(round2!.author!.unitTests?.fixAttempts, 0);
+      assert.equal(task.result?.unitTests?.status, "passed");
+      assert.match(git(h.repoPath, "show", `${round1!.author!.commit}:add.js`), /a \+ b/, "the reviewed commit holds the fixed code");
+      const toCoder = h.store.recentComm({ taskId: task.id }).filter((entry) => entry.to === "coder" && entry.kind === "relay");
+      assert.match(toCoder[0]!.text, /^Unit tests fail \(npm test exited with code 1/);
+      const events = await h.store.readEvents(task.id);
+      assert.ok(events.some((event) => event.type === "phase" && event.text === "Verifying unit tests"));
+      assert.ok(events.some((event) => /^Unit tests pass: `npm test`/.test(event.text)));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("an agent that reports failing unit tests must fix them before it can submit", async () => {
+    let rejection = "";
+    const h = createHarness({
+      coder: [
+        async (spec) => {
+          if (spec.submit.kind !== "work") throw new Error("unexpected");
+          await Promise.resolve(
+            spec.submit.onSubmit({ summary: "done?", unit_tests: { status: "failed", commands: ["npm test"], total: 3, passed: 2, failed: 1 } }),
+          ).catch((error: Error) => (rejection = error.message));
+          await spec.submit.onSubmit({ summary: "done", unit_tests: PASSING_UNIT_TESTS });
+        },
+      ],
+      "code-reviewer": [submitReview("approve")],
+    });
+    try {
+      await h.runner.submit({ description: "Fix it", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      assert.match(rejection, /The unit tests still fail\. Fix the cause/);
+      assert.equal(h.store.tasks[0]!.result?.approved, true);
+      assert.deepEqual(h.commands.map((entry) => entry.command), ["npm test"]);
+      assert.equal(path.basename(h.commands[0]!.cwd), "author", "the tests run in the author's worktree");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("tests that still fail after the fix attempts reach the reviewer flagged, and it cannot approve", async () => {
+    let rejection = "";
+    const h = createHarness(
+      {
+        coder: [submitWork("v1"), submitWork("try 1"), submitWork("try 2"), submitWork("try 3")],
+        "code-reviewer": [
+          async (spec, prompt) => {
+            assert.match(prompt, /Unit tests: FAILING - the manager's run of `npm test` still failed after 3 fix attempt\(s\) \(exit code 1\)/);
+            assert.match(prompt, /1 failing/);
+            await Promise.resolve(submitReview("approve")(spec, prompt)).catch((error: Error) => (rejection = error.message));
+            await submitReview("request_changes", [{ severity: "blocker", body: "The unit tests fail" }])(spec, prompt);
+          },
+        ],
+      },
+      { runCommand: async () => ({ exitCode: 1, durationMs: 5, output: "1 failing" }), settings: { maxRounds: 1 } },
+    );
+    try {
+      const created = await h.runner.submit({ description: "Hard change", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.match(rejection, /fail, so it cannot be approved/);
+      assert.equal(h.driver.prompts.coder!.length, 4, "the first submission plus three fix attempts");
+      assert.deepEqual([task.stages[0]!.rounds[0]!.author!.unitTests?.status, task.stages[0]!.rounds[0]!.author!.unitTests?.fixAttempts], ["failed", 3]);
+      assert.equal(task.result?.approved, false);
+      assert.equal(task.result?.unitTests?.status, "failed");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("tests the author cannot run are not executed; the reviewer weighs the reason", async () => {
+    const h = createHarness({
+      coder: [submitWork("Changed the SQL", [], { status: "blocked", commands: [], reason: "The tests need a SQL Server instance that is not available" })],
+      "code-reviewer": [
+        steps((_spec, prompt) => {
+          assert.match(prompt, /Unit tests: NOT PASSING - the author reports they cannot run or pass: The tests need a SQL Server instance/);
+        }, submitReview("approve")),
+      ],
+    });
+    try {
+      await h.runner.submit({ description: "Change the query", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.tasks[0]!;
+      assert.equal(task.result?.approved, true);
+      assert.equal(task.stages[0]!.rounds[0]!.author!.unitTests?.status, "blocked");
+      assert.deepEqual(h.commands, [], "nothing to run");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("the manager re-runs the reported commands for real and keeps their side effects out of the commit", async () => {
+    const check = [
+      "const fs = require('fs');",
+      "fs.writeFileSync('run-artifact.txt', 'written by the test run');",
+      "fs.appendFileSync('README.md', 'touched by the test run');",
+      "if (!fs.existsSync('ready.txt')) { console.error('ready.txt is missing'); process.exit(1); }",
+      "",
+    ].join("\n");
+    const tests = { status: "passed" as const, commands: ["node check.js"], total: 1, passed: 1, failed: 0 };
+    const h = createHarness(
+      {
+        coder: [
+          steps(writeFile("check.js", check), submitWork("Added the check", [], tests)),
+          steps((_spec, prompt) => {
+            assert.match(prompt, /`node check\.js` exited with code 1/);
+            assert.match(prompt, /ready\.txt is missing/);
+          }, writeFile("ready.txt", "ready\n"), submitWork("Added ready.txt", [], tests)),
+        ],
+        "code-reviewer": [submitReview("approve")],
+      },
+      { runCommand: runShellCommand },
+    );
+    try {
+      const created = await h.runner.submit({ description: "Add a readiness check", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(task.stages[0]!.rounds[0]!.author!.unitTests?.status, "passed");
+      const files = git(h.repoPath, "ls-tree", "-r", "--name-only", task.branch!).split("\n");
+      assert.ok(files.includes("check.js") && files.includes("ready.txt"));
+      assert.ok(!files.includes("run-artifact.txt"), "files the test run created are not committed");
+      assert.equal(git(h.repoPath, "show", `${task.branch}:README.md`), "# Sample", "files the test run changed are restored");
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("isolation between tasks on one repository", () => {
+  test("parallel tasks verify their unit tests one at a time, each in its own worktree and temp folder", async () => {
+    const port = await new Promise<number>((resolve) => {
+      const probe = net.createServer().listen(0, "127.0.0.1", () => {
+        const { port: free } = probe.address() as net.AddressInfo;
+        probe.close(() => resolve(free));
+      });
+    });
+    // Tests with the classic collisions: a fixed port, and a fixed file in the temp folder that is never cleaned up.
+    const check = (name: string) =>
+      [
+        "const fs = require('fs'), os = require('os'), path = require('path'), net = require('net');",
+        "const marker = path.join(os.tmpdir(), 'isolation-marker.txt');",
+        "if (fs.existsSync(marker)) { console.error('leftover from another run: ' + fs.readFileSync(marker, 'utf8')); process.exit(1); }",
+        `fs.writeFileSync(marker, '${name}');`,
+        "const server = net.createServer();",
+        "server.on('error', (error) => { console.error('port taken: ' + error.code); process.exit(1); });",
+        `server.listen(${port}, '127.0.0.1', () => setTimeout(() => server.close(() => process.exit(0)), 1500));`,
+        "",
+      ].join("\n");
+    const tests = { status: "passed" as const, commands: ["node check.js"], total: 1, passed: 1, failed: 0 };
+    let started = 0;
+    let release!: () => void;
+    const bothCoding = new Promise<void>((resolve) => (release = resolve));
+    const coder =
+      (name: string): Step =>
+      async (spec, prompt) => {
+        if (++started === 2) release();
+        await bothCoding;
+        await writeFile("check.js", check(name))(spec, prompt);
+        await writeFile(`${name}.txt`, `${name}\n`)(spec, prompt);
+        await submitWork(`Work of ${name}`, [], tests)(spec, prompt);
+      };
+    const h = createHarness(
+      { coder: [coder("task-a"), coder("task-b")], "code-reviewer": [submitReview("approve"), submitReview("approve")] },
+      { runCommand: runShellCommand, settings: { maxConcurrency: 2, cleanupWorktrees: false } },
+    );
+    try {
+      const first = await h.runner.submit({ description: "Task A", kind: "coding", repoId: "sample" });
+      const second = await h.runner.submit({ description: "Task B", kind: "coding", repoId: "sample" });
+      await h.runner.idle();
+      const tasks = [h.store.getTask(first.id)!, h.store.getTask(second.id)!];
+      for (const task of tasks) {
+        assert.equal(task.status, "completed");
+        const unitTests = task.stages[0]!.rounds[0]!.author!.unitTests!;
+        assert.deepEqual([unitTests.status, unitTests.fixAttempts], ["passed", 0], `${task.id}: ${unitTests.logExcerpt ?? ""}`);
+        assert.ok(fs.existsSync(path.join(task.workspaceRoot!, "tmp", "isolation-marker.txt")), "each task's run used its own temp folder");
+      }
+      const [filesA, filesB] = tasks.map((task) => git(h.repoPath, "ls-tree", "--name-only", task.branch!).split("\n"));
+      assert.equal(filesA!.includes("task-a.txt") !== filesA!.includes("task-b.txt"), true, "each branch holds only its own task's work");
+      assert.equal(filesB!.includes("task-a.txt") !== filesB!.includes("task-b.txt"), true);
+      assert.notDeepEqual(filesA, filesB);
+      const events = (await Promise.all(tasks.map((task) => h.store.readEvents(task.id)))).flat();
+      assert.equal(events.filter((event) => /Another task is running unit tests on this repository/.test(event.text)).length, 1, "the second run waited for the first");
+    } finally {
+      release();
       h.cleanup();
     }
   });

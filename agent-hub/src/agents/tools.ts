@@ -34,6 +34,39 @@ export const submitWorkSchema = {
   required: ["summary"],
 } as const;
 
+export const unitTestsSchema = {
+  type: "object",
+  description:
+    "The unit tests you ran after your last change. The manager re-runs these commands in your working directory before the review; the round only goes to review when they pass.",
+  properties: {
+    status: {
+      type: "string",
+      enum: ["passed", "failed", "blocked"],
+      description:
+        "passed: every command ran and all tests passed. failed: tests still fail - fix them before you submit. blocked: the tests cannot run or pass for a reason outside your change (a missing tool or service, failures that already happen at the base commit, no unit tests can cover this change); explain in reason.",
+    },
+    commands: {
+      type: "array",
+      description:
+        "The exact unit test commands you ran, one per entry and as you ran them in your shell: no install or setup steps, no chaining. Each must exit non-zero when a test fails (for example Invoke-Pester -CI).",
+      items: { type: "string" },
+    },
+    total: { type: "integer", description: "Number of tests that ran." },
+    passed: { type: "integer" },
+    failed: { type: "integer" },
+    skipped: { type: "integer" },
+    reason: { type: "string", description: "Required when status is blocked: what prevents the tests from running or passing." },
+  },
+  required: ["status", "commands"],
+} as const;
+
+/** submit_work for coding agents: the unit tests are part of every submission. */
+export const submitCodeSchema = {
+  ...submitWorkSchema,
+  properties: { ...submitWorkSchema.properties, unit_tests: unitTestsSchema },
+  required: ["summary", "unit_tests"],
+} as const;
+
 export const submitReviewSchema = {
   type: "object",
   properties: {
@@ -143,9 +176,10 @@ export function buildSubmitTool(channel: SubmitChannel): Tool<any> {
   switch (channel.kind) {
     case "work":
       return defineTool<WorkSubmissionInput>(SUBMIT_WORK_TOOL, {
-        description:
-          "Submit your work for this round to the reviewer. Call exactly once, as your final action, after the round's work is complete.",
-        parameters: submitWorkSchema,
+        description: channel.unitTests
+          ? "Submit your work for this round to the reviewer, with the unit tests you ran. Call exactly once, as your final action, after the round's work is complete and the unit tests pass."
+          : "Submit your work for this round to the reviewer. Call exactly once, as your final action, after the round's work is complete.",
+        parameters: channel.unitTests ? submitCodeSchema : submitWorkSchema,
         handler: async (args) => {
           await channel.onSubmit(args);
           return "Submission recorded. Your turn is complete.";

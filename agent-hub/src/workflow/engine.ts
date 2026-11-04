@@ -12,6 +12,8 @@ import {
   type WorkSubmissionInput,
 } from "../agents/driver.ts";
 import path from "node:path";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
 import {
   authorPrompt,
   executionPrompt,
@@ -25,8 +27,10 @@ import {
   restartNote,
   reviewPrompt,
   systemPromptFor,
+  unitTestFailurePrompt,
   type DesignContext,
 } from "../agents/prompts.ts";
+import { evaluatePermission } from "../agents/policy.ts";
 import { skillsForRole, type HubSkills } from "../context.ts";
 import { DOC_EXTENSIONS, documentProblem, formatOfPath, renderDocTemplate, type DocTemplates } from "../docs.ts";
 import type { AgentWorkspace, TaskWorkspace } from "../git.ts";
@@ -54,12 +58,15 @@ import {
   type StageKind,
   type Task,
   type TestRunInfo,
+  type UnitTestCheck,
 } from "../types.ts";
+import { runShellCommand, type CommandRunner } from "../shell.ts";
 import { CancelledError, errorMessage, firstLine, nowIso, settledWithin, slugify, truncate } from "../util.ts";
 import {
   fallbackReview,
   fallbackTestRun,
   heuristicPlan,
+  mergeWork,
   normalizePlan,
   normalizeReview,
   normalizeTestRun,
@@ -86,10 +93,17 @@ export interface EngineHooks {
 export interface EngineOptions {
   driver: AgentDriver;
   workspace: TaskWorkspace;
-  settings: Pick<Settings, "designDocDir" | "documentDir" | "docFormat" | "turnTimeoutMinutes" | "cleanupWorktrees">;
+  settings: Pick<Settings, "designDocDir" | "documentDir" | "docFormat" | "turnTimeoutMinutes" | "stuckAgentMinutes" | "cleanupWorktrees">;
   hooks: EngineHooks;
   hubSkills?: HubSkills;
   docTemplates?: DocTemplates | null;
+  /** Runs the coding agents' unit test commands when the manager verifies them (default: the real shell). */
+  runCommand?: CommandRunner;
+  /**
+   * One unit-test verification at a time on the task's repository, across tasks: test runs of different tasks
+   * may still share ports, databases or fixed paths outside their worktrees.
+   */
+  testRuns?: { busy(): boolean; run<T>(work: () => Promise<T>): Promise<T> };
 }
 
 interface ActiveAgent {
@@ -103,11 +117,26 @@ interface ActiveAgent {
   restartPrompt?: () => Promise<string>;
 }
 
+type AuthorWork = { input: WorkSubmissionInput; fallback: boolean };
+
+/** The manager's run of a round's unit test commands; on failure, the command that failed and how. */
+interface UnitTestRun {
+  passed: boolean;
+  command: string;
+  problem: string;
+  output: string;
+  durationMs: number;
+  exitCode: number | null;
+  stopped?: UnitTestCheck["stopped"];
+}
+
 const MAX_SUBMIT_NUDGES = 2;
 /** Recoveries per turn: interrupt and continue, then fresh sessions; after that the task fails (Retry resumes it). */
 export const MAX_RECOVERIES = 3;
 /** How long a stuck session gets to let go of its turn (abort, disconnect) before the manager moves on. */
 const STOP_GRACE_MS = 30_000;
+/** Times failing unit tests go back to the coding agent before the round goes to review anyway (flagged). */
+export const MAX_TEST_FIX_ATTEMPTS = 3;
 const MAX_ROUND_DIFF_BYTES = 60_000;
 const CO_AUTHOR = "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>";
 const COMMENT_PREFIX: Record<StageKind, string> = { design: "D", document: "W", coding: "C", testing: "T" };
@@ -151,6 +180,10 @@ export class WorkflowEngine {
   private pendingTest: TestRunSubmissionInput | null = null;
   private pendingPlan: PlanSubmissionInput | null = null;
   private expectedCommentIds: string[] = [];
+  /** A resubmission after failing unit tests need not repeat comment responses. */
+  private partialResponses = false;
+  /** The round under review failed the unit-test gate, so it cannot be approved. */
+  private unitTestsFailing = false;
   private currentAuthorWorkspace: AgentWorkspace | null = null;
   /** Template content the current document was seeded with (to detect an unmodified template). */
   private seededDoc: string | null = null;
@@ -545,11 +578,13 @@ export class WorkflowEngine {
     };
     const prompt = await buildPrompt(fresh);
     this.currentAuthorWorkspace = ws;
-    const submission = await this.runAuthorTurn(agent, prompt, () => buildPrompt(true), context.open);
+    let submission = await this.runAuthorTurn(agent, prompt, () => buildPrompt(true), context.open);
+    let unitTests: UnitTestCheck | undefined;
+    if (kind === "coding") ({ submission, unitTests } = await this.unitTestGate(agent, stage, round, ws, submission));
     hooks.agent(role, (info) => {
       info.status = "idle";
     });
-    return this.recordAuthorRound(stage, round, role, ws, startHead, submission.input, submission.fallback, context.open, fromUser);
+    return this.recordAuthorRound(stage, round, role, ws, startHead, submission.input, submission.fallback, context.open, fromUser, unitTests);
   }
 
   private async reviewTurn(stage: Stage, round: Round, role: AgentRole, design: DesignContext | undefined): Promise<ReviewSubmission> {
@@ -590,6 +625,7 @@ export class WorkflowEngine {
         ? this.buildExecutionPrompt(stage, round, includeContext, design, reviewedSha)
         : this.buildReviewPrompt(stage, round, includeContext, design, reviewedSha);
     const prompt = await build(fresh);
+    this.unitTestsFailing = round.author?.unitTests?.status === "failed";
     const review = executor
       ? await this.runTestTurn(agent, prompt, () => build(true), stage, reviewedSha)
       : await this.runReviewTurn(agent, prompt, () => build(true), stage, reviewedSha);
@@ -672,9 +708,18 @@ export class WorkflowEngine {
   private submitChannelFor(role: AgentRole, stageKind: StageKind | undefined): SubmitChannel {
     if (role === "planner") return { kind: "plan", onSubmit: (input) => void (this.pendingPlan = normalizePlan(input)) };
     if (role === "executor") return { kind: "test", onSubmit: (input) => void (this.pendingTest = normalizeTestRun(input)) };
-    if (isReviewerRole(role)) return { kind: "review", onSubmit: (input) => void (this.pendingReview = normalizeReview(input)) };
+    if (isReviewerRole(role)) return { kind: "review", onSubmit: (input) => void (this.pendingReview = this.checkVerdict(normalizeReview(input))) };
     if (!stageKind) throw new Error(`${role} needs a stage`);
-    return { kind: "work", onSubmit: (input) => this.acceptWork(input, stageKind) };
+    return { kind: "work", unitTests: stageKind === "coding", onSubmit: (input) => this.acceptWork(input, stageKind) };
+  }
+
+  private checkVerdict(review: ReviewSubmissionInput): ReviewSubmissionInput {
+    if (review.verdict === "approve" && this.unitTestsFailing) {
+      throw new Error(
+        "The unit tests of this round fail, so it cannot be approved. Call submit_review with request_changes and a blocker comment about the failing tests.",
+      );
+    }
+    return review;
   }
 
   private async releaseAgent(role: AgentRole, status: AgentStatus): Promise<void> {
@@ -769,7 +814,7 @@ export class WorkflowEngine {
   }
 
   private async acceptWork(input: WorkSubmissionInput, stageKind: StageKind): Promise<void> {
-    const normalized = normalizeWork(input, this.expectedCommentIds);
+    const normalized = normalizeWork(input, this.expectedCommentIds, { unitTests: stageKind === "coding", partialResponses: this.partialResponses });
     if (isDocStage(stageKind)) {
       const stage = this.stage(stageKind);
       const content = await this.currentAuthorWorkspace?.readFile(stage.docPath!);
@@ -781,15 +826,22 @@ export class WorkflowEngine {
     this.pendingWork = normalized;
   }
 
-  private async runAuthorTurn(
+  private async runAuthorTurn(agent: ActiveAgent, prompt: string, restartPrompt: () => Promise<string>, open: ReviewComment[]): Promise<AuthorWork> {
+    this.expectedCommentIds = open.map((comment) => comment.id);
+    const { input, lastMessage } = await this.collectWork(agent, prompt, restartPrompt);
+    if (input) return { input, fallback: false };
+    this.options.hooks.emit({ type: "warning", role: agent.role, text: "Agent never called submit_work; using its last message as the round summary." });
+    return { input: { summary: lastMessage?.trim() || "(no summary provided)" }, fallback: true };
+  }
+
+  /** Sends a prompt and waits for submit_work, nudging an agent that ends its turn without it. */
+  private async collectWork(
     agent: ActiveAgent,
     prompt: string,
-    restartPrompt: () => Promise<string>,
-    open: ReviewComment[],
-  ): Promise<{ input: WorkSubmissionInput; fallback: boolean }> {
+    restartPrompt?: () => Promise<string>,
+  ): Promise<{ input: WorkSubmissionInput | null; lastMessage?: string }> {
     const role = agent.role;
     this.pendingWork = null;
-    this.expectedCommentIds = open.map((comment) => comment.id);
     let result = await this.send(agent, prompt, restartPrompt);
     for (let nudge = 0; !this.submittedWork() && nudge < MAX_SUBMIT_NUDGES; nudge++) {
       this.throwIfAborted();
@@ -797,10 +849,161 @@ export class WorkflowEngine {
       this.options.hooks.comm({ from: "manager", to: role, kind: "nudge", text: "Your turn ended without submit_work - finish the round and submit" });
       result = await this.send(agent, NUDGE_WORK);
     }
-    const submitted = this.submittedWork();
-    if (submitted) return { input: submitted, fallback: false };
-    this.options.hooks.emit({ type: "warning", role, text: "Agent never called submit_work; using its last message as the round summary." });
-    return { input: { summary: result.lastMessage?.trim() || "(no summary provided)" }, fallback: true };
+    return { input: this.submittedWork(), lastMessage: result.lastMessage };
+  }
+
+  /**
+   * The unit-test gate between a coding round and its review: the manager re-runs the unit tests the author
+   * reported in the author's worktree and hands failures back to the same agent until they pass (at most
+   * MAX_TEST_FIX_ATTEMPTS times). The reviewer then gets a round whose unit tests pass, or one flagged as
+   * failing that it cannot approve.
+   */
+  private async unitTestGate(
+    agent: ActiveAgent,
+    stage: Stage,
+    round: Round,
+    ws: AgentWorkspace,
+    submission: AuthorWork,
+  ): Promise<{ submission: AuthorWork; unitTests: UnitTestCheck }> {
+    const { hooks } = this.options;
+    const role = agent.role;
+    const label = ROLE_LABELS[role];
+    const roundRestart = agent.restartPrompt;
+    let current = submission;
+    for (let attempt = 0; ; attempt++) {
+      this.throwIfAborted();
+      const report = current.input.unit_tests;
+      const counts = { total: report?.total, passed: report?.passed, failed: report?.failed, skipped: report?.skipped };
+      if (report?.status === "blocked") {
+        hooks.emit({ type: "warning", role, text: `${label} reports that the unit tests cannot pass (${truncate(report.reason ?? "", 400)}); the reviewer weighs the reason.` });
+        return { submission: current, unitTests: { status: "blocked", commands: report.commands, ...counts, reason: report.reason, fixAttempts: attempt } };
+      }
+      const commands = report?.commands.length ? report.commands : this.knownUnitTestCommands(stage);
+      if (!commands.length) {
+        const reason = `the ${label.toLowerCase()} did not report which unit tests it ran`;
+        hooks.emit({ type: "warning", role, text: `Unit tests not verified: ${reason}. The reviewer cannot approve the round.` });
+        return { submission: current, unitTests: { status: "failed", commands: [], reason, fixAttempts: attempt } };
+      }
+      this.setPhase(stage.kind, "verifying", round.n);
+      const run = await this.runUnitTests(role, ws, commands);
+      this.throwIfAborted();
+      const unitTests: UnitTestCheck = {
+        status: run.passed ? "passed" : "failed",
+        commands,
+        ...counts,
+        verified: run.passed,
+        fixAttempts: attempt,
+        exitCode: run.exitCode,
+        durationMs: run.durationMs,
+        stopped: run.stopped,
+        logExcerpt: run.passed ? undefined : run.output.slice(-6000) || undefined,
+      };
+      const list = commands.map((command) => `\`${command}\``).join(", ");
+      if (run.passed) {
+        hooks.emit({ type: "info", text: `Unit tests pass: ${list} (${Math.round(run.durationMs / 1000)} s). Round ${round.n} goes to review.` });
+        hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", text: `Unit tests pass for round ${round.n} (${commands.join(", ")}); handing it to the reviewer` });
+        return { submission: current, unitTests };
+      }
+      const failure = `\`${run.command}\` ${run.problem}`;
+      if (attempt >= MAX_TEST_FIX_ATTEMPTS) {
+        hooks.emit({ type: "warning", role, text: `Unit tests still fail after ${attempt} fix attempt(s) (${failure}); the round goes to review flagged as failing.` });
+        hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", text: `Unit tests still fail after ${attempt} fix attempt(s); the reviewer gets round ${round.n} flagged and cannot approve it` });
+        return { submission: current, unitTests };
+      }
+      const next = `fix attempt ${attempt + 1} of ${MAX_TEST_FIX_ATTEMPTS}`;
+      hooks.emit({ type: "warning", role, text: `Unit tests fail: ${failure}. Sending the failures back to the ${label.toLowerCase()} (${next}).` });
+      hooks.comm({ from: "manager", to: role, kind: "relay", text: `Unit tests fail (${run.command} ${run.problem}) - fix them and submit again (${next})` });
+      this.setPhase(stage.kind, role === "resolver" ? "revising" : "authoring", round.n);
+      hooks.agent(role, (info) => {
+        info.status = "working";
+        info.assignment = `Fixing failing unit tests (${next})`;
+      });
+      const prompt = unitTestFailurePrompt(run, attempt + 1, MAX_TEST_FIX_ATTEMPTS);
+      this.partialResponses = true;
+      let fixed: { input: WorkSubmissionInput | null };
+      try {
+        fixed = await this.collectWork(agent, prompt, roundRestart && (async () => `${await roundRestart()}\n\n${prompt}`));
+      } finally {
+        this.partialResponses = false;
+      }
+      if (!fixed.input) {
+        hooks.emit({ type: "warning", role, text: "Agent did not resubmit after the unit test failures; the round goes to review flagged as failing." });
+        return { submission: current, unitTests };
+      }
+      current = { input: current.fallback ? fixed.input : mergeWork(current.input, fixed.input), fallback: false };
+    }
+  }
+
+  /** Runs unit test commands in the author's worktree, stopping at the first failure, and removes what the run left behind. */
+  private async runUnitTests(role: AgentRole, ws: AgentWorkspace, commands: string[]): Promise<UnitTestRun> {
+    const { hooks } = this.options;
+    const runs = this.options.testRuns;
+    hooks.agent(role, (info) => {
+      info.status = "idle";
+      info.assignment = `Waiting while the manager runs the unit tests: ${commands.join(", ")}`;
+    });
+    this.throwIfAborted();
+    if (!runs) return this.runUnitTestCommands(ws, commands);
+    if (runs.busy()) hooks.emit({ type: "info", text: "Another task is running unit tests on this repository; waiting for it to finish so the runs cannot interfere." });
+    const queued = runs.run(() => (hooks.signal.aborted ? Promise.resolve(CANCELLED_RUN) : this.runUnitTestCommands(ws, commands)));
+    let onAbort!: () => void;
+    const cancelled = new Promise<never>((_, reject) => {
+      onAbort = () => reject(new CancelledError());
+      hooks.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([queued, cancelled]);
+    } finally {
+      hooks.signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  private async runUnitTestCommands(ws: AgentWorkspace, commands: string[]): Promise<UnitTestRun> {
+    const { hooks, settings, workspace } = this.options;
+    const runCommand = this.options.runCommand ?? runShellCommand;
+    // A temp folder per task, emptied before every run, so leftovers of other tasks' runs cannot affect this one.
+    const tempDir = path.join(workspace.root, "tmp");
+    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    await fsp.mkdir(tempDir, { recursive: true });
+    const env = testRunEnv(ws.path, tempDir);
+    const before = await ws.changedPaths();
+    let durationMs = 0;
+    try {
+      for (const command of commands) {
+        // The hub runs what the agent reported, so the agent's own command restrictions (no push, no global installs) apply.
+        const policy = evaluatePermission({ kind: "shell", fullCommandText: command }, { readOnly: false, workingDirectory: ws.path });
+        if (policy.kind === "reject") return { passed: false, command, problem: `was not run: ${policy.feedback}`, output: "", durationMs, exitCode: null };
+        hooks.emit({ type: "info", text: `Running the unit tests to verify them before review: ${command}` });
+        const result = await runCommand(command, {
+          cwd: ws.path,
+          timeoutMs: settings.turnTimeoutMinutes * 60_000,
+          silenceMs: settings.stuckAgentMinutes * 60_000,
+          signal: hooks.signal,
+          env,
+        });
+        durationMs += result.durationMs;
+        if (result.stopped || result.exitCode !== 0) {
+          const problem =
+            result.stopped === "silent"
+              ? `printed nothing for ${settings.stuckAgentMinutes} min and was stopped (a test probably hangs)`
+              : result.stopped === "timeout"
+                ? `ran longer than ${settings.turnTimeoutMinutes} min and was stopped`
+                : result.stopped === "cancelled"
+                  ? "was cancelled"
+                  : `exited with code ${result.exitCode} after ${Math.round(result.durationMs / 1000)} s`;
+          return { passed: false, command, problem, output: result.output, durationMs, exitCode: result.exitCode, stopped: result.stopped };
+        }
+      }
+      return { passed: true, command: commands.at(-1)!, problem: "", output: "", durationMs, exitCode: 0 };
+    } finally {
+      const discarded = await ws.discardChangesSince(before);
+      if (discarded.length) hooks.emit({ type: "info", text: `Discarded ${discarded.length} file(s) the test run created or changed: ${truncate(discarded.join(", "), 300)}` });
+    }
+  }
+
+  /** Unit test commands an earlier round of the stage reported, for an author that does not report its own. */
+  private knownUnitTestCommands(stage: Stage): string[] {
+    return [...stage.rounds].reverse().find((round) => round.author?.unitTests?.commands.length)?.author?.unitTests?.commands ?? [];
   }
 
   /** Submissions arrive through tool callbacks while `send` is awaited, so read them via accessors. */
@@ -883,6 +1086,9 @@ export class WorkflowEngine {
       this.options.hooks.emit({ type: "warning", role, text: "Reviewer never called submit_review; deriving the verdict from its last message." });
       input = fallbackReview(result.lastMessage);
     }
+    if (input.verdict === "approve" && this.unitTestsFailing) {
+      input = { verdict: "request_changes", summary: input.summary, comments: [{ severity: "blocker", body: "The unit tests of this round fail; make them pass." }] };
+    }
     const prefix = COMMENT_PREFIX[stage.kind];
     return {
       verdict: input.verdict,
@@ -904,6 +1110,7 @@ export class WorkflowEngine {
     fallback: boolean,
     open: ReviewComment[],
     fromUser = false,
+    unitTests?: UnitTestCheck,
   ): Promise<AuthorSubmission> {
     const { workspace, hooks } = this.options;
     const task = this.task;
@@ -971,6 +1178,7 @@ export class WorkflowEngine {
         `Submitted round ${round.n}`,
         commit ? `commit ${commit.slice(0, 10)}${shortStat ? ` (${shortStat})` : ""}` : "no file changes",
         open.length ? `${addressed} addressed, ${declined} declined` : "",
+        unitTests ? `unit tests ${unitTests.status}` : "",
         fallback ? "no submit_work call (summary derived)" : "",
       ]
         .filter(Boolean)
@@ -991,6 +1199,7 @@ export class WorkflowEngine {
       prevCommit: startHead,
       shortStat,
       docSnapshot,
+      unitTests,
       at: nowIso(),
     };
   }
@@ -1118,6 +1327,7 @@ export class WorkflowEngine {
     const lastReview = [...lastStage.rounds].reverse().find((round) => round.review)?.review;
     const docStage = task.stages.find((stage) => isDocStage(stage.kind));
     const testStage = task.stages.find((stage) => stage.kind === "testing");
+    const codingStage = task.stages.find((stage) => stage.kind === "coding");
     const stages = kinds.map((kind) => this.stage(kind));
     const summary =
       stages.length > 1
@@ -1138,6 +1348,7 @@ export class WorkflowEngine {
       docPath: docStage?.docPath,
       docFormat: docStage?.docFormat,
       tests: testStage ? [...testStage.rounds].reverse().find((round) => round.review?.testRun)?.review?.testRun : undefined,
+      unitTests: codingStage ? [...codingStage.rounds].reverse().find((round) => round.author?.unitTests)?.author?.unitTests : undefined,
       // Failures of the last run stay unresolved until a run passes, whatever the fixer answered.
       openComments:
         lastStage.kind === "testing"
@@ -1166,6 +1377,27 @@ export class WorkflowEngine {
     });
     hooks.update();
   }
+}
+
+/** A test run that never started because its task was cancelled while it waited for another task's run. */
+const CANCELLED_RUN: UnitTestRun = { passed: false, command: "", problem: "was cancelled", output: "", durationMs: 0, exitCode: null, stopped: "cancelled" };
+
+/**
+ * Environment of the manager's unit test runs: a per-task temp folder, no MSBuild nodes outliving the run, and the
+ * worktree's own Python virtual environment and node_modules/.bin first on PATH, as if the agent had activated them.
+ */
+export function testRunEnv(worktree: string, tempDir: string): Record<string, string> {
+  const env: Record<string, string> = { TMP: tempDir, TEMP: tempDir, TMPDIR: tempDir, MSBUILDDISABLENODEREUSE: "1" };
+  const bins: string[] = [];
+  const venv = [".venv", "venv"].map((name) => path.join(worktree, name)).find((dir) => fs.existsSync(path.join(dir, "pyvenv.cfg")));
+  if (venv) {
+    env.VIRTUAL_ENV = venv;
+    bins.push(path.join(venv, process.platform === "win32" ? "Scripts" : "bin"));
+  }
+  const nodeBin = path.join(worktree, "node_modules", ".bin");
+  if (fs.existsSync(nodeBin)) bins.push(nodeBin);
+  if (bins.length) env.PATH = [...bins, process.env.PATH ?? ""].join(path.delimiter);
+  return env;
 }
 
 export function assignmentFor(role: AgentRole, round: number, openComments: number, fromUser = false): string {
@@ -1202,6 +1434,7 @@ export function assignmentFor(role: AgentRole, round: number, openComments: numb
 
 export function phaseLabel(stage: StageKind | undefined, phase: Phase): string {
   if (phase === "planning") return "Planning";
+  if (phase === "verifying") return "Verifying unit tests";
   if (stage === "testing") {
     if (phase === "reviewing") return "Running tests";
     if (phase === "authoring" || phase === "revising") return "Fixing test failures";

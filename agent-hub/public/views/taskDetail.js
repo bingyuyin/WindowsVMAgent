@@ -34,6 +34,7 @@ const ACTIVE = ["queued", "running", "needs-input"];
 const REVIEWER_ROLE = { design: "design-reviewer", document: "doc-reviewer", coding: "code-reviewer", testing: "executor" };
 const AUTHOR_ROLE = { design: "designer", document: "writer", coding: "coder", testing: "fixer" };
 const TEST_STATUS = { passed: ["Passed", "success"], failed: ["Failed", "danger"], blocked: ["Blocked", "warning"] };
+const UNIT_TEST_STATUS = { passed: ["Unit tests pass", "success"], failed: ["Unit tests fail", "danger"], blocked: ["Unit tests blocked", "warning"] };
 const CATEGORY_CLASS = { "product-bug": "danger", "test-bug": "warning", environment: "neutral", flaky: "info", integrity: "danger", unknown: "neutral" };
 const STAGE_STATUS = {
   pending: ["Pending", "neutral"],
@@ -488,6 +489,7 @@ export function taskDetailView(root, { params }) {
             "div",
             { class: "result-stats" },
             tests ? h("span", {}, chip(...(TEST_STATUS[tests.status] ?? [tests.status, "neutral"])), " ", testCounts(tests)) : null,
+            result.unitTests ? h("span", {}, chip(...(UNIT_TEST_STATUS[result.unitTests.status] ?? [result.unitTests.status, "neutral"]))) : null,
             h("span", {}, h("strong", {}, String(result.commits ?? 0)), " commit(s)"),
             result.shortStat ? h("span", {}, result.shortStat) : null,
             docPath ? h("span", {}, docStage?.kind === "document" ? "document " : "design ", h("span", { class: "mono" }, docPath)) : null,
@@ -1097,6 +1099,7 @@ export function taskDetailView(root, { params }) {
             ),
             renderMarkdown(author.summary),
             author.validation ? h("div", { class: "sub-block" }, h("div", { class: "label" }, "Validation"), h("pre", { class: "pre-wrap" }, author.validation)) : null,
+            unitTestsBlock(author.unitTests),
             author.responses?.length
               ? h(
                   "div",
@@ -1115,7 +1118,7 @@ export function taskDetailView(root, { params }) {
               : null,
           )
         : current && task.phase !== "reviewing"
-          ? h("div", { class: "conv-block" }, spinner(`${ROLE_LABELS[authorRole]} is working…`))
+          ? h("div", { class: "conv-block" }, spinner(task.phase === "verifying" ? "The manager is running the unit tests before the review…" : `${ROLE_LABELS[authorRole]} is working…`))
           : null,
       review
         ? h(
@@ -1145,6 +1148,28 @@ export function taskDetailView(root, { params }) {
         : current && (author || testing) && task.phase === "reviewing"
           ? h("div", { class: "conv-block review" }, spinner(testing ? `${ROLE_LABELS[reviewerRole]} is running the tests…` : `${ROLE_LABELS[reviewerRole]} is reviewing…`))
           : null,
+    );
+  }
+
+  /** A coding round's unit tests: what the author reported and whether the manager's own run passed. */
+  function unitTestsBlock(check) {
+    if (!check) return null;
+    const [label, cls] = UNIT_TEST_STATUS[check.status] ?? [check.status, "neutral"];
+    return h(
+      "div",
+      { class: "sub-block" },
+      h("div", { class: "label" }, "Unit tests"),
+      h(
+        "div",
+        { class: "row wrap small" },
+        chip(label, cls),
+        check.verified ? h("span", { class: "muted" }, "re-run by the manager before the review") : null,
+        check.total !== undefined ? h("span", {}, testCounts(check)) : null,
+        check.fixAttempts ? h("span", { class: "muted" }, `${check.fixAttempts} fix attempt(s) after failing runs`) : null,
+      ),
+      check.reason ? h("p", { class: "small" }, check.reason) : null,
+      check.commands?.length ? h("pre", { class: "pre-wrap test-commands" }, check.commands.join("\n")) : null,
+      check.logExcerpt ? h("details", {}, h("summary", { class: "label" }, "Output of the failing run"), h("pre", { class: "pre-wrap" }, check.logExcerpt)) : null,
     );
   }
 
@@ -1424,6 +1449,14 @@ export function taskDetailView(root, { params }) {
           meta("Commits", String(result.commits ?? 0)),
           meta("Changes", result.shortStat || "—"),
           result.tests ? meta("Tests", chip(...(TEST_STATUS[result.tests.status] ?? [result.tests.status, "neutral"])), " ", testCounts(result.tests)) : null,
+          result.unitTests
+            ? meta(
+                "Unit tests",
+                chip(...(UNIT_TEST_STATUS[result.unitTests.status] ?? [result.unitTests.status, "neutral"])),
+                " ",
+                h("span", { class: "mono small" }, result.unitTests.commands.join(", ")),
+              )
+            : null,
           (result.docPath ?? result.designDocPath) ? meta(task.kind === "document" ? "Document" : "Design document", h("span", { class: "mono" }, result.docPath ?? result.designDocPath)) : null,
         ),
         h("h3", {}, "Final summary"),
