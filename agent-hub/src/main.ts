@@ -10,6 +10,7 @@ import { createApiRouter } from "./http/api.ts";
 import { createHttpServer } from "./http/server.ts";
 import { GhPullRequestCreator } from "./remote.ts";
 import { RepoService } from "./repos.ts";
+import { GhReviewHost } from "./review/github.ts";
 import { Store } from "./store.ts";
 import { errorMessage } from "./util.ts";
 import { TaskRunner } from "./workflow/runner.ts";
@@ -39,6 +40,7 @@ const runner = new TaskRunner({
   hubSkills: loadHubSkills(config.skillsDir),
   docTemplates,
   pullRequests: new GhPullRequestCreator(),
+  reviewHost: new GhReviewHost(),
 });
 const repos = new RepoService(store, bus, config.reposDir);
 runner.init();

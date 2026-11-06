@@ -2014,6 +2014,130 @@ details > summary {
   word-break: break-word;
 }
 
+/* A task that wrote several documents: the list on the left, the selected document on the right. */
+.doc-layout {
+  display: grid;
+  grid-template-columns: minmax(200px, 280px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.doc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  position: sticky;
+  top: 12px;
+}
+.doc-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.doc-item:hover {
+  background: var(--bg-inset);
+}
+.doc-item.active {
+  border-color: var(--accent);
+  background: var(--accent-muted);
+}
+.doc-item-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.doc-item-path {
+  overflow-wrap: anywhere;
+}
+.doc-main {
+  min-width: 0;
+}
+@media (max-width: 900px) {
+  .doc-layout {
+    grid-template-columns: 1fr;
+  }
+  .doc-list {
+    position: static;
+  }
+}
+
+/* ---- code review: summary, curated comments, publishing ------------------------------------------ */
+
+.review-summary h3,
+.publish-card h3 {
+  margin-top: 0;
+}
+.file-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 6px;
+}
+.file-table td {
+  padding: 3px 8px;
+  border-top: 1px solid var(--border-muted);
+}
+.file-table td.num {
+  width: 1%;
+  white-space: nowrap;
+  text-align: right;
+  font: 12px var(--mono);
+}
+.file-table td.add {
+  color: var(--success);
+}
+.file-table td.del {
+  color: var(--danger);
+}
+.review-comments {
+  margin: 18px 0;
+}
+.review-comment.editing {
+  border-color: var(--accent);
+}
+.review-comment textarea {
+  width: 100%;
+  margin: 6px 0;
+  font: 13px/1.5 var(--mono);
+}
+.comment.is-dropped {
+  opacity: 0.62;
+}
+.comment.is-dropped:hover {
+  opacity: 0.9;
+}
+.comment-actions {
+  margin-top: 8px;
+}
+.seg.seg-sm .seg-item {
+  padding: 3px 10px;
+  font-size: 12.5px;
+}
+.left-out {
+  margin-bottom: 18px;
+}
+.left-out > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.publish-card textarea {
+  width: 100%;
+  font: 13px/1.5 var(--sans);
+}
+.publish-card > .row,
+.publish-card > .callout,
+.publish-card > .muted {
+  margin-top: 10px;
+}
+
 /* ---- settings: storage -------------------------------------------------------------------------- */
 
 .storage-list {
@@ -2837,6 +2961,43 @@ details > summary {
 }
 .org .node-icon-text.role-fixer {
   fill: var(--attention);
+}
+
+/* ---- code review reviewers (lead and peer) -------------------------------------------------------- */
+
+.role-lead-reviewer {
+  background: var(--accent-muted);
+  color: var(--accent);
+}
+.role-peer-reviewer {
+  background: color-mix(in srgb, #39c5cf 18%, transparent);
+  color: #39c5cf;
+}
+.hero-icon.role-lead-reviewer,
+.agent-icon.role-lead-reviewer,
+.pipe-icon.role-lead-reviewer,
+.roster-icon.role-lead-reviewer {
+  background: var(--accent);
+  color: #fff;
+}
+.hero-icon.role-peer-reviewer,
+.agent-icon.role-peer-reviewer,
+.pipe-icon.role-peer-reviewer,
+.roster-icon.role-peer-reviewer {
+  background: color-mix(in srgb, #39c5cf 22%, transparent);
+  color: #39c5cf;
+}
+.org .node-icon.role-lead-reviewer {
+  fill: var(--accent);
+}
+.org .node-icon-text.role-lead-reviewer {
+  fill: #fff;
+}
+.org .node-icon.role-peer-reviewer {
+  fill: color-mix(in srgb, #39c5cf 22%, transparent);
+}
+.org .node-icon-text.role-peer-reviewer {
+  fill: #39c5cf;
 }
 .org .msg-dot.k-plan {
   fill: var(--violet);

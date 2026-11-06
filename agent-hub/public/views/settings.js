@@ -10,6 +10,7 @@ export function settingsView(root) {
   const reviewerSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const resolverSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const managerSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
+  const peerSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const settings = state.settings ?? {};
   const isolation = h(
     "select",
@@ -52,7 +53,8 @@ export function settingsView(root) {
         field("Manager model", managerSelect, "Plans Auto tasks: reads the request and repository and decides which sub-agents to create. Defaults to the author model."),
         field("Author model (designer, writer, coder)", authorSelect),
         field("Comment resolver / test fixer model", resolverSelect, "Resolves code review comments and fixes test failures; defaults to the author model."),
-        field("Reviewer / test executor model", reviewerSelect, "Reviews and verifies the authors' work. A different model gives a second opinion."),
+        field("Reviewer / test executor model", reviewerSelect, "Reviews and verifies the authors' work. A different model gives a second opinion. Also the lead reviewer of Code review tasks."),
+        field("Peer reviewer model (Code review tasks)", peerSelect, "Reviews alongside the lead reviewer and discusses the findings with it; defaults to the author model. Pick a model other than the reviewer model for a real second opinion."),
       ),
       h("h2", { class: "section-title" }, "Workspaces"),
       h(
@@ -159,6 +161,7 @@ export function settingsView(root) {
       setContent(reviewerSelect, modelOptions(models, state.settings?.reviewerModel));
       setContent(resolverSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.resolverModel));
       setContent(managerSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.managerModel));
+      setContent(peerSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.peerReviewerModel));
       if (force) toast("Model list refreshed", "success");
     } catch (error) {
       toast(`Could not load models: ${error.message}`, "error");
@@ -176,6 +179,7 @@ export function settingsView(root) {
         reviewerModel: reviewerSelect.value,
         resolverModel: resolverSelect.value || null,
         managerModel: managerSelect.value || null,
+        peerReviewerModel: peerSelect.value || null,
         isolation: isolation.value,
         cleanupWorktrees: cleanup.checked,
         pushOnComplete: pushOnComplete.checked,

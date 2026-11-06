@@ -3,6 +3,7 @@ import {
   type AgentDriver,
   type AgentHandle,
   type AgentObserver,
+  type CodeReviewTool,
   type PlanSubmissionInput,
   type ReviewSubmissionInput,
   type SubmitChannel,
@@ -30,12 +31,32 @@ import {
   unitTestFailurePrompt,
   type DesignContext,
 } from "../agents/prompts.ts";
+import { findingsPrompt, finalPrompt, MAX_REVIEW_DIFF, nudgeFor, positionsPrompt, signoffPrompt, type ReviewTurnBase } from "../agents/reviewPrompts.ts";
 import { evaluatePermission } from "../agents/policy.ts";
 import { skillsForRole, type HubSkills } from "../context.ts";
-import { DOC_EXTENSIONS, documentProblem, formatOfPath, renderDocTemplate, type DocTemplates } from "../docs.ts";
+import { DOC_EXTENSIONS, documentProblem, formatOfPath, isDocumentPath, placeholderProblem, renderDocTemplate, type DocTemplates } from "../docs.ts";
 import type { AgentWorkspace, TaskWorkspace } from "../git.ts";
 import {
+  curate,
+  defaultReviewBody,
+  fallbackFinal,
+  fallbackFindings,
+  fallbackSignoff,
+  nextCommentNumber,
+  normalizeFinal,
+  normalizeFindings,
+  normalizePositions,
+  normalizeSignoff,
+  toFinalReview,
+  type FinalInput,
+  type FindingsInput,
+  type PositionsInput,
+  type SignoffInput,
+} from "../review/discussion.ts";
+import {
   authorRoleFor,
+  CODE_REVIEW_ROLES,
+  isCodeReviewRole,
   isDocStage,
   isReviewerRole,
   resolverRoleFor,
@@ -47,10 +68,16 @@ import {
   type AgentRole,
   type AgentStatus,
   type AuthorSubmission,
+  type CodeReview,
+  type DocumentSnapshot,
   type NewCommEntry,
   type NewTaskEvent,
   type Phase,
   type ReviewComment,
+  type ReviewerComment,
+  type ReviewerEntry,
+  type ReviewPhase,
+  type ReviewRound,
   type ReviewSubmission,
   type Round,
   type Settings,
@@ -115,7 +142,24 @@ interface ActiveAgent {
   interrupt?: (reason: string) => void;
   /** Rebuilds the current assignment with full context, for a fresh session that replaces a stuck one. */
   restartPrompt?: () => Promise<string>;
+  /** Code review reviewers: the submit tool the current turn asks for (named in recovery prompts). */
+  tool?: CodeReviewTool;
 }
+
+/** What a code review reviewer's current turn must submit, and how the submission is validated. */
+interface ReviewStep {
+  tool: CodeReviewTool;
+  normalize: (input: unknown) => unknown;
+}
+
+const REVIEW_TOOLS: Record<ReviewPhase, CodeReviewTool> = {
+  findings: "submit_findings",
+  positions: "submit_positions",
+  final: "submit_final_review",
+  signoff: "submit_signoff",
+};
+const REVIEW_PHASES: Record<ReviewPhase, Phase> = { findings: "reviewing", positions: "discussing", final: "consolidating", signoff: "consolidating" };
+const COMMENT_PREFIXES: Partial<Record<AgentRole, string>> = { "lead-reviewer": "L", "peer-reviewer": "P" };
 
 type AuthorWork = { input: WorkSubmissionInput; fallback: boolean };
 
@@ -157,8 +201,9 @@ export class AgentUnrecoverableError extends Error {
   }
 }
 
-export function modelFor(task: Pick<Task, "authorModel" | "reviewerModel" | "resolverModel" | "managerModel">, role: AgentRole): string {
+export function modelFor(task: Pick<Task, "authorModel" | "reviewerModel" | "resolverModel" | "managerModel" | "peerReviewerModel">, role: AgentRole): string {
   if (role === "planner") return task.managerModel || task.authorModel;
+  if (role === "peer-reviewer") return task.peerReviewerModel || task.authorModel;
   // The executor verifies the fixer's work, so it gets the reviewer model (a second opinion).
   if (isReviewerRole(role) || role === "executor") return task.reviewerModel;
   if (role === "resolver" || role === "fixer") return task.resolverModel || task.authorModel;
@@ -189,6 +234,9 @@ export class WorkflowEngine {
   private currentAuthorWorkspace: AgentWorkspace | null = null;
   /** Template content the current document was seeded with (to detect an unmodified template). */
   private seededDoc: string | null = null;
+  /** Code review reviewers work in parallel: what each one's current turn must submit, and what it submitted. */
+  private readonly reviewSteps = new Map<AgentRole, ReviewStep>();
+  private readonly reviewSubmissions = new Map<AgentRole, unknown>();
 
   constructor(task: Task, options: EngineOptions) {
     this.task = task;
@@ -196,6 +244,10 @@ export class WorkflowEngine {
   }
 
   async run(): Promise<void> {
+    if (this.task.kind === "review") {
+      await this.runCodeReview();
+      return;
+    }
     if (this.task.kind === "auto" && !this.task.plan) await this.plan();
     const kinds = stageKindsOf(this.task);
     for (const kind of kinds) {
@@ -325,6 +377,326 @@ export class WorkflowEngine {
     const stage = this.task.stages.find((candidate) => candidate.kind === kind);
     if (!stage) throw new Error(`Stage ${kind} missing`);
     return stage;
+  }
+
+  // ---- Code review tasks -------------------------------------------------------------------------
+
+  /**
+   * Two reviewers, usually on different models, review someone else's change: each reviews it on its own (in
+   * parallel), then each responds to the other's comments and revises its own (in parallel), then the lead
+   * reviewer writes the final review and the peer reviewer signs off on it or objects - the lead revises until
+   * the peer agrees or the round budget runs out. Every step is recorded, so a retry resumes where it stopped.
+   */
+  private async runCodeReview(): Promise<void> {
+    const { hooks, workspace } = this.options;
+    const task = this.task;
+    const review = task.review;
+    if (!review) throw new Error("This code review task has no change to review; create it again.");
+    const head = review.target.headSha;
+    const base = workspace.baseSha;
+    review.files ??= await workspace.numstat(base, head);
+    review.shortStat ??= await workspace.shortStat(base, head);
+    review.commits ??= await workspace.commitCount(base, head);
+    const change = { stat: await workspace.diffStat(base, head), diff: await workspace.diff(base, head, MAX_REVIEW_DIFF) };
+    const what = review.target.pullRequest ? `pull request #${review.target.pullRequest.number}` : review.target.headRef;
+    hooks.comm({
+      from: "manager",
+      to: "manager",
+      kind: "lifecycle",
+      text: `Code review of ${what} (${review.shortStat || "no changes"}): ${ROLE_LABELS["lead-reviewer"]} on ${modelFor(task, "lead-reviewer")} and ${ROLE_LABELS["peer-reviewer"]} on ${modelFor(task, "peer-reviewer")} review it independently, discuss each other's findings, then agree on the final review`,
+    });
+    hooks.update();
+
+    const budget = Math.max(1, task.roundsBudget ?? task.maxRounds);
+    let status: AgentStatus = "done";
+    try {
+      for (const phase of ["findings", "positions"] as const) {
+        const round = review.rounds.find((candidate) => candidate.phase === phase) ?? this.openReviewRound(review, phase);
+        const missing = CODE_REVIEW_ROLES.filter((role) => !round.entries.some((entry) => entry.role === role));
+        if (!missing.length) continue;
+        this.setPhase(undefined, REVIEW_PHASES[phase], round.n);
+        // Both reviewers work at the same time; a reviewer that finished keeps its entry when the other fails.
+        const results = await Promise.allSettled(missing.map((role) => this.codeReviewTurn(role, round, change)));
+        const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        if (failure) throw failure.reason;
+      }
+      let finals = review.rounds.filter((round) => round.phase === "final" && round.attempt === task.attempt && round.entries.length).length;
+      for (;;) {
+        this.throwIfAborted();
+        const last = review.rounds.at(-1)!;
+        if (last.phase === "final" && last.entries.length) {
+          const round = this.openReviewRound(review, "signoff");
+          this.setPhase(undefined, REVIEW_PHASES.signoff, round.n);
+          await this.codeReviewTurn("peer-reviewer", round, change);
+          continue;
+        }
+        if (last.phase === "signoff" && last.entries.length) {
+          const signoff = last.entries[0]!.signoff!;
+          if (signoff.agreed || !signoff.objections.length) break;
+          if (finals >= budget) {
+            const text = `The peer reviewer still objects after ${finals} final review round(s); its objections are shown with the comments for you to decide.`;
+            hooks.emit({ type: "warning", round: last.n, text });
+            hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", round: last.n, text });
+            break;
+          }
+        }
+        const unfinishedSignoff = last.phase === "signoff" && !last.entries.length;
+        const round = unfinishedSignoff ? last : this.openReviewRound(review, "final");
+        const role: AgentRole = unfinishedSignoff ? "peer-reviewer" : "lead-reviewer";
+        this.setPhase(undefined, REVIEW_PHASES[round.phase], round.n);
+        await this.codeReviewTurn(role, round, change);
+        if (!unfinishedSignoff) finals++;
+      }
+    } catch (error) {
+      status = hooks.signal.aborted || error instanceof CancelledError ? "cancelled" : "failed";
+      throw error;
+    } finally {
+      for (const role of CODE_REVIEW_ROLES) await this.releaseAgent(role, status);
+      hooks.update();
+    }
+    await this.finalizeCodeReview();
+  }
+
+  /** The round a step runs in: the last round when it is that step and unfinished, otherwise a new one. */
+  private openReviewRound(review: CodeReview, phase: ReviewPhase): ReviewRound {
+    const last = review.rounds.at(-1);
+    if (last?.phase === phase && !last.entries.length) return last;
+    const round: ReviewRound = { n: review.rounds.length + 1, phase, attempt: this.task.attempt, startedAt: nowIso(), entries: [] };
+    review.rounds.push(round);
+    return round;
+  }
+
+  /** One reviewer's turn in a discussion round: prompt, wait for its submit tool (nudging it), record the result. */
+  private async codeReviewTurn(role: AgentRole, round: ReviewRound, change: ReviewTurnBase["change"]): Promise<void> {
+    const { hooks, workspace } = this.options;
+    const task = this.task;
+    const review = task.review!;
+    const phase = round.phase;
+    const tool = REVIEW_TOOLS[phase];
+    const prefix = COMMENT_PREFIXES[role]!;
+    const otherRole: AgentRole = role === "lead-reviewer" ? "peer-reviewer" : "lead-reviewer";
+    const otherPrefix = COMMENT_PREFIXES[otherRole]!;
+    const ws = await workspace.prepareReviewer(role, review.target.headSha);
+    const fresh = !this.agents.has(role);
+    const agent = await this.agentFor(role, undefined, ws.path);
+    agent.tool = tool;
+    // What the reviewer is shown, fixed for the turn: the other reviewer may change its comments meanwhile.
+    const own = review.comments.filter((comment) => comment.id.startsWith(prefix) && !comment.withdrawn);
+    const theirs = review.comments.filter((comment) => comment.id.startsWith(otherPrefix) && !comment.withdrawn);
+    const previousFinal = [...review.rounds].reverse().find((candidate) => candidate.n < round.n && candidate.phase === "final" && candidate.entries.length)?.entries[0]?.final;
+    const lastSignoff = [...review.rounds].reverse().find((candidate) => candidate.n < round.n && candidate.phase === "signoff" && candidate.entries.length)?.entries[0]?.signoff;
+    const objecting = phase === "final" && previousFinal && lastSignoff && !lastSignoff.agreed ? lastSignoff : undefined;
+
+    const assignment =
+      phase === "findings"
+        ? `Reviewing the change independently (round ${round.n})`
+        : phase === "positions"
+          ? `Discussing the ${ROLE_LABELS[otherRole].toLowerCase()}'s ${theirs.length} comment(s) (round ${round.n})`
+          : phase === "final"
+            ? objecting
+              ? `Revising the final review for ${objecting.objections.length} objection(s) (round ${round.n})`
+              : `Writing the final review (round ${round.n})`
+            : `Checking the final review (round ${round.n})`;
+    hooks.agent(role, (info) => {
+      info.status = "working";
+      info.workspace = ws.path;
+      info.workspaceRemoved = false;
+      info.branch = null;
+      info.assignment = assignment;
+      if (!info.rounds.includes(round.n)) info.rounds.push(round.n);
+    });
+    hooks.comm({
+      from: "manager",
+      to: role,
+      kind: phase === "findings" ? "assign" : "relay",
+      round: round.n,
+      text:
+        phase === "findings"
+          ? `Review ${review.target.pullRequest ? `pull request #${review.target.pullRequest.number}` : review.target.headRef} at ${review.target.headSha.slice(0, 10)} independently`
+          : phase === "positions"
+            ? `Respond to the ${ROLE_LABELS[otherRole].toLowerCase()}'s comments${theirs.length ? ` ${theirs.map((comment) => comment.id).join(", ")}` : " (none)"} and re-check your own`
+            : phase === "final"
+              ? objecting
+                ? `The ${ROLE_LABELS[otherRole].toLowerCase()} objects (${objecting.objections.length}); revise the final review`
+                : `Write the final review from ${review.comments.length} comment(s) and the discussion`
+              : `Sign off on the final review (${previousFinal?.comments.length ?? 0} comment(s)) or object`,
+    });
+
+    const known = review.comments.map((comment) => comment.id);
+    const normalize: (input: unknown) => unknown =
+      phase === "findings"
+        ? normalizeFindings
+        : phase === "positions"
+          ? (input) => normalizePositions(input, theirs.map((comment) => comment.id), own.map((comment) => comment.id))
+          : phase === "final"
+            ? (input) => normalizeFinal(input, review.comments.filter((comment) => !comment.withdrawn).map((comment) => comment.id), known)
+            : (input) => normalizeSignoff(input, [...(previousFinal?.comments.map((comment) => comment.id) ?? []), ...known]);
+    const base = (includeContext: boolean): ReviewTurnBase => ({
+      task,
+      role,
+      context: task.context,
+      includeContext,
+      round: round.n,
+      change,
+      otherModel: modelFor(task, otherRole),
+    });
+    const build = async (includeContext: boolean): Promise<string> => {
+      switch (phase) {
+        case "findings":
+          return findingsPrompt(base(includeContext));
+        case "positions": {
+          const theirEntry = review.rounds.find((candidate) => candidate.phase === "findings")?.entries.find((entry) => entry.role === otherRole);
+          return positionsPrompt({ ...base(includeContext), own, theirs, theirEntry });
+        }
+        case "final":
+          return finalPrompt({ ...base(includeContext), review, previous: objecting ? previousFinal : undefined, signoff: objecting });
+        case "signoff":
+          return signoffPrompt({ ...base(includeContext), review, final: previousFinal! });
+      }
+    };
+
+    this.reviewSubmissions.delete(role);
+    this.reviewSteps.set(role, { tool, normalize });
+    let result: TurnResult;
+    try {
+      result = await this.send(agent, await build(fresh), () => build(true));
+      for (let nudge = 0; !this.reviewSubmissions.has(role) && nudge < MAX_SUBMIT_NUDGES; nudge++) {
+        this.throwIfAborted();
+        hooks.emit({ type: "warning", role, round: round.n, text: `${ROLE_LABELS[role]} ended its turn without calling ${tool}; asking it to submit.` });
+        hooks.comm({ from: "manager", to: role, kind: "nudge", round: round.n, text: `Your turn ended without ${tool} - submit it` });
+        result = await this.send(agent, nudgeFor(tool));
+      }
+    } finally {
+      this.reviewSteps.delete(role);
+    }
+    const submitted = this.reviewSubmissions.get(role);
+    this.reviewSubmissions.delete(role);
+    const fallback = submitted === undefined;
+    if (fallback) hooks.emit({ type: "warning", role, round: round.n, text: `${ROLE_LABELS[role]} never called ${tool}; the hub derived its result.` });
+    const at = nowIso();
+    const label = ROLE_LABELS[role];
+    let entry: ReviewerEntry;
+    let summary: string;
+    switch (phase) {
+      case "findings": {
+        const input = (submitted as FindingsInput | undefined) ?? fallbackFindings(result.lastMessage);
+        const ids = this.addReviewerComments(review, prefix, input.comments, round.n);
+        entry = { role, summary: input.assessment, changeSummary: input.changeSummary, verdict: input.verdict, comments: ids, at };
+        summary = `${label}'s independent review: ${ids.length} comment(s), verdict ${input.verdict.replace("_", " ")}`;
+        break;
+      }
+      case "positions": {
+        const input = (submitted as PositionsInput | undefined) ?? { summary: "The reviewer did not respond to the other review.", responses: [], updates: [], newComments: [] };
+        for (const update of input.updates) {
+          const comment = review.comments.find((candidate) => candidate.id === update.commentId);
+          if (!comment) continue;
+          if (update.action === "withdraw") {
+            comment.withdrawn = { note: update.note, round: round.n };
+          } else {
+            comment.revised = { note: update.note, round: round.n, previous: { body: comment.body, severity: comment.severity, line: comment.line } };
+            if (update.body) comment.body = update.body;
+            if (update.severity) comment.severity = update.severity;
+            if (update.line) comment.line = update.line;
+          }
+        }
+        const ids = this.addReviewerComments(review, prefix, input.newComments, round.n);
+        entry = {
+          role,
+          summary: input.summary,
+          positions: input.responses,
+          updates: input.updates.map(({ commentId, action, note }) => ({ commentId, action, note })),
+          comments: ids,
+          at,
+        };
+        const count = (position: string) => input.responses.filter((response) => response.position === position).length;
+        const withdrawn = input.updates.filter((update) => update.action === "withdraw").length;
+        const revised = input.updates.length - withdrawn;
+        summary = `${label} on the ${ROLE_LABELS[otherRole].toLowerCase()}'s comments: ${count("agree")} agree, ${count("disagree")} disagree, ${count("refine")} refine${withdrawn ? `; withdrew ${withdrawn}` : ""}${revised ? `; revised ${revised}` : ""}${ids.length ? `; ${ids.length} new` : ""}`;
+        break;
+      }
+      case "final": {
+        const leadSummary = review.rounds.find((candidate) => candidate.phase === "findings")?.entries.find((candidate) => candidate.role === "lead-reviewer")?.changeSummary;
+        const input = (submitted as FinalInput | undefined) ?? fallbackFinal(review, leadSummary);
+        const final = toFinalReview(input, fallback);
+        review.final = final;
+        entry = { role, summary: final.assessment, final, at };
+        summary = `Final review: ${final.comments.length} comment(s)${describeSeverities(final.comments)}, ${final.dropped.length} dropped, verdict ${final.verdict.replace("_", " ")}`;
+        break;
+      }
+      case "signoff": {
+        const signoff = (submitted as SignoffInput | undefined) ? { ...(submitted as SignoffInput) } : fallbackSignoff();
+        review.signoff = signoff;
+        entry = { role, summary: signoff.summary, signoff, at };
+        summary = signoff.agreed
+          ? `${label} signed off on the final review`
+          : signoff.fallback
+            ? `${label} did not sign off`
+            : `${label} objects to the final review (${signoff.objections.length}): ${truncate(signoff.objections.map((objection) => `${objection.commentId ? `${objection.commentId}: ` : ""}${objection.issue}`).join("; "), 300)}`;
+        break;
+      }
+    }
+    if (fallback) entry.fallback = true;
+    round.entries.push(entry);
+    hooks.agent(role, (info) => {
+      info.status = "idle";
+      info.assignment = undefined;
+    });
+    hooks.emit({ type: "review", role, round: round.n, text: `${summary} - ${truncate(firstLine(entry.summary), 300)}`, data: { phase, fallback } });
+    hooks.comm({ from: role, to: "manager", kind: phase === "signoff" || phase === "final" ? "verdict" : "submit", round: round.n, text: summary });
+    hooks.update();
+  }
+
+  private addReviewerComments(review: CodeReview, prefix: string, comments: readonly Omit<ReviewerComment, "id" | "round">[], round: number): string[] {
+    let next = nextCommentNumber(review.comments, prefix);
+    return comments.map((comment) => {
+      const id = `${prefix}${next++}`;
+      review.comments.push({ id, severity: comment.severity, file: comment.file, line: comment.line, body: comment.body, round });
+      return id;
+    });
+  }
+
+  /** Turns the agreed final review into the user's working copy and the task's result. */
+  private async finalizeCodeReview(): Promise<void> {
+    const { workspace, hooks, settings } = this.options;
+    const task = this.task;
+    const review = task.review!;
+    this.setPhase(undefined, "finalizing", task.currentRound);
+    const finalIndex = review.rounds.findLastIndex((round) => round.phase === "final" && round.entries.length);
+    const final = review.rounds[finalIndex]?.entries[0]?.final;
+    if (!final) throw new Error("The reviewers produced no final review.");
+    const signoff = review.rounds.slice(finalIndex + 1).findLast((round) => round.phase === "signoff" && round.entries.length)?.entries[0]?.signoff;
+    review.final = final;
+    review.signoff = signoff;
+    review.curated = curate(final, signoff);
+    review.body = defaultReviewBody(final);
+    review.event ??= "COMMENT";
+    const head = review.target.headSha;
+    task.result = {
+      approved: signoff?.agreed === true,
+      summary: final.changeSummary || final.assessment,
+      headSha: head,
+      diffStat: await workspace.diffStat(workspace.baseSha, head),
+      shortStat: review.shortStat,
+      commits: review.commits,
+      openComments: review.curated.length,
+    };
+    if (settings.cleanupWorktrees) {
+      await workspace.removeWorktrees();
+      for (const info of task.agents ?? []) {
+        hooks.agent(info.role, (agent) => {
+          agent.workspaceRemoved = true;
+        });
+      }
+    }
+    task.phase = "done";
+    const objections = signoff && !signoff.agreed ? signoff.objections.length : 0;
+    hooks.emit({
+      type: "info",
+      text: `Code review complete: ${final.comments.length} comment(s)${describeSeverities(final.comments)}; ${
+        signoff?.agreed ? "both reviewers agree on the final review" : objections ? `the peer reviewer still objects to ${objections} item(s)` : "the peer reviewer did not sign off"
+      }. Review the comments, then publish them.`,
+    });
+    hooks.update();
   }
 
   /** First unfinished stage; when all are finished, continue the last one if it was not approved. */
@@ -710,6 +1082,18 @@ export class WorkflowEngine {
   private submitChannelFor(role: AgentRole, stageKind: StageKind | undefined): SubmitChannel {
     if (role === "planner") return { kind: "plan", onSubmit: (input) => void (this.pendingPlan = normalizePlan(input)) };
     if (role === "executor") return { kind: "test", onSubmit: (input) => void (this.pendingTest = normalizeTestRun(input)) };
+    if (isCodeReviewRole(role)) {
+      return {
+        kind: "code-review",
+        tools: role === "lead-reviewer" ? ["submit_findings", "submit_positions", "submit_final_review"] : ["submit_findings", "submit_positions", "submit_signoff"],
+        onSubmit: (tool, input) => {
+          const step = this.reviewSteps.get(role);
+          if (!step) throw new Error("No submission is expected from you right now.");
+          if (step.tool !== tool) throw new Error(`This turn asks for \`${step.tool}\`, not \`${tool}\`. Call \`${step.tool}\`.`);
+          this.reviewSubmissions.set(role, step.normalize(input));
+        },
+      };
+    }
     if (isReviewerRole(role)) return { kind: "review", onSubmit: (input) => void (this.pendingReview = this.checkVerdict(normalizeReview(input))) };
     if (!stageKind) throw new Error(`${role} needs a stage`);
     return { kind: "work", unitTests: stageKind === "coding", onSubmit: (input) => this.acceptWork(input, stageKind) };
@@ -796,7 +1180,7 @@ export class WorkflowEngine {
         kind: "recover",
         text: `No progress: ${problem}. ${restart ? "Killing the session and restarting the agent" : "Interrupted the turn; continue without repeating what hung"} (${attempt})`,
       });
-      message = restart ? await this.restartAgent(agent, problem) : recoveryPrompt(role, problem);
+      message = restart ? await this.restartAgent(agent, problem) : recoveryPrompt(role, problem, agent.tool);
     }
   }
 
@@ -812,6 +1196,7 @@ export class WorkflowEngine {
   private hasSubmission(role: AgentRole): boolean {
     if (role === "planner") return this.pendingPlan !== null;
     if (role === "executor") return this.pendingTest !== null;
+    if (isCodeReviewRole(role)) return this.reviewSubmissions.has(role);
     return isReviewerRole(role) ? this.pendingReview !== null : this.pendingWork !== null;
   }
 
@@ -819,10 +1204,19 @@ export class WorkflowEngine {
     const normalized = normalizeWork(input, this.expectedCommentIds, { unitTests: stageKind === "coding", partialResponses: this.partialResponses });
     if (isDocStage(stageKind)) {
       const stage = this.stage(stageKind);
-      const content = await this.currentAuthorWorkspace?.readFile(stage.docPath!);
+      const ws = this.currentAuthorWorkspace;
+      const content = await ws?.readFile(stage.docPath!);
       const problem = documentProblem(content, stage.docFormat ?? "markdown", this.seededDoc);
       if (problem) {
         throw new Error(`The document '${stage.docPath}' ${problem}. Fix the file at that exact path, then call submit_work again.`);
+      }
+      // Further HTML documents written this round must not keep template placeholders.
+      for (const file of ws ? await ws.changedPaths() : []) {
+        if (file === stage.docPath || formatOfPath(file) !== "html" || !isDocumentPath(file)) continue;
+        const extra = await ws!.readFile(file);
+        if (extra === null) continue;
+        const extraProblem = placeholderProblem(extra);
+        if (extraProblem) throw new Error(`The document '${file}' ${extraProblem}. Fix it (or remove the file if it is not needed), then call submit_work again.`);
       }
     }
     this.pendingWork = normalized;
@@ -1191,6 +1585,7 @@ export class WorkflowEngine {
     } else {
       hooks.emit({ type: "warning", role, text: "The author made no file changes in this round." });
     }
+    const documents = isDocStage(stage.kind) ? await this.snapshotDocuments(stage, round, docSnapshot, startHead, commit) : undefined;
     hooks.emit({
       type: "submission",
       role,
@@ -1230,9 +1625,33 @@ export class WorkflowEngine {
       prevCommit: startHead,
       shortStat,
       docSnapshot,
+      ...(documents?.length ? { documents } : {}),
       unitTests,
       at: nowIso(),
     };
+  }
+
+  /**
+   * The documents a document-stage round wrote: the deliverable plus any further documents the author created or
+   * changed next to it (a request can call for several). Each is saved as it stands after the round.
+   */
+  private async snapshotDocuments(stage: Stage, round: Round, docSnapshot: string | undefined, startHead: string, commit: string | null): Promise<DocumentSnapshot[]> {
+    const { workspace, hooks } = this.options;
+    const documents: DocumentSnapshot[] = docSnapshot && stage.docPath ? [{ path: stage.docPath, snapshot: docSnapshot }] : [];
+    if (!commit) return documents;
+    const extra = (await workspace.changedPaths(startHead, commit)).filter((file) => isDocumentPath(file) && file !== stage.docPath).slice(0, 30);
+    for (const [index, file] of extra.entries()) {
+      const content = await workspace.readAt(commit, file);
+      if (content === null) continue;
+      const snapshot = `doc-r${round.n}-${index + 1}${DOC_EXTENSIONS[formatOfPath(file)]}`;
+      await hooks.saveArtifact(snapshot, content);
+      documents.push({ path: file, snapshot });
+    }
+    if (extra.length) {
+      stage.extraDocs = [...new Set([...(stage.extraDocs ?? []), ...extra])];
+      hooks.emit({ type: "info", stage: stage.kind, round: round.n, text: `Round ${round.n} also wrote ${extra.length} further document(s): ${extra.join(", ")}` });
+    }
+    return documents;
   }
 
   private async buildExecutionPrompt(
@@ -1273,12 +1692,17 @@ export class WorkflowEngine {
     const totalStat = await workspace.diffStat(workspace.baseSha, headSha);
     let docContent: string | undefined;
     let roundDiff: { text: string; truncated: boolean } | undefined;
+    let extraDocs: Array<{ path: string; content: string | null }> | undefined;
     if (isDocStage(stage.kind)) {
       docContent =
         (stage.docPath ? await workspace.readAt(headSha, stage.docPath) : null) ??
         (submission.docSnapshot ? await hooks.readArtifact(submission.docSnapshot) : null) ??
         undefined;
       if (round.n > 1 && stage.docPath) roundDiff = await workspace.diff(prevSha, headSha, MAX_ROUND_DIFF_BYTES, [stage.docPath]);
+      if (stage.extraDocs?.length) {
+        extraDocs = [];
+        for (const file of stage.extraDocs) extraDocs.push({ path: file, content: await workspace.readAt(headSha, file) });
+      }
     } else {
       roundDiff = await workspace.diff(prevSha, headSha, MAX_ROUND_DIFF_BYTES);
     }
@@ -1295,6 +1719,7 @@ export class WorkflowEngine {
       docPath: stage.docPath,
       docFormat: stage.docFormat,
       docContent,
+      extraDocs,
       submission,
       authorLabel: ROLE_LABELS[submission.role ?? authorRoleFor(stage.kind)],
       baseSha: workspace.baseSha,
@@ -1474,6 +1899,8 @@ export function phaseLabel(stage: StageKind | undefined, phase: Phase): string {
   if (phase === "authoring") return stage === "design" ? "Designing" : stage === "document" ? "Writing" : "Coding";
   if (phase === "reviewing") return `Reviewing ${noun}`;
   if (phase === "revising") return stage === "coding" || !stage ? "Resolving review comments" : `Revising ${noun}`;
+  if (phase === "discussing") return "Discussing the findings";
+  if (phase === "consolidating") return "Agreeing on the final review";
   if (phase === "preparing") return "Preparing workspace";
   if (phase === "finalizing") return "Finalizing";
   if (phase === "done") return "Done";
@@ -1507,4 +1934,11 @@ function describeComments(comments: readonly ReviewComment[]): string {
   const counts = new Map<string, number>();
   for (const comment of comments) counts.set(comment.severity, (counts.get(comment.severity) ?? 0) + 1);
   return `${comments.length} comment${comments.length === 1 ? "" : "s"} (${[...counts].map(([severity, count]) => `${count} ${severity}`).join(", ")})`;
+}
+
+/** " (1 blocker, 2 minor)" in severity order, or "" for no comments. */
+function describeSeverities(comments: ReadonlyArray<{ severity: string }>): string {
+  const order = ["blocker", "major", "minor", "nit"];
+  const parts = order.map((severity) => [severity, comments.filter((comment) => comment.severity === severity).length] as const).filter(([, count]) => count);
+  return parts.length ? ` (${parts.map(([severity, count]) => `${count} ${severity}`).join(", ")})` : "";
 }

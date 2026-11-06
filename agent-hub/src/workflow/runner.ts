@@ -5,12 +5,15 @@ import type { Bus } from "../bus.ts";
 import { describeContext, discoverContext, type HubSkills } from "../context.ts";
 import { formatOfPath, type DocTemplates } from "../docs.ts";
 import { branchWebUrl, primaryRemote, pullRequestPageUrl, pushBranch, sanitizeRemoteUrl, type PullRequestCreator } from "../remote.ts";
+import { commentableLines, pendingChanges, publishReview, REVIEW_EVENTS, reviewMarkdown, type ReviewPublisher } from "../review/publish.ts";
+import { resolveReviewTarget, type PullRequestLookup } from "../review/target.ts";
 import type { CommandRunner } from "../shell.ts";
 import {
   deleteBranch,
   deleteBranchesWithPrefix,
   diffBetween,
   diffStatBetween,
+  git,
   GitTaskWorkspace,
   inspectRepo,
   isValidBranchName,
@@ -23,19 +26,25 @@ import {
   isDocStage,
   MAX_PARALLEL_TASKS,
   ROLE_LABELS,
+  SEVERITIES,
   stageKindsOf,
   stagesFor,
   TASK_KINDS,
   type AgentInfo,
   type AgentRole,
+  type CodeReview,
   type CommEntry,
+  type CuratedComment,
   type DocFormat,
   type NewCommEntry,
   type NewTaskEvent,
   type PullRequestInfo,
   type PushInfo,
   type Repo,
+  type ReviewEvent,
+  type ReviewPullRequest,
   type Round,
+  type Severity,
   type Stage,
   type StageKind,
   type Task,
@@ -55,6 +64,10 @@ export interface SubmitTaskInput {
   reviewerModel?: string;
   resolverModel?: string;
   managerModel?: string;
+  /** Code review tasks: model of the peer reviewer (the lead reviewer uses the reviewer model). */
+  peerReviewerModel?: string;
+  /** Code review tasks: the pull request (number or URL) or the branch, tag or commit to review. */
+  reviewTarget?: string;
   maxRounds?: number;
 }
 
@@ -63,6 +76,9 @@ export interface RuntimeGate {
   isReady(): boolean;
   deleteSessions(sessionIds: readonly string[]): Promise<void>;
 }
+
+/** Looks up pull requests to review and publishes code reviews on them (the GitHub CLI). */
+export type ReviewHost = PullRequestLookup & ReviewPublisher;
 
 export interface RunnerDeps {
   store: Store;
@@ -74,6 +90,8 @@ export interface RunnerDeps {
   docTemplates?: DocTemplates | null;
   /** Creates pull requests directly (e.g. with the GitHub CLI); without it the host's create page is used. */
   pullRequests?: PullRequestCreator;
+  /** Code review tasks: pull request details and publishing; without it, reviews can only be copied as Markdown. */
+  reviewHost?: ReviewHost;
   /** How often the manager checks on working agents (default 60 s). */
   monitorIntervalMs?: number;
   /** Silence after which the manager posts a check-in about a working agent (default 5 min). */
@@ -117,6 +135,9 @@ export interface ManagerOverview {
 
 const NO_ANSWER =
   "The user did not answer in time. Proceed using your best judgment and state your assumptions explicitly in your summary.";
+/** Focus of a code review task when the user gives none. */
+const DEFAULT_REVIEW_FOCUS =
+  "Review the change for correctness, security, error handling, performance, tests and maintainability, and give the author actionable comments.";
 const SHA = /^[0-9a-f]{7,40}$/i;
 const MAX_AUTO_RESUMES = 3;
 /** Heartbeats are frequent (streaming, tool output); publish them to the UI at most this often per task. */
@@ -129,6 +150,7 @@ export const KIND_LABELS: Record<TaskKind, string> = {
   document: "Document",
   testing: "Execute & verify",
   "design-coding": "Design → Coding",
+  review: "Code review",
 };
 
 /** Queues tasks, prepares git worktrees, runs workflow engines and relays their progress. */
@@ -144,6 +166,11 @@ export class TaskRunner {
   private readonly resumeQueue = new Set<string>();
   private readonly checkIns = new Set<string>();
   private readonly heartbeatsPublished = new Map<string, number>();
+  /** Code review tasks whose review is being published right now. */
+  private readonly publishing = new Set<string>();
+  private readonly anchorCache = new Map<string, Map<string, Set<number>>>();
+  /** One question to the user at a time per task (code review reviewers work in parallel). */
+  private readonly askLocks = new KeyedMutex();
   private readonly startedAt = nowIso();
   private monitorTimer: NodeJS.Timeout | null = null;
   private lastCheckAt: string | null = null;
@@ -199,7 +226,8 @@ export class TaskRunner {
 
   async submit(input: SubmitTaskInput): Promise<Task> {
     const { store } = this.deps;
-    const description = typeof input.description === "string" ? input.description.trim() : "";
+    const isReview = input.kind === "review";
+    const description = (typeof input.description === "string" ? input.description.trim() : "") || (isReview ? DEFAULT_REVIEW_FOCUS : "");
     if (!description) throw new HttpError(400, "A task description is required");
     if (description.length > 50_000) throw new HttpError(400, "The description is too long (max 50,000 characters)");
     if (!TASK_KINDS.includes(input.kind)) throw new HttpError(400, `Task type must be one of: ${TASK_KINDS.join(", ")}`);
@@ -207,25 +235,47 @@ export class TaskRunner {
     if (!repo) throw new HttpError(400, "Select a registered repository");
 
     const settings = store.settings;
-    const authorModel = (input.authorModel || settings.authorModel || "").trim();
+    let authorModel = (input.authorModel || settings.authorModel || "").trim();
     const reviewerModel = (input.reviewerModel || settings.reviewerModel || authorModel).trim();
     const resolverModel = (input.resolverModel || settings.resolverModel || authorModel).trim();
     const managerModel = input.kind === "auto" ? (input.managerModel || settings.managerModel || authorModel).trim() : undefined;
-    if (!authorModel || !reviewerModel) throw new HttpError(400, "Choose the author and reviewer models first (Settings)");
+    const peerReviewerModel = isReview ? (input.peerReviewerModel || settings.peerReviewerModel || authorModel || reviewerModel).trim() : undefined;
+    if (isReview) {
+      if (!reviewerModel || !peerReviewerModel) throw new HttpError(400, "Choose the lead and peer reviewer models first");
+      authorModel ||= peerReviewerModel;
+    } else if (!authorModel || !reviewerModel) {
+      throw new HttpError(400, "Choose the author and reviewer models first (Settings)");
+    }
     const maxRounds = clampInt(input.maxRounds ?? settings.maxRounds, 1, 10);
 
     let baseRef: string;
     let baseSha: string;
+    let review: CodeReview | undefined;
+    let suggestedTitle: string | undefined;
     try {
       const info = await inspectRepo(repo.path);
-      baseRef = input.baseRef?.trim() || info.branch || repo.defaultBranch;
-      baseSha = await resolveCommit(repo.path, baseRef);
+      if (isReview) {
+        const target = (input.reviewTarget ?? "").trim();
+        if (!target) throw new Error("Enter the pull request (number or URL) or the branch to review");
+        const resolved = await resolveReviewTarget(repo.path, target, {
+          baseRef: input.baseRef?.trim() || undefined,
+          defaultBranch: repo.defaultBranch && repo.defaultBranch !== "HEAD" ? repo.defaultBranch : (info.branch ?? "main"),
+          lookup: this.deps.reviewHost,
+        });
+        review = { target: resolved.target, rounds: [], comments: [] };
+        baseRef = resolved.target.baseRef;
+        baseSha = resolved.baseSha;
+        suggestedTitle = resolved.title;
+      } else {
+        baseRef = input.baseRef?.trim() || info.branch || repo.defaultBranch;
+        baseSha = await resolveCommit(repo.path, baseRef);
+      }
     } catch (error) {
       throw new HttpError(400, errorMessage(error));
     }
 
     const now = nowIso();
-    const title = truncate((input.title ?? "").trim() || firstLine(description), 100);
+    const title = truncate((input.title ?? "").trim() || suggestedTitle || firstLine(description), 100);
     const task: Task = {
       id: store.allocateTaskId(),
       title,
@@ -241,6 +291,7 @@ export class TaskRunner {
       reviewerModel,
       resolverModel,
       managerModel,
+      peerReviewerModel,
       maxRounds,
       status: "queued",
       phase: "queued",
@@ -253,18 +304,41 @@ export class TaskRunner {
       createdAt: now,
       updatedAt: now,
       lastSeq: 0,
+      ...(review ? { review } : {}),
     };
+    if (review) {
+      // The reviewed head gets a branch right away, so the fetched commits stay referenced while the task waits.
+      const headSha = review.target.headSha;
+      try {
+        await this.repoLocks.run(repo.path, async () => {
+          const branch = await uniqueBranchName(repo.path, await this.taskBranchBase(task, repo));
+          await git(repo.path, ["branch", branch, headSha]);
+          task.branch = branch;
+        });
+      } catch (error) {
+        throw new HttpError(500, `Could not create a branch for the reviewed change: ${errorMessage(error)}`);
+      }
+    }
     store.addTask(task);
-    this.emit(task, { type: "status", text: `Queued ${KIND_LABELS[task.kind]} task on ${repo.name} @ ${baseRef} (${baseSha.slice(0, 10)})` });
+    const where = review
+      ? `${review.target.pullRequest ? `pull request #${review.target.pullRequest.number}` : review.target.headRef} (${review.target.headSha.slice(0, 10)}) against ${baseRef}`
+      : `${repo.name} @ ${baseRef} (${baseSha.slice(0, 10)})`;
+    this.emit(task, { type: "status", text: `Queued ${KIND_LABELS[task.kind]} task ${review ? `of ${where} on ${repo.name}` : `on ${where}`}` });
     this.comm(task, {
       from: "user",
       to: "manager",
       kind: "lifecycle",
-      text: `New ${KIND_LABELS[task.kind]} task on ${repo.name} @ ${baseRef}: ${truncate(firstLine(description), 140)}`,
+      text: review ? `New code review of ${where} on ${repo.name}` : `New ${KIND_LABELS[task.kind]} task on ${repo.name} @ ${baseRef}: ${truncate(firstLine(description), 140)}`,
     });
     this.publish(task);
     this.pump();
     return task;
+  }
+
+  /** agent-hub/<id>-<title> (or agent-hub/<id> when the title does not make a valid branch name). */
+  private async taskBranchBase(task: Task, repo: Repo): Promise<string> {
+    const base = `agent-hub/${task.id.toLowerCase()}-${slugify(task.title, 32)}`;
+    return (await isValidBranchName(repo.path, base)) ? base : `agent-hub/${task.id.toLowerCase()}`;
   }
 
   cancel(id: string): Task {
@@ -289,6 +363,9 @@ export class TaskRunner {
   retry(id: string, extraRounds?: number): Task {
     const task = this.get(id);
     const unapproved = task.status === "completed" && task.result?.approved === false;
+    if (task.kind === "review" && task.status === "completed") {
+      throw new HttpError(409, "This code review is finished: keep, drop or edit its comments and publish them, or start a new review");
+    }
     if (!["failed", "cancelled", "interrupted"].includes(task.status) && !unapproved) {
       throw new HttpError(409, "Only failed, cancelled, interrupted or unapproved tasks can be retried");
     }
@@ -311,6 +388,7 @@ export class TaskRunner {
    */
   requestChanges(id: string, input: { request: string; stage?: string; rounds?: number }): Task {
     const task = this.get(id);
+    if (task.kind === "review") throw new HttpError(409, "Code review tasks do not change code: edit, keep or drop the review's comments instead");
     if (this.running.has(id) || task.status !== "completed") throw new HttpError(409, "Changes can be requested once the task has finished");
     const text = (input.request ?? "").trim();
     if (!text) throw new HttpError(400, "Describe the changes you want");
@@ -497,26 +575,45 @@ export class TaskRunner {
     return { from: fromRef, to: toRef, stat, ...diff };
   }
 
-  /** The task's design/document deliverable as of a review round (default: the latest). */
+  /**
+   * A document of the task's design/document stages as of a round (default: its latest version): the stage's
+   * deliverable, or with `docPath` any further document the stage's author wrote.
+   */
   async document(
     id: string,
     round?: number,
+    docPath?: string,
   ): Promise<{ stage: StageKind; path: string | null; format: DocFormat; round: number | null; rounds: number[]; content: string | null }> {
     const task = this.get(id);
-    const stage = task.stages.find((candidate) => isDocStage(candidate.kind));
-    if (!stage) throw new HttpError(404, "This task has no design or document stage");
-    const format = stage.docFormat ?? (stage.docPath ? formatOfPath(stage.docPath) : "markdown");
-    const rounds = stage.rounds.filter((candidate) => candidate.author?.docSnapshot);
+    const docStages = task.stages.filter((candidate) => isDocStage(candidate.kind));
+    if (!docStages.length) throw new HttpError(404, "This task has no design or document stage");
+    const snapshotIn = (stage: Stage, candidate: Round, file: string | undefined): string | undefined =>
+      candidate.author?.documents?.find((document) => document.path === file)?.snapshot ??
+      (file === stage.docPath ? candidate.author?.docSnapshot : undefined);
+    let stage = docStages[0]!;
+    let file = stage.docPath;
+    if (docPath) {
+      const found = docStages.find(
+        (candidate) => candidate.docPath === docPath || candidate.extraDocs?.includes(docPath) || candidate.rounds.some((entry) => snapshotIn(candidate, entry, docPath)),
+      );
+      if (!found) throw new HttpError(404, `This task wrote no document ${docPath}`);
+      stage = found;
+      file = docPath;
+    }
+    const format = file === stage.docPath ? (stage.docFormat ?? (file ? formatOfPath(file) : "markdown")) : formatOfPath(file!);
+    const rounds = stage.rounds.filter((candidate) => snapshotIn(stage, candidate, file));
     const target = round ? rounds.find((candidate) => candidate.n === round) : rounds.at(-1);
-    const base = { stage: stage.kind, path: stage.docPath ?? null, format, rounds: rounds.map((candidate) => candidate.n) };
-    if (!target?.author?.docSnapshot) return { ...base, round: null, content: null };
-    const content = await this.deps.store.readArtifact(task.id, target.author.docSnapshot);
+    const base = { stage: stage.kind, path: file ?? null, format, rounds: rounds.map((candidate) => candidate.n) };
+    const snapshot = target ? snapshotIn(stage, target, file) : undefined;
+    if (!target || !snapshot) return { ...base, round: null, content: null };
+    const content = await this.deps.store.readArtifact(task.id, snapshot);
     return { ...base, round: target.n, content };
   }
 
   /** Pushes the task branch now (e.g. after a failed automatic push, or with automatic pushes turned off). */
   async pushNow(id: string): Promise<Task> {
     const task = this.get(id);
+    if (task.kind === "review") throw new HttpError(409, "Code review tasks review an existing change; they have no branch of their own to push");
     if (this.running.has(id) || ACTIVE_STATUSES.includes(task.status)) throw new HttpError(409, "Wait until the task has finished before pushing its branch");
     if (task.push?.status === "pushing") throw new HttpError(409, "The branch is being pushed right now");
     await this.pushTask(task, false);
@@ -529,6 +626,7 @@ export class TaskRunner {
    */
   async pullRequest(id: string): Promise<PullRequestOutcome> {
     const task = this.get(id);
+    if (task.kind === "review") throw new HttpError(409, "Code review tasks review an existing change; publish the review's comments instead");
     if (this.running.has(id) || ACTIVE_STATUSES.includes(task.status)) throw new HttpError(409, "Wait until the task has finished before opening a pull request");
     if (task.pullRequest) return { pullRequest: task.pullRequest, message: `Pull request ${prName(task.pullRequest)} already exists` };
     const repo = this.deps.store.getRepo(task.repoId);
@@ -585,6 +683,157 @@ export class TaskRunner {
       supported: direct || remote.webUrl !== null,
       pullRequest: task.pullRequest,
     };
+  }
+
+  // ---- Code review tasks: curating and publishing the final review ---------------------------------
+
+  private finishedReview(id: string): { task: Task; review: CodeReview; curated: CuratedComment[] } {
+    const task = this.get(id);
+    if (task.kind !== "review" || !task.review) throw new HttpError(404, "This task is not a code review");
+    if (task.status !== "completed" || !task.review.curated) throw new HttpError(409, "The reviewers have not finished the review yet");
+    return { task, review: task.review, curated: task.review.curated };
+  }
+
+  private editableReview(id: string): { task: Task; review: CodeReview; curated: CuratedComment[] } {
+    if (this.publishing.has(id)) throw new HttpError(409, "The review is being published; edit it once publishing has finished");
+    return this.finishedReview(id);
+  }
+
+  /** Keeps, drops or edits a comment of the final review before it is published (published comments are updated on the next publish). */
+  updateReviewComment(id: string, commentId: string, patch: { decision?: unknown; body?: unknown; severity?: unknown; revert?: unknown }): Task {
+    const { task, curated } = this.editableReview(id);
+    const comment = curated.find((candidate) => candidate.id === commentId.toUpperCase());
+    if (!comment) throw new HttpError(404, `The review has no comment ${commentId}`);
+    if (patch.decision !== undefined) {
+      if (patch.decision !== "keep" && patch.decision !== "drop") throw new HttpError(400, "'decision' must be keep or drop");
+      comment.decision = patch.decision;
+    }
+    if (patch.revert === true && comment.original) {
+      comment.body = comment.original.body;
+      comment.severity = comment.original.severity;
+      comment.original = undefined;
+    }
+    if (patch.body !== undefined || patch.severity !== undefined) {
+      if (patch.body !== undefined && typeof patch.body !== "string") throw new HttpError(400, "'body' must be a string");
+      const body = patch.body === undefined ? comment.body : (patch.body as string).trim();
+      if (!body) throw new HttpError(400, "A comment needs text; drop it instead");
+      if (body.length > 20_000) throw new HttpError(400, "The comment is too long (max 20,000 characters)");
+      const severity = (patch.severity === undefined ? comment.severity : patch.severity) as Severity;
+      if (!SEVERITIES.includes(severity)) throw new HttpError(400, `'severity' must be one of: ${SEVERITIES.join(", ")}`);
+      if (body !== comment.body || severity !== comment.severity) {
+        comment.original ??= { body: comment.body, severity: comment.severity };
+        comment.body = body;
+        comment.severity = severity;
+        if (comment.original.body === body && comment.original.severity === severity) comment.original = undefined;
+      }
+    }
+    this.publish(task);
+    return task;
+  }
+
+  /** Puts a reviewer comment the final review dropped (or the peer reviewer said was missing) back into the review. */
+  addReviewComment(id: string, sourceId: string): Task {
+    const { task, review, curated } = this.editableReview(id);
+    const source = review.comments.find((candidate) => candidate.id === sourceId.trim().toUpperCase());
+    if (!source) throw new HttpError(404, `The reviewers raised no comment ${sourceId}`);
+    if (curated.some((comment) => comment.sources.includes(source.id) && comment.decision === "keep")) {
+      throw new HttpError(409, `${source.id} is already part of a kept comment`);
+    }
+    const next = Math.max(0, ...curated.map((comment) => Number(comment.id.slice(1)) || 0)) + 1;
+    curated.push({ id: `R${next}`, severity: source.severity, file: source.file, line: source.line, body: source.body, sources: [source.id], decision: "keep", addedByUser: true });
+    this.publish(task);
+    return task;
+  }
+
+  /** Sets the text published with the comments and, before the first publication, the kind of review. */
+  updateReviewSummary(id: string, patch: { body?: unknown; event?: unknown }): Task {
+    const { task, review } = this.editableReview(id);
+    if (patch.body !== undefined) {
+      if (typeof patch.body !== "string") throw new HttpError(400, "'body' must be a string");
+      if (patch.body.length > 60_000) throw new HttpError(400, "The review text is too long (max 60,000 characters)");
+      review.body = patch.body.trim();
+    }
+    if (patch.event !== undefined) {
+      if (!REVIEW_EVENTS.includes(patch.event as ReviewEvent)) throw new HttpError(400, `'event' must be one of: ${REVIEW_EVENTS.join(", ")}`);
+      const main = review.publications?.find((publication) => publication.main);
+      if (main && main.event !== patch.event) throw new HttpError(409, "The review was already published; its kind cannot change any more");
+      review.event = patch.event as ReviewEvent;
+    }
+    this.publish(task);
+    return task;
+  }
+
+  /** Whether the review can be published on its pull request right now, and what publishing would change. */
+  async reviewPublishStatus(id: string): Promise<{
+    pullRequest: ReviewPullRequest | null;
+    available: boolean;
+    reason: string | null;
+    /** Changes the pull request does not show yet (null before the first publication). */
+    pending: number | null;
+    inline: number;
+    inBody: number;
+  }> {
+    const { task, review, curated } = this.finishedReview(id);
+    const pr = review.target.pullRequest ?? null;
+    let reason: string | null = null;
+    if (!pr) {
+      reason =
+        review.target.kind === "ref"
+          ? "This review is of a branch with no open GitHub pull request, so there is nowhere to publish it; copy it as Markdown instead."
+          : "The pull request is unknown.";
+    } else if (!this.deps.reviewHost) {
+      reason = "Publishing is not available in this hub; copy the review as Markdown instead.";
+    } else {
+      reason = await this.deps.reviewHost.unavailable(pr);
+    }
+    const anchors = await this.reviewAnchors(task);
+    const kept = curated.filter((comment) => comment.decision === "keep");
+    const inline = kept.filter((comment) => (comment.published ? comment.published.inline : Boolean(comment.file && comment.line && anchors.get(comment.file)?.has(comment.line)))).length;
+    return { pullRequest: pr, available: reason === null, reason, pending: pendingChanges(review, anchors), inline, inBody: kept.length - inline };
+  }
+
+  /** Publishes the curated review on the pull request, or updates what an earlier publish put there. */
+  async publishReviewComments(id: string): Promise<{ task: Task; ok: boolean; message: string }> {
+    const { task, review } = this.editableReview(id);
+    const pr = review.target.pullRequest;
+    if (!pr) throw new HttpError(409, "This review has no pull request to publish to; copy it as Markdown instead");
+    const host = this.deps.reviewHost;
+    if (!host) throw new HttpError(409, "Publishing is not available in this hub; copy the review as Markdown instead");
+    const problem = await host.unavailable(pr);
+    if (problem) throw new HttpError(409, problem);
+    if (this.publishing.has(id)) throw new HttpError(409, "The review is being published already");
+    this.publishing.add(id);
+    try {
+      const anchors = await this.reviewAnchors(task);
+      const outcome = await publishReview(review, pr, host, anchors, review.target.headSha);
+      this.emit(task, { type: outcome.ok ? "info" : "warning", text: outcome.message, data: { publish: true, url: review.publications?.find((publication) => publication.main)?.url } });
+      this.comm(task, { from: "manager", to: "user", kind: "lifecycle", text: truncate(outcome.message, 300) });
+      this.publish(task);
+      return { task, ok: outcome.ok, message: outcome.message };
+    } finally {
+      this.publishing.delete(id);
+    }
+  }
+
+  /** The curated review as Markdown, to paste on hosts the hub cannot publish to. */
+  reviewAsMarkdown(id: string): { markdown: string } {
+    const { task, review } = this.finishedReview(id);
+    return { markdown: reviewMarkdown(task.title, review) };
+  }
+
+  /** Lines of the reviewed change that pull request comments can be attached to (cached per task and head). */
+  private async reviewAnchors(task: Task): Promise<Map<string, Set<number>>> {
+    const review = task.review!;
+    const key = `${task.id}:${task.baseSha}:${review.target.headSha}`;
+    const cached = this.anchorCache.get(key);
+    if (cached) return cached;
+    const repo = this.deps.store.getRepo(task.repoId);
+    if (!repo || !task.baseSha) return new Map();
+    const diff = await diffBetween(repo.path, task.baseSha, review.target.headSha, 256 * 1024 * 1024);
+    const anchors = commentableLines(diff.text);
+    if (this.anchorCache.size > 50) this.anchorCache.clear();
+    this.anchorCache.set(key, anchors);
+    return anchors;
   }
 
   /**
@@ -654,7 +903,8 @@ export class TaskRunner {
       if (!repo) throw new Error("The repository is no longer registered");
       const workspace = await this.prepareWorkspace(task, repo);
       if (entry.controller.signal.aborted) throw new CancelledError();
-      task.context = await discoverContext(repo.path, task.baseSha!);
+      // A code review reads the guidance of the reviewed change, as its reviewers' worktrees do.
+      task.context = await discoverContext(repo.path, task.review?.target.headSha ?? task.baseSha!);
       this.emit(task, { type: "info", text: `Repository context: ${describeContext(task.context)}`, data: { context: true } });
       this.publish(task);
       const testRunsKey = `${repo.path}#tests`;
@@ -701,7 +951,7 @@ export class TaskRunner {
       this.heartbeatsPublished.delete(task.id);
       this.publish(task);
       this.pump();
-      if (task.status === "completed" && store.settings.pushOnComplete && !this.shuttingDown) this.afterTask(this.pushTask(task, true));
+      if (task.status === "completed" && store.settings.pushOnComplete && task.kind !== "review" && !this.shuttingDown) this.afterTask(this.pushTask(task, true));
     }
   }
 
@@ -748,11 +998,7 @@ export class TaskRunner {
   private async prepareWorkspace(task: Task, repo: Repo): Promise<GitTaskWorkspace> {
     await this.repoLocks.run(repo.path, async () => {
       task.baseSha ??= await resolveCommit(repo.path, task.baseRef);
-      if (!task.branch) {
-        let base = `agent-hub/${task.id.toLowerCase()}-${slugify(task.title, 32)}`;
-        if (!(await isValidBranchName(repo.path, base))) base = `agent-hub/${task.id.toLowerCase()}`;
-        task.branch = await uniqueBranchName(repo.path, base);
-      }
+      task.branch ??= await uniqueBranchName(repo.path, await this.taskBranchBase(task, repo));
     });
     task.workspaceRoot ??= path.join(this.deps.worktreesDir, task.id);
     task.isolation ??= this.deps.store.settings.isolation;
@@ -765,11 +1011,13 @@ export class TaskRunner {
       task.layout = 2;
       task.worktreePath = undefined;
     }
-    await this.repoLocks.run(repo.path, () => workspace.ensureTaskBranch());
+    const target = task.review?.target;
+    await this.repoLocks.run(repo.path, () => workspace.ensureTaskBranch(target?.headSha));
     this.emit(task, {
       type: "info",
-      text:
-        task.isolation === "worktree"
+      text: target
+        ? `Reviewing ${target.headSha.slice(0, 10)} (branch ${task.branch}) against ${target.baseRef}; each reviewer has its own read-only worktree under ${task.workspaceRoot}`
+        : task.isolation === "worktree"
           ? `Task branch ${task.branch}; each sub-agent gets its own worktree and branch under ${task.workspaceRoot}`
           : `Task branch ${task.branch}; author agents work on their own branches in ${path.join(task.workspaceRoot, "author")}, reviewers in ${path.join(task.workspaceRoot, "review")}`,
     });
@@ -867,7 +1115,12 @@ export class TaskRunner {
     this.scheduleUpdate(task);
   }
 
+  /** Agents of one task ask one question at a time (the code review reviewers work in parallel). */
   private askUser(task: Task, role: AgentRole, question: UserQuestion, signal: AbortSignal): Promise<string> {
+    return this.askLocks.run(task.id, () => this.askUserNow(task, role, question, signal));
+  }
+
+  private askUserNow(task: Task, role: AgentRole, question: UserQuestion, signal: AbortSignal): Promise<string> {
     if (signal.aborted) return Promise.reject(new CancelledError());
     const inputId = randomId(10);
     task.pendingInput = {
@@ -1019,6 +1272,10 @@ function clampInt(value: unknown, min: number, max: number): number {
 
 function completionText(task: Task): string {
   const result = task.result;
+  if (task.kind === "review") {
+    const comments = result?.openComments ?? 0;
+    return `Completed: code review ready with ${comments} comment(s) (${result?.approved ? "both reviewers agree" : "the reviewers did not fully agree"}); review and publish them`;
+  }
   const testsLast = stageKindsOf(task).at(-1) === "testing";
   if (result?.approved) return testsLast ? "Completed: all tests pass (verified by the test executor)" : "Completed: approved by the reviewer";
   return testsLast

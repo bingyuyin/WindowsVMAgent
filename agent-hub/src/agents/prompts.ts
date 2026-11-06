@@ -1,6 +1,7 @@
 import { isAutoLoadedInstruction } from "../context.ts";
 import { docForPrompt } from "../docs.ts";
 import {
+  isCodeReviewRole,
   isDocStage,
   isReviewerRole,
   ROLE_LABELS,
@@ -163,7 +164,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         ),
         "- Explore the repository first (README, existing docs, relevant code, configuration and scripts) so every statement, command, path and API you document is accurate. Verify instead of guessing.",
         "- Write for the intended audience: purpose first, then task-oriented sections with short paragraphs, lists, tables, runnable examples and diagrams where they help.",
-        "- Write the document to the exact file path you are given. Do not create or modify any other files.",
+        "- Write the document to the exact file path you are given. When the request calls for several documents (for example a guide per component, or a runbook plus an FAQ), make that file the main one and write each further document as its own file in the same folder and format, linked from the main document. Do not create or modify any other files.",
         ...docAuthoringRules(options.docFormat),
         ...skillsLine(skills),
         "- When you receive review comments, address every comment ID: update the document (preferred) or decline with a concrete justification.",
@@ -174,7 +175,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
       return [
         ...header("ROLE: DOCUMENTATION REVIEWER. Critically review the document written by the technical writer."),
         "- You are strictly read-only: never create, modify or delete files and never run commands with side effects.",
-        "- Verify accuracy against the repository (commands, paths, APIs, configuration, behavior), completeness for the request and its audience, structure and clarity, and that examples are correct.",
+        "- Verify accuracy against the repository (commands, paths, APIs, configuration, behavior), completeness for the request and its audience, structure and clarity, and that examples are correct. When the writer produced several documents, review each of them and how they fit together.",
         ...docReviewRules(options.docFormat),
         ...skillsLine(skills),
         "- Each comment must be specific and actionable and point to the section. Severities: blocker (wrong or misleading), major (significant gap or inaccuracy), minor (worthwhile improvement), nit (polish).",
@@ -257,6 +258,9 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         ...skillsLine(skills),
         "- Finish every round by calling the `submit_work` tool exactly once, with a response for every failure ID. Never end your turn without calling it.",
       ].join("\n");
+    case "lead-reviewer":
+    case "peer-reviewer":
+      return codeReviewSystemPrompt(role, env, skills);
     case "planner":
       return [
         "You are the MANAGER of Copilot Agent Hub's team of sub-agents. You do not do the work yourself: you read the request, inspect the repository, decide which sub-agent teams to create, and write each team's assignment. The hub then creates the agents, relays their results and monitors them.",
@@ -281,6 +285,33 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
 
 function requestBlock(task: Task): string {
   return [`# Task ${task.id}: ${task.title}`, "", "## Request", "", task.description.trim()].join("\n");
+}
+
+/** The two reviewers of a code review task: independent reviews, a discussion of each other's findings, a final review and a sign-off. */
+function codeReviewSystemPrompt(role: AgentRole, env: AgentEnvironment, skills: string[]): string {
+  const lead = role === "lead-reviewer";
+  return [
+    "You are an autonomous sub-agent inside Copilot Agent Hub. Two reviewers - you and another agent, often running on a different model - review a change someone else wrote (a pull request or a branch). The hub relays your structured results between you, turn by turn, and the user publishes the final review on the pull request.",
+    "",
+    lead
+      ? "ROLE: LEAD CODE REVIEWER. You review the change independently, discuss the peer reviewer's findings with it, and then write the final review from both reviews and the discussion; the peer reviewer signs off on it."
+      : "ROLE: PEER CODE REVIEWER. You review the change independently and discuss your findings with the lead reviewer, who then writes the final review; you sign off on it or object.",
+    "",
+    environmentBlock(role, env),
+    "",
+    "Rules:",
+    "- You are strictly read-only: never create, modify or delete files and never run commands with side effects. Inspect the code with view/grep/glob and read-only git commands (git diff, git log, git show, git blame).",
+    `- Review the complete change (git diff ${short(env.baseSha)}..HEAD) against its purpose - the pull request's title and description and the user's focus - and the code around it: correctness and edge cases, security, error handling, concurrency, performance, API and compatibility changes, tests for the changed behavior, and maintainability. Read the surrounding code and callers before you call something a bug. Follow the repository's instructions and conventions.`,
+    ...skillsLine(skills),
+    "- Review the change only: no comments on code it does not touch, and none on pure formatting or style unless it breaks the repository's conventions. Prefer a few high-signal comments over many trivial ones; each must be a real, specific problem.",
+    "- Anchor each comment to a file and a line of the new version, preferably a line the change added or modified (those can be posted inline on the pull request). Say what is wrong, why it matters and how to fix it; a short code suggestion helps. Severities: blocker (bug, security hole, data loss: must fix), major (should be fixed before merging), minor (worth improving), nit (polish).",
+    "- Comments are read by the change's author: specific, respectful and self-contained. Never mention the other reviewer, comment IDs or this discussion in a comment's text.",
+    "- In the discussion, judge the other reviewer's findings on their merits: agree when they are right, disagree with evidence from the code when they are not, and refine the text, severity or line when that makes a comment better. Withdraw your own comments that turn out to be wrong. Changing your mind for good reasons is the point of the discussion.",
+    lead
+      ? "- When you write the final review: merge duplicates into one comment, apply agreed refinements, keep the comments you both agree on, decide disputed ones on their merits, and drop wrong, duplicate or out-of-scope ones with the reason. When the peer reviewer objects to the final review, address each objection: change the review where it is right, or keep your decision and explain why."
+      : "- When you sign off: accept the final review when it keeps every valid issue with a fair severity and location, drops only wrong or duplicate ones, and reads well for the change's author. Object only to substantive problems (a valid issue dropped, a wrong comment kept, a misleading severity or location), not to wording preferences.",
+    "- Every turn asks for one submit tool (submit_findings, submit_positions or " + (lead ? "submit_final_review" : "submit_signoff") + "). Finish the turn by calling exactly that tool once. Never end your turn without calling it.",
+  ].join("\n");
 }
 
 /** The manager's assignment for a stage (Auto tasks), shown to that stage's agents. */
@@ -480,6 +511,11 @@ export function authorPrompt(input: AuthorPromptInput): string {
     } else {
       parts.push(`Write the ${noun} as Markdown to \`${input.docPath}\` (relative to the working directory; its folder already exists).`);
     }
+    if (input.stage === "document") {
+      parts.push(
+        `If the request calls for several documents, \`${input.docPath}\` is the main one: write each further document as its own ${input.docFormat === "html" ? "HTML page (start from a copy of the main page's head, styles and Mermaid loader)" : "Markdown file"} in the same folder and link to it from the main document.`,
+      );
+    }
     parts.push(`When it is complete, call \`submit_work\` with a short summary of the ${input.stage === "design" ? "design" : "document"}.`);
   } else {
     parts.push(
@@ -503,6 +539,8 @@ export interface ReviewPromptInput {
   docPath?: string;
   docFormat?: DocFormat;
   docContent?: string;
+  /** Document stages: further documents the author wrote next to the deliverable, as of the reviewed commit. */
+  extraDocs?: Array<{ path: string; content: string | null }>;
   submission: AuthorSubmission;
   authorLabel: string;
   baseSha: string;
@@ -552,6 +590,21 @@ export function reviewPrompt(input: ReviewPromptInput): string {
     }
     if (input.docContent) {
       parts.push("", `Current document${format === "html" ? " (styles and scripts omitted; the full file is in your worktree)" : ""}:`, fenced(input.docContent, format));
+    }
+    if (input.extraDocs?.length) {
+      parts.push("", `The author also wrote ${input.extraDocs.length} further document(s) for this request; review each of them too:`);
+      let budget = MAX_INLINE_DOC;
+      for (const doc of input.extraDocs) {
+        const docFormat = /\.html?$/i.test(doc.path) ? "html" : "markdown";
+        if (doc.content === null) {
+          parts.push("", `- \`${doc.path}\` (removed since; check whether that was intended)`);
+        } else if (doc.content.length > budget) {
+          parts.push("", `- \`${doc.path}\` (read it in your worktree)`);
+        } else {
+          budget -= doc.content.length;
+          parts.push("", `\`${doc.path}\`:`, fenced(doc.content, docFormat));
+        }
+      }
     }
   } else {
     parts.push(
@@ -743,10 +796,12 @@ export const NUDGE_PLAN =
   "You ended your turn without calling the `submit_plan` tool. Call `submit_plan` now with the stages, your rationale, an assignment for each stage and the briefing. " +
   "Do not end your turn without calling it.";
 
-/** The tool that ends each kind of agent's turn. */
-export function submitToolFor(role: AgentRole): string {
+/** The tool that ends each kind of agent's turn (code review reviewers have one per step; `tool` names the current one). */
+export function submitToolFor(role: AgentRole, tool?: string): string {
+  if (tool) return tool;
   if (role === "planner") return "submit_plan";
   if (role === "executor") return "submit_test_results";
+  if (isCodeReviewRole(role)) return "submit tool this turn asks for";
   return isReviewerRole(role) ? "submit_review" : "submit_work";
 }
 
@@ -754,12 +809,12 @@ const AVOID_HANGS =
   "Do not repeat what got stuck: give long-running commands a timeout, run tools non-interactively (for example `CI=true`, `--yes`, `--no-watch`, `-NonInteractive`), never wait on servers, watchers or interactive prompts in the foreground, and narrow a run that hangs (one project, file or test) to find the culprit. If a command hangs again, stop it and report the hang instead of waiting on it.";
 
 /** Sent in the same session after the manager interrupted a stuck turn: the agent keeps its conversation. */
-export function recoveryPrompt(role: AgentRole, reason: string): string {
+export function recoveryPrompt(role: AgentRole, reason: string, tool?: string): string {
   return [
     `The manager interrupted your previous turn because it stopped making progress: ${reason}.`,
     "Your conversation and the files in your working directory are intact. Continue your assignment from where you left off.",
     AVOID_HANGS,
-    `Then finish by calling \`${submitToolFor(role)}\`. Do not end your turn without calling it.`,
+    `Then finish by calling \`${submitToolFor(role, tool)}\`. Do not end your turn without calling it.`,
   ].join("\n\n");
 }
 

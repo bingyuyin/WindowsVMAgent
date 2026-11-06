@@ -1,5 +1,5 @@
 import { defineTool, type Tool } from "@github/copilot-sdk";
-import type { PlanSubmissionInput, ReviewSubmissionInput, SubmitChannel, TestRunSubmissionInput, WorkSubmissionInput } from "./driver.ts";
+import type { CodeReviewTool, PlanSubmissionInput, ReviewSubmissionInput, SubmitChannel, TestRunSubmissionInput, WorkSubmissionInput } from "./driver.ts";
 
 export const SUBMIT_WORK_TOOL = "submit_work";
 export const SUBMIT_REVIEW_TOOL = "submit_review";
@@ -186,6 +186,205 @@ export const submitPlanSchema = {
   required: ["stages", "rationale", "instructions", "briefing"],
 } as const;
 
+const SEVERITY_ENUM = ["blocker", "major", "minor", "nit"] as const;
+
+const reviewCommentProperties = {
+  severity: {
+    type: "string",
+    enum: SEVERITY_ENUM,
+    description: "blocker: must be fixed (bug, security hole, data loss). major: should be fixed before merging. minor: worth improving. nit: polish.",
+  },
+  file: { type: "string", description: "Repository-relative path of the file the comment is about." },
+  line: {
+    type: "integer",
+    description:
+      "1-based line in the NEW version of the file (the reviewed commit). Prefer a line the change added or modified: comments on lines of the diff can be posted inline on the pull request.",
+  },
+  body: {
+    type: "string",
+    description:
+      "Written for the change's author: what is wrong, why it matters and how to fix it (a short code suggestion helps). Self-contained: never mention the other reviewer, comment IDs or this discussion.",
+  },
+} as const;
+
+const reviewCommentSchema = { type: "object", properties: reviewCommentProperties, required: ["severity", "body"] } as const;
+
+const verdictSchema = {
+  type: "string",
+  enum: ["approve", "request_changes"],
+  description: "approve: the change can be merged as is or with minor/nit comments. request_changes: a blocker or major issue must be fixed first.",
+} as const;
+
+export const submitFindingsSchema = {
+  type: "object",
+  properties: {
+    change_summary: {
+      type: "string",
+      description:
+        "What the change does, for a reader who has not seen it: its purpose, the main changes grouped by area or file, and notable risks. Concise Markdown.",
+    },
+    assessment: { type: "string", description: "Your overall assessment of the change in a few sentences." },
+    verdict: verdictSchema,
+    comments: { type: "array", description: "One entry per issue worth raising; empty when there is none.", items: reviewCommentSchema },
+  },
+  required: ["change_summary", "assessment", "verdict", "comments"],
+} as const;
+
+export const submitPositionsSchema = {
+  type: "object",
+  properties: {
+    summary: { type: "string", description: "Where you agree and disagree with the other reviewer, in a few sentences." },
+    responses: {
+      type: "array",
+      description: "Exactly one entry for every comment of the OTHER reviewer.",
+      items: {
+        type: "object",
+        properties: {
+          comment_id: { type: "string", description: "The other reviewer's comment ID, e.g. P2 or L3." },
+          position: {
+            type: "string",
+            enum: ["agree", "disagree", "refine"],
+            description: "agree: valid as written. disagree: not a real issue (say why, pointing to the code). refine: valid, but the text, severity or line should change.",
+          },
+          note: { type: "string", description: "Your reasoning, with evidence from the code." },
+          suggested_body: { type: "string", description: "refine: the better comment text." },
+          suggested_severity: { type: "string", enum: SEVERITY_ENUM, description: "refine: the severity it should have." },
+        },
+        required: ["comment_id", "position", "note"],
+      },
+    },
+    own_updates: {
+      type: "array",
+      description: "Changes to your OWN comments after reading the other review: withdraw one that is wrong, or revise it.",
+      items: {
+        type: "object",
+        properties: {
+          comment_id: { type: "string", description: "Your comment's ID." },
+          action: { type: "string", enum: ["withdraw", "revise"] },
+          note: { type: "string", description: "Why you withdraw or revise it." },
+          body: { type: "string", description: "revise: the new text." },
+          severity: { type: "string", enum: SEVERITY_ENUM, description: "revise: the new severity." },
+          line: { type: "integer", description: "revise: the corrected line." },
+        },
+        required: ["comment_id", "action", "note"],
+      },
+    },
+    new_comments: {
+      type: "array",
+      description: "Real issues neither reviewer raised (often prompted by the other review). Usually empty.",
+      items: reviewCommentSchema,
+    },
+  },
+  required: ["summary", "responses"],
+} as const;
+
+export const submitFinalReviewSchema = {
+  type: "object",
+  properties: {
+    change_summary: { type: "string", description: "The final summary of what the change does (purpose, main changes by area, risks). Concise Markdown." },
+    assessment: { type: "string", description: "The overall assessment the change's author reads with the comments." },
+    verdict: verdictSchema,
+    comments: {
+      type: "array",
+      description: "The final comments, each self-contained and written for the change's author.",
+      items: {
+        type: "object",
+        properties: {
+          ...reviewCommentProperties,
+          sources: {
+            type: "array",
+            items: { type: "string" },
+            description: 'IDs of the reviewer comments merged into this one, e.g. ["L2", "P1"]; empty for an issue you add now.',
+          },
+        },
+        required: ["severity", "body", "sources"],
+      },
+    },
+    dropped: {
+      type: "array",
+      description: "Every reviewer comment that is in no final comment's sources, with the reason (wrong, duplicate, out of scope...). Withdrawn comments need not be listed.",
+      items: {
+        type: "object",
+        properties: { comment_id: { type: "string" }, reason: { type: "string" } },
+        required: ["comment_id", "reason"],
+      },
+    },
+    objection_responses: {
+      type: "array",
+      description: "Only when revising after the peer reviewer's objections: how you handled each one.",
+      items: {
+        type: "object",
+        properties: { objection: { type: "string", description: "The objection, briefly." }, response: { type: "string", description: "What you changed, or why you keep your decision." } },
+        required: ["objection", "response"],
+      },
+    },
+  },
+  required: ["change_summary", "assessment", "verdict", "comments", "dropped"],
+} as const;
+
+export const submitSignoffSchema = {
+  type: "object",
+  properties: {
+    agree: { type: "boolean", description: "true when you accept the final review as a whole; wording preferences and nits are no reason to object." },
+    summary: { type: "string", description: "Why you accept it, or what is wrong with it, in a few sentences." },
+    objections: {
+      type: "array",
+      description: "Required when agree is false: one entry per problem.",
+      items: {
+        type: "object",
+        properties: {
+          comment_id: { type: "string", description: "R# of a final comment, or the ID of a reviewer comment the final review dropped; omit for the review as a whole." },
+          issue: { type: "string", description: "What is wrong and what the final review should do instead." },
+        },
+        required: ["issue"],
+      },
+    },
+  },
+  required: ["agree", "summary"],
+} as const;
+
+const CODE_REVIEW_TOOLS: Record<CodeReviewTool, { description: string; parameters: Record<string, unknown>; done: string }> = {
+  submit_findings: {
+    description: "Submit your independent review of the change: its summary, your assessment and verdict, and your comments. Call exactly once, as your final action.",
+    parameters: submitFindingsSchema,
+    done: "Findings recorded. Your turn is complete.",
+  },
+  submit_positions: {
+    description: "Submit your response to the other reviewer's comments and any changes to your own. Call exactly once, as your final action.",
+    parameters: submitPositionsSchema,
+    done: "Positions recorded. Your turn is complete.",
+  },
+  submit_final_review: {
+    description: "Submit the consolidated final review. Call exactly once, as your final action.",
+    parameters: submitFinalReviewSchema,
+    done: "Final review recorded. Your turn is complete.",
+  },
+  submit_signoff: {
+    description: "Accept the final review, or object to it. Call exactly once, as your final action.",
+    parameters: submitSignoffSchema,
+    done: "Sign-off recorded. Your turn is complete.",
+  },
+};
+
+/** The terminal tools of an agent: one submit tool, or one per step for the code review reviewers. */
+export function buildSubmitTools(channel: SubmitChannel): Tool<any>[] {
+  if (channel.kind !== "code-review") return [buildSubmitTool(channel)];
+  return channel.tools.map((name) => {
+    const tool = CODE_REVIEW_TOOLS[name];
+    return defineTool<Record<string, unknown>>(name, {
+      description: tool.description,
+      parameters: tool.parameters,
+      handler: async (args) => {
+        await channel.onSubmit(name, args);
+        return tool.done;
+      },
+      isTerminal: true,
+      skipPermission: true,
+      defer: "never",
+    });
+  });
+}
+
 /** Builds the terminal tool through which an agent hands its structured result to the workflow. */
 export function buildSubmitTool(channel: SubmitChannel): Tool<any> {
   const terminal = { isTerminal: true, skipPermission: true, defer: "never" } as const;
@@ -233,5 +432,7 @@ export function buildSubmitTool(channel: SubmitChannel): Tool<any> {
         },
         ...terminal,
       });
+    case "code-review":
+      throw new Error("Code review reviewers have one tool per step: use buildSubmitTools");
   }
 }

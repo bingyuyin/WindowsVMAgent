@@ -24,7 +24,7 @@ const PREFS_KEY = "agent-hub.agents-view";
 const AUTHOR = { design: "designer", document: "writer", coding: "coder", testing: "fixer" };
 const REVIEWER = { design: "design-reviewer", document: "doc-reviewer", coding: "code-reviewer", testing: "executor" };
 const RESOLVER = { design: "designer", document: "writer", coding: "resolver", testing: "fixer" };
-const ROLE_ORDER = ["planner", "designer", "design-reviewer", "coder", "code-reviewer", "resolver", "executor", "fixer", "writer", "doc-reviewer"];
+const ROLE_ORDER = ["planner", "designer", "design-reviewer", "coder", "code-reviewer", "resolver", "executor", "fixer", "writer", "doc-reviewer", "lead-reviewer", "peer-reviewer"];
 const COMM_KINDS = {
   lifecycle: "status",
   plan: "plan",
@@ -111,6 +111,7 @@ function pendingHint(task, role) {
     return role === "resolver" ? "approved without comments to resolve" : role === "fixer" ? "tests passed without failures to fix" : "not used by this run";
   }
   if (role === "planner") return "plans the task first";
+  if (role === "lead-reviewer" || role === "peer-reviewer") return "reviews the change when the task starts";
   if (role === "resolver") return "joins if the reviewer requests changes";
   if (role === "fixer") return "joins if a test run fails";
   if (role === "executor") return "runs the tests when the stage starts";
@@ -122,6 +123,8 @@ function pendingHint(task, role) {
 
 function modelForRole(task, role) {
   if (role === "planner") return task.managerModel || task.authorModel;
+  if (role === "lead-reviewer") return task.reviewerModel;
+  if (role === "peer-reviewer") return task.peerReviewerModel || task.authorModel;
   if (REVIEWER[stageOfRole(role)] === role) return task.reviewerModel;
   if (role === "resolver" || role === "fixer") return task.resolverModel || task.authorModel;
   return task.authorModel;
@@ -132,10 +135,15 @@ function taskLine(task) {
   if (task.status === "needs-input") return "Waiting for your answer";
   if (task.status === "running") {
     if (task.phase === "planning") return "Manager is planning the sub-agents";
+    if (task.kind === "review") return `${task.phase === "reviewing" ? "Reviewing the change independently" : phaseLabel(task.currentStage, task.phase)}${task.currentRound ? ` · round ${task.currentRound}` : ""}`;
     const budget = task.roundsBudget ?? task.maxRounds;
     return `${phaseLabel(task.currentStage, task.phase)}${task.currentRound ? ` · round ${task.currentRound}/${Math.max(budget, task.currentRound)}` : ""}`;
   }
   if (task.status === "completed") {
+    if (task.kind === "review") {
+      const review = task.review;
+      return review ? `${review.published ? "Review published" : "Review ready"}: keeping ${review.kept} of ${review.comments} comment(s)` : "Review ready";
+    }
     const rounds = task.stages.at(-1)?.rounds.length ?? 0;
     const testsLast = task.stages.at(-1)?.kind === "testing";
     if (testsLast) return task.approved ? `Tests pass after ${rounds} run${rounds === 1 ? "" : "s"}` : `Tests failing (${task.openComments ?? 0} failure(s))`;
@@ -648,14 +656,42 @@ export function agentsView(root) {
                   h("div", { class: "pipe-sub" }, task.kind === "auto" ? (task.plan ? "planned · assigns" : task.phase === "planning" ? "planning…" : "plans first") : "assigns · relays"),
                 ),
               ),
-              !task.stages.length
+              !task.stages.length && task.kind !== "review"
                 ? [h("span", { class: "pipe-arrow pipe-arrow-stage" }, "→"), h("div", { class: "pipe-lane current" }, h("div", { class: "pipe-lane-head" }, h("span", {}, "Planning"), h("span", { class: "muted small" }, "agents are created from the plan")))]
                 : null,
+              task.kind === "review" ? [h("span", { class: "pipe-arrow pipe-arrow-stage" }, "→"), reviewLane(task)] : null,
               task.stages.map((stage, index) => [h("span", { class: "pipe-arrow pipe-arrow-stage" }, index ? "⇒" : "→"), stageLane(task, stage)]),
             ),
           );
         }),
       ),
+    );
+  }
+
+  /** Code review tasks: the two reviewers work side by side, discuss, then the lead finalizes and the peer signs off. */
+  function reviewLane(task) {
+    const current = ACTIVE.includes(task.status);
+    const phase = !current
+      ? task.status === "completed"
+        ? task.review?.published
+          ? "published"
+          : "ready for you"
+        : task.status
+      : task.phase === "discussing"
+        ? "discussing"
+        : task.phase === "consolidating"
+          ? "agreeing on the final review"
+          : task.phase === "reviewing"
+            ? "reviewing independently"
+            : "starting";
+    return h(
+      "div",
+      { class: `pipe-lane ${current ? "current" : ""} lane-${task.status === "completed" ? "approved" : current ? "running" : "pending"}` },
+      h("div", { class: "pipe-lane-head" }, h("span", {}, "Code review"), h("span", { class: "muted small" }, phase)),
+      h("div", { class: "pipe-steps" }, pipeStep(task, "lead-reviewer"), h("span", { class: "pipe-arrow" }, "⇄"), pipeStep(task, "peer-reviewer")),
+      task.review && task.status === "completed"
+        ? h("div", { class: "pipe-loop" }, h("span", { class: "muted small" }, `keeping ${task.review.kept} of ${task.review.comments} comment(s)${task.review.agreed === false ? " · disputed" : ""}`))
+        : null,
     );
   }
 

@@ -166,6 +166,40 @@ export async function commitCountBetween(cwd: string, from: string, to: string):
   return Number((await git(cwd, ["rev-list", "--count", `${from}..${to}`])).stdout.trim()) || 0;
 }
 
+export interface FileStat {
+  path: string;
+  /** null for binary files. */
+  additions: number | null;
+  deletions: number | null;
+}
+
+/** Files changed between two commits with their line counts (renames report the new path). */
+export async function numstatBetween(cwd: string, from: string, to: string): Promise<FileStat[]> {
+  const tokens = (await git(cwd, ["diff", "--numstat", "-z", "-M", from, to])).stdout.split("\0");
+  const files: FileStat[] = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index]!;
+    if (!token) continue;
+    const match = /^(-|\d+)\t(-|\d+)\t(.*)$/s.exec(token);
+    if (!match) continue;
+    let file = match[3]!;
+    // A rename is "<added>\t<deleted>\t" followed by the old and the new path as separate tokens.
+    if (!file) {
+      index += 2;
+      file = tokens[index] ?? "";
+    }
+    const count = (value: string) => (value === "-" ? null : Number(value));
+    files.push({ path: file, additions: count(match[1]!), deletions: count(match[2]!) });
+  }
+  return files;
+}
+
+/** Paths added, modified or renamed between two commits. */
+export async function changedPathsBetween(cwd: string, from: string, to: string): Promise<string[]> {
+  const result = await git(cwd, ["diff", "--name-only", "-z", "--diff-filter=AMR", from, to]);
+  return result.stdout.split("\0").filter(Boolean);
+}
+
 /** Reads a file as of a commit (no checkout needed). */
 export async function readFileAt(cwd: string, sha: string, relativePath: string): Promise<string | null> {
   const rel = relativePath.replaceAll("\\", "/").replace(/^\.\//, "");
@@ -239,6 +273,8 @@ export interface TaskWorkspace {
   diffStat(from: string, to: string): Promise<string>;
   diff(from: string, to: string, maxBytes: number, paths?: string[]): Promise<DiffText>;
   commitCount(from: string, to: string): Promise<number>;
+  numstat(from: string, to: string): Promise<FileStat[]>;
+  changedPaths(from: string, to: string): Promise<string[]>;
   readAt(sha: string, relativePath: string): Promise<string | null>;
   removeWorktrees(): Promise<void>;
 }
@@ -274,6 +310,8 @@ export class GitTaskWorkspace implements TaskWorkspace {
     if (this.isolation === "worktree") return path.join(this.root, role);
     // The executor keeps its own checkout so installed dependencies and build output survive between runs.
     if (role === "executor") return path.join(this.root, "run");
+    // The two code review reviewers work at the same time, so each has its own checkout.
+    if (role === "peer-reviewer") return path.join(this.root, "review-peer");
     return path.join(this.root, isReviewerRole(role) || role === "planner" ? "review" : "author");
   }
 
@@ -281,9 +319,9 @@ export class GitTaskWorkspace implements TaskWorkspace {
     return worksDetached(role) ? null : `${this.taskBranch}--${role}`;
   }
 
-  /** Creates the task branch at the base commit when it does not exist yet. */
-  async ensureTaskBranch(): Promise<void> {
-    if (!(await branchExists(this.repoPath, this.taskBranch))) await git(this.repoPath, ["branch", this.taskBranch, this.baseSha]);
+  /** Creates the task branch when it does not exist yet: at the base commit, or at `at` (the head a code review reviews). */
+  async ensureTaskBranch(at = this.baseSha): Promise<void> {
+    if (!(await branchExists(this.repoPath, this.taskBranch))) await git(this.repoPath, ["branch", this.taskBranch, at]);
   }
 
   /** Removes a pre-v2 single worktree (on the task branch itself) so agents get their own branches. */
@@ -368,6 +406,14 @@ export class GitTaskWorkspace implements TaskWorkspace {
 
   commitCount(from: string, to: string): Promise<number> {
     return commitCountBetween(this.repoPath, from, to);
+  }
+
+  numstat(from: string, to: string): Promise<FileStat[]> {
+    return numstatBetween(this.repoPath, from, to);
+  }
+
+  changedPaths(from: string, to: string): Promise<string[]> {
+    return changedPathsBetween(this.repoPath, from, to);
   }
 
   readAt(sha: string, relativePath: string): Promise<string | null> {

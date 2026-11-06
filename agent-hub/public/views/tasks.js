@@ -27,6 +27,20 @@ let currentFilter = "all";
 
 /** Compact stage/round pipeline: one pill per stage, one dot per review round (or test run). */
 export function pipelineMini(task) {
+  if (task.kind === "review") {
+    const running = ["running", "needs-input"].includes(task.status);
+    const review = task.review;
+    const label = running
+      ? `Code review · ${task.phase === "reviewing" ? "reviewing independently" : task.phase === "discussing" ? "discussing" : task.phase === "consolidating" ? "agreeing on the final review" : "starting"}`
+      : review && task.status === "completed"
+        ? `Code review · ${review.published ? "published" : "ready for you"}`
+        : "Code review";
+    return h(
+      "div",
+      { class: "pipeline-mini" },
+      h("span", { class: `pm-stage pm-${task.status === "completed" ? "approved" : running ? "running" : "pending"}` }, h("span", { class: "pm-label" }, label), review?.target ? h("span", { class: "muted small" }, ` ${review.target}`) : null),
+    );
+  }
   if (!task.stages.length && task.kind === "auto") {
     const planning = ["running", "needs-input"].includes(task.status);
     return h("div", { class: "pipeline-mini" }, h("span", { class: "pm-stage pm-running" }, h("span", { class: "pm-label" }, planning ? "Manager is planning…" : "Not planned yet")));
@@ -224,6 +238,17 @@ function liveLine(task) {
 }
 
 function resultLine(task) {
+  if (task.status === "completed" && task.kind === "review") {
+    const review = task.review;
+    return h(
+      "div",
+      { class: `task-result ${review?.agreed === false ? "warn" : "ok"}` },
+      review?.published ? "✓ Review published" : "✓ Review ready",
+      review ? h("span", { class: "muted" }, ` · keeping ${review.kept} of ${review.comments} comment(s)`) : null,
+      review?.agreed === true ? h("span", { class: "muted" }, " · both reviewers agree") : review?.agreed === false ? h("span", { class: "muted" }, " · the reviewers disagree on some items") : null,
+      review?.pullRequest ? h("span", { class: "result-badge pr", title: review.pullRequest.url ?? "" }, `PR #${review.pullRequest.number}`) : null,
+    );
+  }
   if (task.status === "completed") {
     const tests = task.tests;
     const testsLast = (task.plan?.stages ?? task.stages.map((stage) => stage.kind)).at(-1) === "testing";

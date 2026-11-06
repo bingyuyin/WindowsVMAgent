@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,12 +7,17 @@ import { describe, test } from "node:test";
 import { evaluatePermission, parseGitCommand, splitCommandText } from "../src/agents/policy.ts";
 import { describeTool } from "../src/agents/copilotDriver.ts";
 import { recoveryPrompt, restartNote, systemPromptFor, unitTestFailurePrompt } from "../src/agents/prompts.ts";
+import { buildSubmitTools } from "../src/agents/tools.ts";
 import { loadHubSkills, ROLE_SKILLS, skillsForRole, techSkillsFor } from "../src/context.ts";
-import { docForPrompt, docForViewer, documentProblem, formatOfPath, loadDocTemplates, renderDocTemplate } from "../src/docs.ts";
+import { docForPrompt, docForViewer, documentProblem, formatOfPath, isDocumentPath, loadDocTemplates, renderDocTemplate } from "../src/docs.ts";
+import { numstatBetween } from "../src/git.ts";
 import { parseSettingsPatch } from "../src/http/api.ts";
-import { branchWebUrl, parseRemote, pullRequestPageUrl, sanitizeRemoteUrl } from "../src/remote.ts";
+import { branchWebUrl, parseRemote, pullRequestPageUrl, remoteLocation, sanitizeRemoteUrl } from "../src/remote.ts";
+import { curate, defaultReviewBody, normalizeFinal, normalizeFindings, normalizePositions, normalizeSignoff, toFinalReview } from "../src/review/discussion.ts";
+import { commentableLines, formatComment, mainReviewBody, planPublication, reviewMarkdown } from "../src/review/publish.ts";
+import { parseReviewTarget, pullRequestRef, remoteMatches } from "../src/review/target.ts";
 import { runShellCommand } from "../src/shell.ts";
-import { rolesFor, rolesForStages, stageKindsOf, worksDetached } from "../src/types.ts";
+import { rolesFor, rolesForStages, stageKindsOf, worksDetached, type CodeReview } from "../src/types.ts";
 import { describeTestRun, testRunEnv } from "../src/workflow/engine.ts";
 import { KeyedMutex } from "../src/util.ts";
 import { pullRequestBase } from "../src/workflow/runner.ts";
@@ -651,5 +657,282 @@ describe("remotes and pull requests", () => {
   test("automatic pushes can be turned off in the settings", () => {
     assert.deepEqual(parseSettingsPatch({ pushOnComplete: false }), { pushOnComplete: false });
     assert.throws(() => parseSettingsPatch({ pushOnComplete: "no" }), /pushOnComplete/);
+  });
+});
+
+describe("code review", () => {
+  const prUrl = (input: string) => {
+    const spec = parseReviewTarget(input);
+    return spec.kind === "pr" ? spec.url : undefined;
+  };
+
+  test("parses pull request numbers and URLs of each host, and branches", () => {
+    for (const input of ["12", "#12", " #12 ", "PR 12", "pr#12", "pull request 12"]) assert.deepEqual(parseReviewTarget(input), { kind: "pr", number: 12 }, input);
+    assert.deepEqual(parseReviewTarget("!7"), { kind: "pr", number: 7 });
+    assert.deepEqual(parseReviewTarget("https://github.com/Acme/Calc/pull/42/files"), {
+      kind: "pr",
+      number: 42,
+      url: { provider: "github", host: "github.com", slug: "acme/calc" },
+    });
+    assert.deepEqual(parseReviewTarget("https://gitlab.com/group/sub/repo/-/merge_requests/5"), {
+      kind: "pr",
+      number: 5,
+      url: { provider: "gitlab", host: "gitlab.com", slug: "group/sub/repo" },
+    });
+    assert.deepEqual(prUrl("https://dev.azure.com/Acme/Platform/_git/Tools/pullrequest/77"), {
+      provider: "azure-devops",
+      host: "dev.azure.com",
+      slug: "acme/platform/tools",
+    });
+    assert.equal(prUrl("https://acme.visualstudio.com/DefaultCollection/Platform/_git/Tools/pullrequest/8")?.slug, "acme/platform/tools");
+    assert.equal(prUrl("https://bitbucket.org/team/repo/pull-requests/9")?.provider, "bitbucket");
+    assert.equal(prUrl("https://git.example.com/a/b/pulls/3")?.provider, "other");
+    assert.deepEqual(parseReviewTarget("feature/login"), { kind: "ref", ref: "feature/login" });
+    assert.deepEqual(parseReviewTarget("refs/heads/dev"), { kind: "ref", ref: "dev" });
+    assert.throws(() => parseReviewTarget("  "), /Enter the pull request/);
+    assert.throws(() => parseReviewTarget("two words"), /neither a pull request nor a branch/);
+    assert.throws(() => parseReviewTarget("--upload-pack=x"), /neither a pull request nor a branch/);
+    assert.throws(() => parseReviewTarget("https://github.com/acme/calc/issues/3"), /not a pull request URL/);
+
+    assert.deepEqual(pullRequestRef("github", 12), { ref: "refs/pull/12/head", merge: false });
+    assert.deepEqual(pullRequestRef("gitlab", 5), { ref: "refs/merge-requests/5/head", merge: false });
+    assert.deepEqual(pullRequestRef("azure-devops", 77), { ref: "refs/pull/77/merge", merge: true });
+    assert.throws(() => pullRequestRef("bitbucket", 9), /review the pull request's source branch/);
+  });
+
+  test("matches pull request URLs to remotes, also on hosts the hub does not recognize", () => {
+    const url = (input: string) => prUrl(input)!;
+    // GitHub Enterprise or Gitea on a custom domain: parseRemote knows neither, the location still matches.
+    const corp = parseRemote("origin", "https://ci-bot@git.corp.example/Acme/Sample.git");
+    assert.deepEqual([corp.provider, corp.host, corp.slug], ["other", undefined, undefined]);
+    assert.deepEqual(remoteLocation(corp), { host: "git.corp.example", path: "acme/sample" });
+    assert.ok(remoteMatches(corp, url("https://git.corp.example/acme/sample/pull/7")));
+    assert.ok(!remoteMatches(corp, url("https://git.corp.example/acme/other/pull/7")));
+    // An SSH host alias only matches by repository path (used when exactly one remote has that path).
+    const alias = parseRemote("origin", "git@github-work:acme/sample.git");
+    assert.deepEqual(remoteLocation(alias), { host: "github-work", path: "acme/sample" });
+    assert.ok(!remoteMatches(alias, url("https://github.com/acme/sample/pull/7")));
+    assert.ok(remoteMatches(alias, url("https://github.com/acme/sample/pull/7"), true));
+    assert.ok(remoteMatches(parseRemote("origin", "git@github.com:Acme/Sample.git"), url("https://github.com/acme/sample/pull/7")));
+    assert.ok(remoteMatches(parseRemote("upstream", "https://dev.azure.com/Acme/Platform/_git/Tools"), url("https://dev.azure.com/acme/platform/_git/tools/pullrequest/3")));
+    assert.ok(!remoteMatches(parseRemote("origin", "https://github.com/acme/tools.git"), url("https://dev.azure.com/acme/platform/_git/tools/pullrequest/3"), true));
+    assert.equal(remoteLocation(parseRemote("origin", "C:\\repos\\calc.git")), null);
+    assert.equal(remoteLocation(parseRemote("origin", "/srv/git/calc.git")), null);
+  });
+
+  test("finds the lines of a diff that pull request comments can be attached to", () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "index 1111111..2222222 100644",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,3 +1,5 @@",
+      " line1",
+      "-old2",
+      "+new2",
+      "+new3",
+      " line4",
+      "+++ an added line that looks like a header",
+      "@@ -10,2 +12,2 @@ function x()",
+      " ctx12",
+      "-gone",
+      "+added13",
+      "\\ No newline at end of file",
+      "diff --git a/old.txt b/old.txt",
+      "deleted file mode 100644",
+      "--- a/old.txt",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-bye",
+      "diff --git a/new.md b/new.md",
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ b/new.md",
+      "@@ -0,0 +1,2 @@",
+      "+# Title",
+      "+text",
+      'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"',
+      '--- "a/caf\\303\\251.txt"',
+      '+++ "b/caf\\303\\251.txt"',
+      "@@ -1 +1 @@",
+      "-a",
+      "+b",
+      "",
+    ].join("\n");
+    const lines = commentableLines(diff);
+    assert.deepEqual([...lines.get("src/a.ts")!], [1, 2, 3, 4, 5, 12, 13]);
+    assert.deepEqual([...lines.get("new.md")!], [1, 2]);
+    assert.deepEqual([...lines.get("café.txt")!], [1]);
+    assert.equal(lines.has("old.txt"), false);
+    assert.equal(lines.has("/dev/null"), false);
+  });
+
+  test("validates each reviewer step and tells the agent exactly what to fix", () => {
+    const findings = normalizeFindings({
+      change_summary: "Adds greet()",
+      assessment: "Fine",
+      verdict: "changes requested",
+      comments: [{ severity: "high", file: ".\\src\\a.ts", line: 3, body: "Bug" }, { severity: "low", file: "b/src/b.ts", body: "Nit" }],
+    });
+    assert.equal(findings.verdict, "request_changes");
+    assert.deepEqual(findings.comments.map((comment) => [comment.severity, comment.file, comment.line]), [
+      ["major", "src/a.ts", 3],
+      ["nit", "src/b.ts", undefined],
+    ]);
+    assert.throws(() => normalizeFindings({ assessment: "x", verdict: "approve", comments: [] }), /change_summary/);
+    assert.throws(() => normalizeFindings({ change_summary: "x", assessment: "x", verdict: "request_changes", comments: [] }), /needs at least one comment/);
+    assert.throws(() => normalizeFindings({ change_summary: "x", assessment: "x", verdict: "approve", comments: [{ severity: "major", body: "b" }] }), /approved but listed blocker\/major/);
+
+    const peerIds = ["P1", "P2"];
+    const ownIds = ["L1"];
+    const positions = normalizePositions(
+      {
+        summary: "Mostly agree",
+        responses: [{ comment_id: "[p1]", position: "accepted", note: "Yes" }, { comment_id: "P2", position: "partially agree", note: "Lower", suggested_severity: "nit" }],
+        own_updates: [{ comment_id: "L1", action: "revise", note: "Wrong line", line: 9 }],
+        new_comments: [{ severity: "minor", body: "Missed this" }],
+      },
+      peerIds,
+      ownIds,
+    );
+    assert.deepEqual(positions.responses.map((response) => [response.commentId, response.position, response.suggestedSeverity ?? null]), [
+      ["P1", "agree", null],
+      ["P2", "refine", "nit"],
+    ]);
+    assert.deepEqual(positions.updates, [{ commentId: "L1", action: "revise", note: "Wrong line", body: undefined, severity: undefined, line: 9 }]);
+    assert.equal(positions.newComments.length, 1);
+    assert.throws(() => normalizePositions({ summary: "s", responses: [{ comment_id: "P1", position: "agree", note: "n" }] }, peerIds, ownIds), /Missing responses for: P2/);
+    assert.throws(() => normalizePositions({ summary: "s", responses: [{ comment_id: "L1", position: "agree", note: "n" }] }, peerIds, ownIds), /your own comment/);
+    assert.throws(
+      () => normalizePositions({ summary: "s", responses: [], own_updates: [{ comment_id: "P1", action: "withdraw", note: "n" }] }, [], ownIds),
+      /not one of your comments/,
+    );
+    assert.throws(() => normalizePositions({ summary: "s", responses: [], own_updates: [{ comment_id: "L1", action: "revise", note: "n" }] }, [], ownIds), /needs the new/);
+    assert.throws(() => normalizePositions({ summary: "s", responses: [{ comment_id: "P1", position: "maybe", note: "n" }] }, ["P1"], []), /agree", "disagree" or "refine/);
+
+    const known = ["L1", "L2", "P1", "P2"];
+    const accountable = ["L1", "P1", "P2"];
+    const final = normalizeFinal(
+      {
+        change_summary: "Adds greet()",
+        assessment: "One bug",
+        verdict: "request_changes",
+        comments: [{ sources: ["l1", "P1", "P1"], severity: "major", file: "a.ts", line: 2, body: "Bug" }, { sources: [], severity: "nit", body: "New" }],
+        dropped: [{ comment_id: "P2", reason: "Duplicate" }],
+      },
+      accountable,
+      known,
+    );
+    assert.deepEqual(final.comments.map((comment) => comment.sources), [["L1", "P1"], []]);
+    assert.throws(
+      () => normalizeFinal({ change_summary: "c", assessment: "a", verdict: "approve", comments: [{ sources: ["L1", "P1"], severity: "minor", body: "b" }] }, accountable, known),
+      /Account for every reviewer comment: P2 is in no final comment's `sources`/,
+    );
+    assert.throws(
+      () => normalizeFinal({ change_summary: "c", assessment: "a", verdict: "approve", comments: [], dropped: [{ comment_id: "X9", reason: "r" }] }, [], known),
+      /Unknown comment IDs: X9/,
+    );
+
+    assert.deepEqual(normalizeSignoff({ agree: "yes", summary: "Good", objections: [{ issue: "ignored when agreeing" }] }, ["R1"]), { agreed: true, summary: "Good", objections: [] });
+    assert.deepEqual(normalizeSignoff({ agree: false, summary: "No", objections: [{ comment_id: "r1", issue: "Too weak" }, { issue: "Overall tone" }] }, ["R1"]).objections, [
+      { commentId: "R1", issue: "Too weak" },
+      { issue: "Overall tone" },
+    ]);
+    assert.throws(() => normalizeSignoff({ agree: false, summary: "No" }, ["R1"]), /no objections are listed/);
+    assert.throws(() => normalizeSignoff({ summary: "No" }, ["R1"]), /`agree` is required/);
+    assert.throws(() => normalizeSignoff({ agree: false, summary: "No", objections: [{ comment_id: "Q1", issue: "x" }] }, ["R1"]), /unknown comment ID 'Q1'/);
+  });
+
+  test("the user's working copy carries the peer's objections; the review is published and exported as the user left it", () => {
+    const final = toFinalReview({
+      changeSummary: "Adds greet()",
+      assessment: "One bug, one doc gap.",
+      verdict: "request_changes",
+      comments: [
+        { sources: ["L1", "P1"], severity: "major", file: "greet.js", line: 2, body: "Handle a missing name." },
+        { sources: ["L2"], severity: "minor", file: "README.md", line: 1, body: "Document greet()." },
+      ],
+      dropped: [],
+      objectionResponses: [],
+    });
+    assert.deepEqual(final.comments.map((comment) => comment.id), ["R1", "R2"]);
+    const curated = curate(final, { agreed: false, summary: "No", objections: [{ commentId: "R2", issue: "This is a nit." }, { issue: "General" }] });
+    assert.deepEqual(curated.map((comment) => [comment.id, comment.decision, comment.objection ?? null]), [
+      ["R1", "keep", null],
+      ["R2", "keep", "This is a nit."],
+    ]);
+    assert.equal(curate(final, { agreed: true, summary: "Ok", objections: [] })[1]!.objection, undefined);
+    assert.equal(defaultReviewBody(final), "One bug, one doc gap.");
+
+    const review = {
+      target: { kind: "ref", input: "f", headRef: "f", headSha: "h", baseRef: "main", baseTipSha: "b" },
+      rounds: [],
+      comments: [],
+      final,
+      curated,
+      body: "Please fix.",
+    } as CodeReview;
+    curated[1]!.decision = "drop";
+    assert.equal(formatComment(curated[0]!), "**Major:** Handle a missing name.");
+    const anchors = new Map([["greet.js", new Set([1, 2, 3])]]);
+    const plan = planPublication(review, anchors);
+    assert.deepEqual([plan.create.map((comment) => comment.id), plan.bodyComments.length, plan.mainChanged], [["R1"], 0, true]);
+    assert.equal(plan.mainBody, "Please fix.");
+    curated[1]!.decision = "keep";
+    assert.match(mainReviewBody(review, [curated[1]!]), /#### Comments outside the changed lines\n\n\*\*Minor\*\* · `README\.md:1`\n\nDocument greet\(\)\./);
+    const markdown = reviewMarkdown("Review #5", review);
+    assert.match(markdown, /^## Review #5\n\nPlease fix\.\n\n### Comments \(2\)\n\n\*\*Major\*\* · `greet\.js:2`/);
+  });
+
+  test("the reviewers get one submit tool per step, their own prompts and the code review skills", () => {
+    const channel = { kind: "code-review" as const, tools: ["submit_findings", "submit_positions", "submit_signoff"] as const, onSubmit: () => {} };
+    assert.deepEqual(
+      buildSubmitTools(channel).map((tool) => tool.name),
+      ["submit_findings", "submit_positions", "submit_signoff"],
+    );
+    const env = { worktree: cwd, branch: null, taskBranch: "agent-hub/t-001", baseSha: "abcdef1234567890" };
+    const lead = systemPromptFor("lead-reviewer", env, ["code-review"]);
+    assert.match(lead, /LEAD CODE REVIEWER/);
+    assert.match(lead, /git diff abcdef1234\.\.HEAD/);
+    assert.match(lead, /submit_findings, submit_positions or submit_final_review/);
+    assert.match(lead, /strictly read-only/);
+    assert.match(systemPromptFor("peer-reviewer", env), /PEER CODE REVIEWER[\s\S]*submit_signoff/);
+    assert.match(recoveryPrompt("peer-reviewer", "silent", "submit_positions"), /finish by calling `submit_positions`/);
+    assert.equal(describeTool("submit_findings", { comments: [{}, {}] }, cwd), "Submitting review findings (2 comments)");
+    assert.equal(describeTool("submit_signoff", { agree: false }, cwd), "Signing off on the final review (objects)");
+    assert.deepEqual(rolesFor("review"), ["lead-reviewer", "peer-reviewer"]);
+    assert.deepEqual(stageKindsOf({ kind: "review" }), []);
+    assert.ok(worksDetached("peer-reviewer"));
+    assert.deepEqual(skillsForRole("peer-reviewer", { stack: ["Node.js"] }), ["code-review", "typescript-best-practices"]);
+    assert.deepEqual(ROLE_SKILLS["lead-reviewer"], ["code-review"]);
+    assert.deepEqual(parseSettingsPatch({ peerReviewerModel: " gpt-x " }), { peerReviewerModel: "gpt-x" });
+    assert.ok(isDocumentPath("docs/Guide.MD") && isDocumentPath("a/b.htm") && !isDocumentPath("src/a.ts"));
+  });
+
+  test("lists changed files with line counts, renames by their new path and binary files without counts", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-hub-numstat-"));
+    const run = (...args: string[]) => execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "core.autocrlf=false", ...args], { cwd: dir, encoding: "utf8" }).trim();
+    try {
+      run("init", "-q", "-b", "main");
+      fs.writeFileSync(path.join(dir, "old name.txt"), Array.from({ length: 20 }, (_, index) => `line ${index}`).join("\n") + "\n");
+      run("add", "-A");
+      run("commit", "-q", "-m", "one");
+      const base = run("rev-parse", "HEAD");
+      run("mv", "old name.txt", "new name.txt");
+      fs.appendFileSync(path.join(dir, "new name.txt"), "line 20\n");
+      fs.writeFileSync(path.join(dir, "blob.bin"), Buffer.from([0, 1, 2, 0, 255]));
+      run("add", "-A");
+      run("commit", "-q", "-m", "two");
+      const files = await numstatBetween(dir, base, "HEAD");
+      assert.deepEqual(
+        files.sort((a, b) => a.path.localeCompare(b.path)),
+        [
+          { path: "blob.bin", additions: null, deletions: null },
+          { path: "new name.txt", additions: 1, deletions: 0 },
+        ],
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
   });
 });

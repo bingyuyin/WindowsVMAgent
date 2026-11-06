@@ -39,6 +39,11 @@ export function formatOfPath(filePath: string): DocFormat {
   return /\.html?$/i.test(filePath) ? "html" : "markdown";
 }
 
+/** Files the hub treats as documents (rendered in the UI): Markdown and HTML. */
+export function isDocumentPath(filePath: string): boolean {
+  return /\.(md|markdown|html?)$/i.test(filePath);
+}
+
 /** Fills the template for a stage; null when there is no template for it. */
 export function renderDocTemplate(templates: DocTemplates, stage: StageKind, vars: TemplateVars): string | null {
   const body = templates.bodies[stage];
@@ -62,15 +67,20 @@ export function documentProblem(content: string | null | undefined, format: DocF
   if (!content?.trim()) return "is missing or empty";
   if (format !== "html") return null;
   if (seeded && normalizeWhitespace(content) === normalizeWhitespace(seeded)) return "is still the unmodified template";
-  const placeholders = content.match(PLACEHOLDER)?.length ?? 0;
-  if (placeholders) {
-    return (
-      `still has ${placeholders} template placeholder element${placeholders === 1 ? "" : "s"} (elements with a data-placeholder attribute). ` +
-      "Replace each one with real content and remove the attribute, or delete sections that do not apply"
-    );
-  }
+  const placeholders = placeholderProblem(content);
+  if (placeholders) return placeholders;
   if (!/<h1[\s>]/i.test(content)) return "has no <h1> title";
   return null;
+}
+
+/** Template placeholders an HTML page still has (a further document started from the template), or null. */
+export function placeholderProblem(content: string): string | null {
+  const placeholders = content.match(PLACEHOLDER)?.length ?? 0;
+  if (!placeholders) return null;
+  return (
+    `still has ${placeholders} template placeholder element${placeholders === 1 ? "" : "s"} (elements with a data-placeholder attribute). ` +
+    "Replace each one with real content and remove the attribute, or delete sections that do not apply"
+  );
 }
 
 /** Shrinks an HTML document for inclusion in a prompt (drops styles, scripts and comments). */

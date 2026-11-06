@@ -116,16 +116,20 @@ export function createApiRouter(deps: ApiDeps): Router {
 
   router.post("/api/tasks", async ({ body }) => {
     const maxRounds = body.maxRounds === undefined || body.maxRounds === "" ? undefined : Number(body.maxRounds);
+    const kind = requireString(body, "kind", 40) as TaskKind;
     return runner.submit({
       title: optionalString(body, "title", 200),
-      description: requireString(body, "description", 50_000),
-      kind: requireString(body, "kind", 40) as TaskKind,
+      // A code review's focus is optional.
+      description: kind === "review" ? (optionalString(body, "description", 50_000) ?? "") : requireString(body, "description", 50_000),
+      kind,
       repoId: requireString(body, "repoId", 200),
       baseRef: optionalString(body, "baseRef", 300),
       authorModel: optionalString(body, "authorModel", 200),
       reviewerModel: optionalString(body, "reviewerModel", 200),
       resolverModel: optionalString(body, "resolverModel", 200),
       managerModel: optionalString(body, "managerModel", 200),
+      peerReviewerModel: optionalString(body, "peerReviewerModel", 200),
+      reviewTarget: optionalString(body, "reviewTarget", 1000),
       maxRounds,
     });
   });
@@ -168,19 +172,30 @@ export function createApiRouter(deps: ApiDeps): Router {
   router.get("/api/tasks/:id/pull-request", ({ params }) => runner.pullRequestStatus(params.id!));
   router.post("/api/tasks/:id/pull-request", ({ params }) => runner.pullRequest(params.id!));
 
+  // ---- Code review: curate the final review, then publish it -------------------------------
+  router.patch("/api/tasks/:id/review/comments/:commentId", ({ params, body }) =>
+    runner.updateReviewComment(params.id!, params.commentId!, { decision: body.decision, body: body.body, severity: body.severity, revert: body.revert }),
+  );
+  router.post("/api/tasks/:id/review/comments", ({ params, body }) => runner.addReviewComment(params.id!, requireString(body, "from", 20)));
+  router.put("/api/tasks/:id/review/summary", ({ params, body }) => runner.updateReviewSummary(params.id!, { body: body.body, event: body.event }));
+  router.get("/api/tasks/:id/review/publish", ({ params }) => runner.reviewPublishStatus(params.id!));
+  router.post("/api/tasks/:id/review/publish", ({ params }) => runner.publishReviewComments(params.id!));
+  router.get("/api/tasks/:id/review/markdown", ({ params }) => runner.reviewAsMarkdown(params.id!));
+
   const documentRound = (url: URL) => {
     const round = Number(url.searchParams.get("round"));
     return Number.isInteger(round) && round > 0 ? round : undefined;
   };
-  router.get("/api/tasks/:id/doc", ({ params, url }) => runner.document(params.id!, documentRound(url)));
-  router.get("/api/tasks/:id/design", ({ params, url }) => runner.document(params.id!, documentRound(url)));
+  const documentPath = (url: URL) => url.searchParams.get("path")?.trim() || undefined;
+  router.get("/api/tasks/:id/doc", ({ params, url }) => runner.document(params.id!, documentRound(url), documentPath(url)));
+  router.get("/api/tasks/:id/design", ({ params, url }) => runner.document(params.id!, documentRound(url), documentPath(url)));
 
   // Serves the document as a standalone page for the UI's sandboxed iframe (or a new tab). The page runs
   // in an opaque origin (CSP sandbox) and may only load the hub's local Mermaid scripts.
   router.get(
     "/api/tasks/:id/doc/view",
     async ({ req, res, params, url }) => {
-      const doc = await runner.document(params.id!, documentRound(url));
+      const doc = await runner.document(params.id!, documentRound(url), documentPath(url));
       if (doc.content === null) throw new HttpError(404, "No document has been written yet");
       const origin = `http://${req.headers.host ?? ""}`;
       const html =
@@ -263,7 +278,7 @@ function intIn(value: unknown, min: number, max: number, key: string): number {
 
 export function parseSettingsPatch(body: Record<string, unknown>): Partial<Settings> {
   const patch: Partial<Settings> = {};
-  for (const key of ["authorModel", "reviewerModel", "resolverModel", "managerModel"] as const) {
+  for (const key of ["authorModel", "reviewerModel", "resolverModel", "managerModel", "peerReviewerModel"] as const) {
     if (!(key in body)) continue;
     const value = body[key];
     if (value !== null && typeof value !== "string") throw new HttpError(400, `'${key}' must be a string`);

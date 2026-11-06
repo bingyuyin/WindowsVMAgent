@@ -97,6 +97,8 @@ export const ROLE_LABELS = {
   "code-reviewer": "Code reviewer",
   executor: "Test executor",
   fixer: "Test fixer",
+  "lead-reviewer": "Lead reviewer",
+  "peer-reviewer": "Peer reviewer",
 };
 
 export const ROLE_ICONS = {
@@ -110,6 +112,8 @@ export const ROLE_ICONS = {
   "code-reviewer": "◎",
   executor: "▶",
   fixer: "✚",
+  "lead-reviewer": "◉",
+  "peer-reviewer": "◎",
 };
 
 export const ROLE_DESCRIPTIONS = {
@@ -123,6 +127,8 @@ export const ROLE_DESCRIPTIONS = {
   "code-reviewer": "Reviews each commit in a read-only worktree pinned to it",
   executor: "Runs the test automation, verifies the results and checks fixes, in a checkout pinned to the commit under test",
   fixer: "Fixes test failures at the root cause on its own branch",
+  "lead-reviewer": "Reviews the change, discusses the peer reviewer's findings and writes the final review",
+  "peer-reviewer": "Reviews the change on its own model, discusses the findings and signs off on the final review",
 };
 
 /** Hub best-practice skills each role is asked to apply (mirrors the server's ROLE_SKILLS). */
@@ -137,9 +143,12 @@ export const ROLE_SKILLS = {
   "code-reviewer": ["code-review"],
   executor: ["test-execution"],
   fixer: ["test-fixing", "coding-best-practices"],
+  "lead-reviewer": ["code-review"],
+  "peer-reviewer": ["code-review"],
 };
 
-export const isReviewerRole = (role) => role === "design-reviewer" || role === "code-reviewer" || role === "doc-reviewer";
+export const isCodeReviewRole = (role) => role === "lead-reviewer" || role === "peer-reviewer";
+export const isReviewerRole = (role) => role === "design-reviewer" || role === "code-reviewer" || role === "doc-reviewer" || isCodeReviewRole(role);
 
 /** Agents that work in a checkout pinned to a commit instead of on a branch of their own. */
 export const worksDetached = (role) => isReviewerRole(role) || role === "executor" || role === "planner";
@@ -167,6 +176,7 @@ export function rolesForStages(stages) {
 
 /** Sub-agents a task kind uses, in workflow order. */
 export function rolesFor(kind) {
+  if (kind === "review") return ["lead-reviewer", "peer-reviewer"];
   return kind === "auto" ? ["planner"] : rolesForStages(KIND_STAGES[kind] ?? ["coding"]);
 }
 
@@ -177,7 +187,7 @@ export function rolesForTask(task) {
   return ["planner", ...rolesForStages(stages)];
 }
 
-/** Stage a role works in. */
+/** Stage a role works in (null for the planner and the code review reviewers, which work outside stages). */
 export const stageOfRole = (role) =>
   role === "designer" || role === "design-reviewer"
     ? "design"
@@ -185,7 +195,7 @@ export const stageOfRole = (role) =>
       ? "document"
       : role === "executor" || role === "fixer"
         ? "testing"
-        : role === "planner"
+        : role === "planner" || isCodeReviewRole(role)
           ? null
           : "coding";
 
@@ -214,6 +224,7 @@ export const KIND_LABELS = {
   document: "Document",
   testing: "Execute & verify",
   "design-coding": "Design → Coding",
+  review: "Code review",
 };
 export const STAGE_LABELS = { design: "Design", document: "Document", coding: "Coding", testing: "Execute & verify" };
 export const isDocStage = (stage) => stage === "design" || stage === "document";
@@ -221,6 +232,8 @@ export const isDocStage = (stage) => stage === "design" || stage === "document";
 export function phaseLabel(stage, phase) {
   if (phase === "planning") return "Planning";
   if (phase === "verifying") return "Verifying unit tests";
+  if (phase === "discussing") return "Discussing the findings";
+  if (phase === "consolidating") return "Agreeing on the final review";
   if (stage === "testing" && phase === "reviewing") return "Running tests";
   if (stage === "testing" && (phase === "authoring" || phase === "revising")) return "Fixing test failures";
   const noun = stage === "design" ? "design" : stage === "document" ? "document" : "code";
@@ -247,10 +260,18 @@ export function statusInfo(task) {
     case "queued":
       return { label: "Queued", cls: "neutral" };
     case "running":
-      return { label: phaseLabel(task.currentStage, task.phase), cls: "running" };
+      return { label: task.kind === "review" && task.phase === "reviewing" ? "Reviewing the change" : phaseLabel(task.currentStage, task.phase), cls: "running" };
     case "needs-input":
       return { label: "Needs your input", cls: "attention" };
     case "completed": {
+      if (task.kind === "review") {
+        // Works for task summaries (review.published/agreed) and full tasks (review.publications/signoff).
+        const review = task.review;
+        const published = review?.published ?? Boolean(review?.publications?.some((publication) => publication.main));
+        const agreed = review?.agreed ?? (review?.signoff ? review.signoff.agreed : null);
+        if (published) return { label: "Review published", cls: "success" };
+        return { label: agreed === false ? "Review ready · disputed" : "Review ready", cls: agreed === false ? "warning" : "success" };
+      }
       const approved = task.approved ?? task.result?.approved;
       const testsLast = (task.plan?.stages ?? task.stages?.map((stage) => stage.kind) ?? []).at(-1) === "testing";
       if (testsLast) return approved ? { label: "Tests pass", cls: "success" } : { label: "Done · tests failing", cls: "warning" };

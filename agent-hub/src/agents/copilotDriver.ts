@@ -5,7 +5,7 @@ import { ROLE_LABELS } from "../types.ts";
 import { errorMessage, firstLine, randomId, truncate } from "../util.ts";
 import { TurnTimeoutError, type AgentDriver, type AgentHandle, type AgentObserver, type AgentSpec } from "./driver.ts";
 import { createPermissionPolicy } from "./policy.ts";
-import { buildSubmitTool } from "./tools.ts";
+import { buildSubmitTools } from "./tools.ts";
 
 /** Runs agents as GitHub Copilot SDK sessions on the hub's shared CopilotClient. */
 export class CopilotAgentDriver implements AgentDriver {
@@ -34,7 +34,7 @@ export class CopilotAgentDriver implements AgentDriver {
       workingDirectory: spec.workingDirectory,
       trustWorkingDirectory: "session",
       systemMessage: { mode: "append", content: spec.systemPrompt },
-      tools: [buildSubmitTool(spec.submit)],
+      tools: buildSubmitTools(spec.submit),
       skillDirectories: spec.skillDirectories,
       disabledSkills: spec.disabledSkills,
       onPermissionRequest: (request) => policy(request),
@@ -145,6 +145,19 @@ export function describeTool(name: string, args: unknown, cwd: string): string {
   if (name === "submit_plan") {
     const stages = isRecord(args) && Array.isArray(args.stages) ? args.stages.filter((stage) => typeof stage === "string").join(" → ") : "";
     return `Submitting plan${stages ? ` (${stages})` : ""}`;
+  }
+  if (name === "submit_findings") {
+    const count = isRecord(args) && Array.isArray(args.comments) ? args.comments.length : null;
+    return `Submitting review findings${count !== null ? ` (${count} comment${count === 1 ? "" : "s"})` : ""}`;
+  }
+  if (name === "submit_positions") return "Submitting positions on the other reviewer's comments";
+  if (name === "submit_final_review") {
+    const count = isRecord(args) && Array.isArray(args.comments) ? args.comments.length : null;
+    return `Submitting the final review${count !== null ? ` (${count} comment${count === 1 ? "" : "s"})` : ""}`;
+  }
+  if (name === "submit_signoff") {
+    const agree = isRecord(args) && typeof args.agree === "boolean" ? (args.agree ? " (agrees)" : " (objects)") : "";
+    return `Signing off on the final review${agree}`;
   }
   if (name === "skill") {
     const skill = isRecord(args) ? Object.values(args).find((value): value is string => typeof value === "string" && value.trim().length > 0) : undefined;

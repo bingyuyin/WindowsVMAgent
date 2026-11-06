@@ -1,5 +1,9 @@
-/** "auto": the manager agent reads the request and plans which stages (and sub-agents) to run. */
-export type TaskKind = "auto" | "coding" | "design" | "document" | "testing" | "design-coding";
+/**
+ * "auto": the manager agent reads the request and plans which stages (and sub-agents) to run.
+ * "review": two reviewers review someone else's change (a pull request or a branch), discuss their findings
+ * and agree on a final review that the user curates and publishes; no code is changed.
+ */
+export type TaskKind = "auto" | "coding" | "design" | "document" | "testing" | "design-coding" | "review";
 export type TaskStatus = "queued" | "running" | "needs-input" | "completed" | "failed" | "cancelled" | "interrupted";
 /** "testing": a test executor runs the test automation and verifies the results; a test fixer fixes failures. */
 export type StageKind = "design" | "document" | "coding" | "testing";
@@ -13,8 +17,21 @@ export type AgentRole =
   | "resolver"
   | "code-reviewer"
   | "executor"
-  | "fixer";
-export type Phase = "queued" | "preparing" | "planning" | "authoring" | "verifying" | "reviewing" | "revising" | "finalizing" | "done";
+  | "fixer"
+  | "lead-reviewer"
+  | "peer-reviewer";
+export type Phase =
+  | "queued"
+  | "preparing"
+  | "planning"
+  | "authoring"
+  | "verifying"
+  | "reviewing"
+  | "revising"
+  | "discussing"
+  | "consolidating"
+  | "finalizing"
+  | "done";
 export type Severity = "blocker" | "major" | "minor" | "nit";
 export type Verdict = "approve" | "request_changes";
 export type CommentStatus = "open" | "addressed" | "declined";
@@ -33,7 +50,7 @@ export type DocFormat = "html" | "markdown";
  */
 export type IsolationMode = "branch" | "worktree";
 
-export const TASK_KINDS: readonly TaskKind[] = ["auto", "coding", "design", "document", "testing", "design-coding"];
+export const TASK_KINDS: readonly TaskKind[] = ["auto", "coding", "design", "document", "testing", "design-coding", "review"];
 /** Most tasks the hub runs at the same time; further tasks wait in the queue until a slot frees up. */
 export const MAX_PARALLEL_TASKS = 10;
 /** Order in which planned stages run: design first, documentation last (it documents the final state). */
@@ -50,6 +67,8 @@ export interface Settings {
   resolverModel: string | null;
   /** Model the manager uses to plan Auto tasks; null means "same as the author model". */
   managerModel: string | null;
+  /** Code review tasks: model of the peer reviewer, who reviews alongside the lead reviewer (reviewer model); null means "same as the author model". */
+  peerReviewerModel: string | null;
   maxRounds: number;
   maxConcurrency: number;
   designDocDir: string;
@@ -112,6 +131,8 @@ export interface AuthorSubmission {
   shortStat?: string;
   /** Artifact file name holding the design document snapshot for this round. */
   docSnapshot?: string;
+  /** Document stages: every document the round wrote or changed (the deliverable and any further documents), with its snapshot. */
+  documents?: DocumentSnapshot[];
   /** Coding rounds: the author's unit tests, re-run by the manager before the review. */
   unitTests?: UnitTestCheck;
   at: string;
@@ -186,6 +207,8 @@ export interface Stage {
   rounds: Round[];
   docPath?: string;
   docFormat?: DocFormat;
+  /** Document stages: further documents the author wrote next to the deliverable (repository-relative paths). */
+  extraDocs?: string[];
   nextCommentNumber: number;
   /** Testing stage: run the automation again before fixing (an earlier stage changed for a change request). */
   rerun?: boolean;
@@ -193,7 +216,206 @@ export interface Stage {
   finishedAt?: string;
 }
 
-/** Further changes the user asked for after the task finished (approved or not). */
+/** A document a document-stage round wrote or changed, and the artifact holding its content as of that round. */
+export interface DocumentSnapshot {
+  path: string;
+  snapshot: string;
+}
+
+// ---- Code review tasks ---------------------------------------------------------------------------
+
+export type RemoteProvider = "github" | "azure-devops" | "gitlab" | "bitbucket" | "other";
+
+/** The pull request a code review task reviews (or the open pull request of the reviewed branch). */
+export interface ReviewPullRequest {
+  provider: RemoteProvider;
+  number: number;
+  url?: string;
+  title?: string;
+  body?: string;
+  author?: string;
+  headBranch?: string;
+  baseBranch?: string;
+  draft?: boolean;
+  state?: string;
+  /** GitHub host and owner/repo, used to publish the review. */
+  host?: string;
+  slug?: string;
+  /** Head commit of the pull request when it was looked up. */
+  headSha?: string;
+}
+
+/** What a code review task reviews: merge-base(base, head)..head, the same change a pull request shows. */
+export interface ReviewTarget {
+  /** "pr": a pull/merge request fetched from the remote; "ref": a branch, tag or commit of the repository. */
+  kind: "pr" | "ref";
+  /** What the user entered: a pull request number or URL, or a branch, tag or commit. */
+  input: string;
+  /** Where the head came from, e.g. "refs/pull/12/head" or "feature/login". */
+  headRef: string;
+  headSha: string;
+  /** Branch the change targets. */
+  baseRef: string;
+  /** Tip of the base branch when the review started (the review covers task.baseSha = merge-base..headSha). */
+  baseTipSha: string;
+  /** Remote the pull request was fetched from. */
+  remote?: string;
+  pullRequest?: ReviewPullRequest;
+}
+
+export type ReviewPhase = "findings" | "positions" | "final" | "signoff";
+export type Position = "agree" | "disagree" | "refine";
+
+/** A finding one of the two reviewers raised: L1, L2... (lead reviewer) or P1, P2... (peer reviewer). */
+export interface ReviewerComment {
+  id: string;
+  severity: Severity;
+  file?: string;
+  line?: number;
+  body: string;
+  /** Discussion round it was raised in. */
+  round: number;
+  /** Its reviewer withdrew it during the discussion. */
+  withdrawn?: { note: string; round: number };
+  /** Its reviewer revised it during the discussion; `previous` is the text before. */
+  revised?: { note: string; round: number; previous: { body: string; severity: Severity; line?: number } };
+}
+
+/** One reviewer's stance on a comment of the other reviewer. */
+export interface PositionEntry {
+  commentId: string;
+  position: Position;
+  note: string;
+  suggestedBody?: string;
+  suggestedSeverity?: Severity;
+}
+
+/** A comment of the final review: one or more reviewer comments merged into the text the change's author sees. */
+export interface FinalComment {
+  /** R1, R2... */
+  id: string;
+  severity: Severity;
+  file?: string;
+  line?: number;
+  body: string;
+  /** Reviewer comment IDs it came from (e.g. L2 and P1 when both found it). */
+  sources: string[];
+}
+
+/** The review the lead reviewer consolidates from both reviewers' findings and their discussion. */
+export interface FinalReview {
+  changeSummary: string;
+  assessment: string;
+  verdict: Verdict;
+  comments: FinalComment[];
+  /** Reviewer comments left out of the final review, and why. */
+  dropped: Array<{ commentId: string; reason: string }>;
+  /** After the peer reviewer objected: the lead's answer to each objection. */
+  objectionResponses?: Array<{ objection: string; response: string }>;
+  fallback?: boolean;
+}
+
+export interface SignOff {
+  agreed: boolean;
+  summary: string;
+  /** What the peer reviewer objects to: a final comment (R2), a dropped reviewer comment (P3), or the review as a whole. */
+  objections: Array<{ commentId?: string; issue: string }>;
+  fallback?: boolean;
+}
+
+/** One reviewer's turn in a discussion round. */
+export interface ReviewerEntry {
+  role: AgentRole;
+  summary: string;
+  at: string;
+  /** The reviewer never called its submit tool; the hub derived the entry. */
+  fallback?: boolean;
+  /** findings: what the change does, and the reviewer's verdict. */
+  changeSummary?: string;
+  verdict?: Verdict;
+  /** findings and positions: IDs of the comments the reviewer raised in this turn. */
+  comments?: string[];
+  /** positions: stances on the other reviewer's comments, and changes to its own. */
+  positions?: PositionEntry[];
+  updates?: Array<{ commentId: string; action: "withdraw" | "revise"; note: string }>;
+  final?: FinalReview;
+  signoff?: SignOff;
+}
+
+/** A discussion round: both reviewers (findings, positions), the lead (final) or the peer (signoff). */
+export interface ReviewRound {
+  n: number;
+  phase: ReviewPhase;
+  attempt: number;
+  startedAt: string;
+  entries: ReviewerEntry[];
+}
+
+export type ReviewEvent = "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
+
+/** How a comment was last published on the pull request. */
+export interface PublishedComment {
+  /** Inline comment on the pull request; absent when the comment went into the review's text (no diff line to attach it to). */
+  remoteId?: number;
+  url?: string;
+  inline: boolean;
+  /** The text as published (to detect later edits). */
+  body: string;
+  at: string;
+}
+
+/** A comment of the final review as the user curates it: keep, drop or edit it before publishing. */
+export interface CuratedComment {
+  id: string;
+  severity: Severity;
+  file?: string;
+  line?: number;
+  body: string;
+  sources: string[];
+  decision: "keep" | "drop";
+  /** The reviewers' version, kept when the user edits the comment. */
+  original?: { body: string; severity: Severity };
+  /** The peer reviewer's objection to this comment when they did not agree. */
+  objection?: string;
+  /** Added by the user from a comment the reviewers dropped or disputed. */
+  addedByUser?: boolean;
+  published?: PublishedComment;
+}
+
+/** A review posted on the pull request. The first one holds the review text; later ones add comments created after it. */
+export interface ReviewPublication {
+  number: number;
+  reviewId: number;
+  url?: string;
+  event: ReviewEvent;
+  main: boolean;
+  /** The review's text as last published. */
+  body: string;
+  at: string;
+  updatedAt?: string;
+}
+
+export interface CodeReview {
+  target: ReviewTarget;
+  /** Files of the change: git diff --numstat base..head (null counts for binary files). */
+  files?: Array<{ path: string; additions: number | null; deletions: number | null }>;
+  shortStat?: string;
+  commits?: number;
+  rounds: ReviewRound[];
+  /** Every comment either reviewer raised, as it stands after the discussion. */
+  comments: ReviewerComment[];
+  /** The latest final review by the lead reviewer. */
+  final?: FinalReview;
+  /** The peer reviewer's latest sign-off on it. */
+  signoff?: SignOff;
+  /** The user's working copy of the final review's comments. */
+  curated?: CuratedComment[];
+  /** Text published with the comments (starts as the change summary and assessment; the user may edit it). */
+  body?: string;
+  event?: ReviewEvent;
+  publications?: ReviewPublication[];
+  lastPublish?: { at: string; ok: boolean; message: string };
+}
 export interface ChangeRequest {
   /** Comment ID the agents respond to and reviewers verify, e.g. "U1". */
   id: string;
@@ -368,6 +590,8 @@ export interface Task {
   resolverModel?: string;
   /** Model of the manager's planner (Auto tasks). */
   managerModel?: string;
+  /** Code review tasks: model of the peer reviewer (the lead reviewer uses reviewerModel). */
+  peerReviewerModel?: string;
   maxRounds: number;
   status: TaskStatus;
   phase: Phase;
@@ -377,6 +601,8 @@ export interface Task {
   activity?: Activity;
   /** Auto tasks: the manager's plan (set once the planner has run). */
   plan?: TaskPlan;
+  /** Code review tasks: the change under review, the reviewers' discussion, the final review and its publication. */
+  review?: CodeReview;
   stages: Stage[];
   agents?: AgentInfo[];
   context?: RepoContext;
@@ -481,6 +707,8 @@ export function stagesFor(kind: TaskKind): StageKind[] {
       return ["testing"];
     case "design-coding":
       return ["design", "coding"];
+    case "review":
+      return [];
   }
 }
 
@@ -528,7 +756,14 @@ export function reviewerRoleFor(stage: StageKind): AgentRole {
 }
 
 export function isReviewerRole(role: AgentRole): boolean {
-  return role === "design-reviewer" || role === "code-reviewer" || role === "doc-reviewer";
+  return role === "design-reviewer" || role === "code-reviewer" || role === "doc-reviewer" || isCodeReviewRole(role);
+}
+
+/** The two reviewers of a code review task. */
+export const CODE_REVIEW_ROLES: readonly AgentRole[] = ["lead-reviewer", "peer-reviewer"];
+
+export function isCodeReviewRole(role: AgentRole): boolean {
+  return role === "lead-reviewer" || role === "peer-reviewer";
 }
 
 /** Agents that work in a checkout pinned to a commit (no branch of their own): reviewers, the executor and the planner. */
@@ -550,6 +785,7 @@ export function rolesForStages(stages: readonly StageKind[]): AgentRole[] {
 
 /** Sub-agents a task of the given kind uses, in workflow order (Auto tasks start with the manager's planner). */
 export function rolesFor(kind: TaskKind): AgentRole[] {
+  if (kind === "review") return [...CODE_REVIEW_ROLES];
   return kind === "auto" ? ["planner"] : rolesForStages(stagesFor(kind));
 }
 
@@ -564,6 +800,8 @@ export const ROLE_LABELS: Record<AgentRole, string> = {
   "code-reviewer": "Code reviewer",
   executor: "Test executor",
   fixer: "Test fixer",
+  "lead-reviewer": "Lead reviewer",
+  "peer-reviewer": "Peer reviewer",
 };
 
 export const ACTIVE_STATUSES: readonly TaskStatus[] = ["queued", "running", "needs-input"];

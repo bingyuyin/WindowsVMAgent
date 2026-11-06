@@ -15,10 +15,11 @@ import { Bus } from "../src/bus.ts";
 import type { HubSkills } from "../src/context.ts";
 import type { DocTemplates } from "../src/docs.ts";
 import { Store } from "../src/store.ts";
-import type { PullRequestCreator } from "../src/remote.ts";
+import type { PullRequestCreator, RemoteDetails } from "../src/remote.ts";
+import type { CreatedReview, NewReview } from "../src/review/publish.ts";
 import type { CommandRunner } from "../src/shell.ts";
-import type { AgentRole, Settings } from "../src/types.ts";
-import { TaskRunner } from "../src/workflow/runner.ts";
+import type { AgentRole, ReviewPullRequest, Settings } from "../src/types.ts";
+import { TaskRunner, type ReviewHost } from "../src/workflow/runner.ts";
 
 export type Step = (spec: AgentSpec, prompt: string) => Promise<void> | void;
 
@@ -129,6 +130,116 @@ export const submitPlan =
 /** A turn that never finishes on its own (until the manager aborts it). */
 export const hang: Step = () => new Promise<void>(() => {});
 
+// ---- Code review reviewers -------------------------------------------------------------------------
+
+type ReviewCommentStep = { severity: string; file?: string; line?: number; body: string };
+
+const reviewStep =
+  (tool: string, payload: (spec: AgentSpec) => Record<string, unknown>): Step =>
+  async (spec) => {
+    if (spec.submit.kind !== "code-review") throw new Error(`${spec.role} is not a code review reviewer`);
+    await spec.submit.onSubmit(tool as never, payload(spec));
+  };
+
+export const submitFindings = (comments: ReviewCommentStep[], verdict: "approve" | "request_changes" = comments.length ? "request_changes" : "approve"): Step =>
+  reviewStep("submit_findings", (spec) => ({ change_summary: `${spec.role}: adds greet()`, assessment: `${spec.role} assessment`, verdict, comments }));
+
+export const submitPositions = (input: {
+  responses?: Array<{ comment_id: string; position: string; note: string; suggested_body?: string; suggested_severity?: string }>;
+  own_updates?: Array<{ comment_id: string; action: string; note: string; body?: string; severity?: string }>;
+  new_comments?: ReviewCommentStep[];
+}): Step => reviewStep("submit_positions", (spec) => ({ summary: `${spec.role} positions`, responses: [], ...input }));
+
+export const submitFinal = (
+  comments: Array<ReviewCommentStep & { sources: string[] }>,
+  dropped: Array<{ comment_id: string; reason: string }> = [],
+  extra: Record<string, unknown> = {},
+): Step =>
+  reviewStep("submit_final_review", () => ({
+    change_summary: "Adds a greet() helper that builds a greeting.",
+    assessment: "Small, focused change; one correctness issue.",
+    verdict: comments.some((comment) => comment.severity === "blocker" || comment.severity === "major") ? "request_changes" : "approve",
+    comments,
+    dropped,
+    ...extra,
+  }));
+
+export const submitSignoff = (agree: boolean, objections: Array<{ comment_id?: string; issue: string }> = []): Step =>
+  reviewStep("submit_signoff", () => ({ agree, summary: agree ? "The final review is right." : "Something is missing.", objections }));
+
+/** Records what the hub publishes, instead of calling GitHub. */
+export class FakeReviewHost implements ReviewHost {
+  readonly calls: Array<{ method: string; args: Record<string, unknown> }> = [];
+  problem: string | null = null;
+  lookup: { pullRequest?: ReviewPullRequest | null; forBranch?: ReviewPullRequest | null } = {};
+  /** Thrown by the next createReview call. */
+  failNextCreate: Error | null = null;
+  /** Created reviews come back without their comments' IDs (GitHub created them, but listing them failed). */
+  forgetCommentIds = false;
+  private nextReviewId = 100;
+  private nextCommentId = 1000;
+
+  async pullRequest(_remote: RemoteDetails, number: number): Promise<ReviewPullRequest | null> {
+    this.calls.push({ method: "pullRequest", args: { number } });
+    return this.lookup.pullRequest ?? null;
+  }
+
+  async forBranch(_remote: RemoteDetails, branch: string): Promise<ReviewPullRequest | null> {
+    this.calls.push({ method: "forBranch", args: { branch } });
+    return this.lookup.forBranch ?? null;
+  }
+
+  async unavailable(): Promise<string | null> {
+    return this.problem;
+  }
+
+  async createReview(pr: ReviewPullRequest, review: NewReview): Promise<CreatedReview> {
+    this.calls.push({ method: "createReview", args: { ...review } });
+    if (this.failNextCreate) {
+      const error = this.failNextCreate;
+      this.failNextCreate = null;
+      throw error;
+    }
+    const reviewId = this.nextReviewId++;
+    return {
+      reviewId,
+      url: `https://github.com/${pr.slug}/pull/${pr.number}#pullrequestreview-${reviewId}`,
+      comments: this.forgetCommentIds
+        ? []
+        : review.comments.map((comment) => {
+            const id = this.nextCommentId++;
+            return { id, path: comment.path, body: comment.body, url: `https://github.com/${pr.slug}/pull/${pr.number}#discussion_r${id}` };
+          }),
+    };
+  }
+
+  async updateReview(_pr: ReviewPullRequest, reviewId: number, body: string): Promise<void> {
+    this.calls.push({ method: "updateReview", args: { reviewId, body } });
+  }
+
+  async updateComment(_pr: ReviewPullRequest, commentId: number, body: string): Promise<void> {
+    this.calls.push({ method: "updateComment", args: { commentId, body } });
+  }
+
+  async deleteComment(_pr: ReviewPullRequest, commentId: number): Promise<void> {
+    this.calls.push({ method: "deleteComment", args: { commentId } });
+  }
+
+  callsOf(method: string): Array<Record<string, unknown>> {
+    return this.calls.filter((call) => call.method === method).map((call) => call.args);
+  }
+}
+
+/** A GitHub pull request as the GitHub CLI reports it. */
+export const githubPullRequest = (number: number, extra: Partial<ReviewPullRequest> = {}): ReviewPullRequest => ({
+  provider: "github",
+  number,
+  host: "github.com",
+  slug: "acme/sample",
+  url: `https://github.com/acme/sample/pull/${number}`,
+  ...extra,
+});
+
 /** Extracts the design/document path the hub asked the author to write. */
 export const designPathFrom = (prompt: string): string => {
   const match = /`([^`]+\.(?:md|html))` \(relative/.exec(prompt) ?? /document `([^`]+\.(?:md|html))`/.exec(prompt);
@@ -167,6 +278,8 @@ export interface HarnessOptions {
   docTemplates?: DocTemplates | null;
   ready?: boolean;
   pullRequests?: PullRequestCreator;
+  /** Pull request lookups and review publishing for code review tasks. */
+  reviewHost?: ReviewHost;
   /** How the manager runs unit test commands (default: a fake that records them and passes). */
   runCommand?: CommandRunner;
 }
@@ -218,6 +331,7 @@ export function createHarness(script: Partial<Record<AgentRole, Step[]>>, option
       hubSkills: options.hubSkills,
       docTemplates: options.docTemplates,
       pullRequests: options.pullRequests,
+      reviewHost: options.reviewHost,
       runCommand,
     });
   const runner = newRunner();
@@ -266,3 +380,17 @@ export function addRemote(h: Harness, url = "https://github.com/acme/sample.git"
 
 /** Runs git in a bare repository, naming it explicitly (as `safe.bareRepository=explicit` requires). */
 export const bareGit = (bare: string, ...args: string[]): string => git(path.dirname(bare), `--git-dir=${bare}`, ...args);
+
+/** Commits `files` on a new branch off main (the change a code review reviews), then checks main out again. Returns the branch head. */
+export function featureBranch(h: Harness, branch: string, files: Record<string, string>, message = "Add greet"): string {
+  git(h.repoPath, "checkout", "-q", "-b", branch);
+  for (const [file, content] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(h.repoPath, file)), { recursive: true });
+    fs.writeFileSync(path.join(h.repoPath, file), content);
+  }
+  git(h.repoPath, "add", "-A");
+  git(h.repoPath, "commit", "-q", "-m", message);
+  const sha = git(h.repoPath, "rev-parse", "HEAD");
+  git(h.repoPath, "checkout", "-q", "main");
+  return sha;
+}

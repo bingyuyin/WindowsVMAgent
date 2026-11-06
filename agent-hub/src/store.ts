@@ -24,6 +24,7 @@ export const DEFAULT_SETTINGS: Settings = {
   reviewerModel: null,
   resolverModel: null,
   managerModel: null,
+  peerReviewerModel: null,
   maxRounds: 3,
   maxConcurrency: MAX_PARALLEL_TASKS,
   designDocDir: "docs/designs",

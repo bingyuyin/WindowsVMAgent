@@ -50,6 +50,9 @@ export interface PlanSubmissionInput {
   briefing?: string;
 }
 
+/** The tools of the two code review reviewers, one per step of their discussion. */
+export type CodeReviewTool = "submit_findings" | "submit_positions" | "submit_final_review" | "submit_signoff";
+
 /**
  * How an agent hands its structured result back to the workflow. `onSubmit` validates the
  * payload and throws a descriptive error when it is unacceptable, so the agent can retry.
@@ -58,7 +61,9 @@ export type SubmitChannel =
   | { kind: "work"; onSubmit: (input: WorkSubmissionInput) => void | Promise<void>; unitTests?: boolean }
   | { kind: "review"; onSubmit: (input: ReviewSubmissionInput) => void | Promise<void> }
   | { kind: "test"; onSubmit: (input: TestRunSubmissionInput) => void | Promise<void> }
-  | { kind: "plan"; onSubmit: (input: PlanSubmissionInput) => void | Promise<void> };
+  | { kind: "plan"; onSubmit: (input: PlanSubmissionInput) => void | Promise<void> }
+  /** Code review reviewers: one tool per discussion step; the hub says which one each turn must call. */
+  | { kind: "code-review"; tools: readonly CodeReviewTool[]; onSubmit: (tool: CodeReviewTool, input: unknown) => void | Promise<void> };
 
 export interface ToolStartInfo {
   id: string;

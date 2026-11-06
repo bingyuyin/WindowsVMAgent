@@ -40,6 +40,12 @@ const TYPES = [
     text: "Agents: designer and design reviewer finalize a design first; then coder, code reviewer and comment resolver implement it.",
     placeholder: "Describe the feature: goals, requirements and acceptance criteria. The design is written first, then implemented…",
   },
+  {
+    id: "review",
+    title: "Code review",
+    text: "Agents: a lead reviewer and a peer reviewer (pick different models for a real second opinion) review a pull request or branch independently, discuss each other's findings and agree on a final review. You then keep, drop or edit each comment and publish them on the pull request with one click.",
+    placeholder: "Optional: what the reviewers should focus on, e.g. \"security of the token handling\" or \"API compatibility\". Leave empty for a full review…",
+  },
 ];
 
 export function newTaskView(root) {
@@ -48,43 +54,65 @@ export function newTaskView(root) {
   const typeHelp = h("p", { class: "muted small" });
   const repoSelect = h("select", { class: "input", required: true });
   const branchSelect = h("select", { class: "input" });
+  const branchLabel = h("span", { class: "field-label" }, "Base branch");
   const titleInput = h("input", { class: "input", type: "text", maxlength: "100", placeholder: "Optional – defaults to the first line of the description" });
+  const targetInput = h("input", { class: "input", type: "text", maxlength: "1000", spellcheck: "false", placeholder: "#123, a pull request URL, or a branch, tag or commit" });
+  const targetField = h(
+    "label",
+    { class: "field", hidden: true },
+    h("span", { class: "field-label" }, "Pull request or branch to review"),
+    targetInput,
+    h(
+      "small",
+      { class: "muted" },
+      "A pull request is fetched from the repository's remote (GitHub, GitLab, Azure DevOps) and reviewed against its target branch; a branch is reviewed against the target branch below. Comments can be published on GitHub pull requests (GitHub CLI signed in); otherwise copy the review as Markdown.",
+    ),
+  );
+  const descriptionLabel = h("span", { class: "field-label" }, "Description");
   const description = h("textarea", { class: "input", rows: "10", required: true });
   const authorSelect = h("select", { class: "input" });
   const reviewerSelect = h("select", { class: "input" });
   const resolverSelect = h("select", { class: "input" });
   const managerSelect = h("select", { class: "input" });
+  const peerSelect = h("select", { class: "input" });
+  const authorField = h("label", { class: "field" }, h("span", { class: "field-label" }, "Author model (designer / writer / coder)"), authorSelect);
+  const reviewerLabel = h("span", { class: "field-label" }, "Reviewer / test executor model");
   const resolverField = h("label", { class: "field" }, h("span", { class: "field-label" }, "Comment resolver / test fixer model"), resolverSelect);
   const managerField = h("label", { class: "field" }, h("span", { class: "field-label" }, "Manager model (plans the task)"), managerSelect);
+  const peerField = h("label", { class: "field", hidden: true }, h("span", { class: "field-label" }, "Peer reviewer model"), peerSelect);
+  const roundsLabel = h("span", { class: "field-label" }, "Max review rounds / test runs");
   const roundsInput = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(state.settings?.maxRounds ?? 3) });
+  const advanced = h("details", { class: "advanced" });
   const submitButton = h("button", { class: "btn btn-primary", type: "submit" }, "Create task");
 
+  setContent(
+    advanced,
+    h("summary", {}, "Agents, models and review rounds"),
+    h(
+      "div",
+      { class: "grid-2" },
+      managerField,
+      authorField,
+      resolverField,
+      h("label", { class: "field" }, reviewerLabel, reviewerSelect),
+      peerField,
+      h("label", { class: "field" }, roundsLabel, roundsInput),
+    ),
+  );
   const form = h(
     "form",
     { class: "card form", onsubmit: submit },
     h("div", { class: "field" }, h("span", { class: "field-label" }, "Type"), typeButtons, typeHelp),
+    targetField,
     h(
       "div",
       { class: "grid-2" },
       h("label", { class: "field" }, h("span", { class: "field-label" }, "Repository"), repoSelect),
-      h("label", { class: "field" }, h("span", { class: "field-label" }, "Base branch"), branchSelect),
+      h("label", { class: "field" }, branchLabel, branchSelect),
     ),
     h("label", { class: "field" }, h("span", { class: "field-label" }, "Title"), titleInput),
-    h("label", { class: "field" }, h("span", { class: "field-label" }, "Description"), description),
-    h(
-      "details",
-      { class: "advanced" },
-      h("summary", {}, "Agents, models and review rounds"),
-      h(
-        "div",
-        { class: "grid-2" },
-        managerField,
-        h("label", { class: "field" }, h("span", { class: "field-label" }, "Author model (designer / writer / coder)"), authorSelect),
-        resolverField,
-        h("label", { class: "field" }, h("span", { class: "field-label" }, "Reviewer / test executor model"), reviewerSelect),
-        h("label", { class: "field" }, h("span", { class: "field-label" }, "Max review rounds / test runs"), roundsInput),
-      ),
-    ),
+    h("label", { class: "field" }, descriptionLabel, description),
+    advanced,
     h("div", { class: "row end" }, h("a", { class: "btn", href: "#/tasks" }, "Cancel"), submitButton),
   );
 
@@ -115,10 +143,31 @@ export function newTaskView(root) {
       ),
     );
     const type = TYPES.find((candidate) => candidate.id === kind);
+    const review = kind === "review";
     typeHelp.textContent = type.text;
     description.placeholder = type.placeholder;
-    resolverField.hidden = kind === "design" || kind === "document";
+    description.required = !review;
+    descriptionLabel.textContent = review ? "Review focus (optional)" : "Description";
+    titleInput.placeholder = review ? "Optional – defaults to the pull request's title or the branch name" : "Optional – defaults to the first line of the description";
+    targetField.hidden = !review;
+    targetInput.required = review;
+    branchLabel.textContent = review ? "Target branch (pull requests use their own)" : "Base branch";
+    authorField.hidden = review;
+    resolverField.hidden = review || kind === "design" || kind === "document";
     managerField.hidden = kind !== "auto";
+    peerField.hidden = !review;
+    reviewerLabel.textContent = review ? "Lead reviewer model" : "Reviewer / test executor model";
+    roundsLabel.textContent = review ? "Max final-review rounds (lead ↔ peer)" : "Max review rounds / test runs";
+    if (review) advanced.open = true;
+    selectDefaultBranch();
+  }
+
+  /** Code reviews compare against the repository's default branch; other tasks start from the checked-out branch. */
+  function selectDefaultBranch() {
+    const repo = state.repos.find((candidate) => candidate.id === repoSelect.value);
+    const preferred = kind === "review" ? repo?.defaultBranch : branchSelect.dataset.current;
+    const option = [...branchSelect.options].find((candidate) => candidate.value === preferred);
+    if (option) branchSelect.value = option.value;
   }
 
   function renderRepos() {
@@ -140,10 +189,12 @@ export function newTaskView(root) {
     setContent(branchSelect, h("option", { value: "" }, "Loading…"));
     try {
       const { branches, current } = await get(`/api/repos/${encodeURIComponent(repoId)}/branches`);
+      branchSelect.dataset.current = current ?? "";
       setContent(
         branchSelect,
         branches.map((branch) => h("option", { value: branch, selected: branch === current }, branch === current ? `${branch} (checked out)` : branch)),
       );
+      selectDefaultBranch();
     } catch (error) {
       setContent(branchSelect, h("option", { value: "" }, "Default"));
       toast(error.message, "error");
@@ -157,6 +208,7 @@ export function newTaskView(root) {
       setContent(reviewerSelect, modelOptions(models, state.settings?.reviewerModel));
       setContent(resolverSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.resolverModel));
       setContent(managerSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.managerModel));
+      setContent(peerSelect, h("option", { value: "" }, "Same as author model"), modelOptions(models, state.settings?.peerReviewerModel));
     } catch (error) {
       toast(`Could not load models: ${error.message}`, "error");
     }
@@ -164,12 +216,19 @@ export function newTaskView(root) {
 
   async function submit(event) {
     event.preventDefault();
-    if (!description.value.trim()) {
+    const review = kind === "review";
+    if (review && !targetInput.value.trim()) {
+      toast("Enter the pull request or branch to review", "error");
+      targetInput.focus();
+      return;
+    }
+    if (!review && !description.value.trim()) {
       toast("Describe the task first", "error");
       description.focus();
       return;
     }
     submitButton.disabled = true;
+    if (review) submitButton.textContent = "Fetching the change…";
     try {
       const task = await post("/api/tasks", {
         kind,
@@ -177,10 +236,12 @@ export function newTaskView(root) {
         baseRef: branchSelect.value || undefined,
         title: titleInput.value.trim() || undefined,
         description: description.value,
-        authorModel: authorSelect.value || undefined,
+        reviewTarget: review ? targetInput.value.trim() : undefined,
+        authorModel: review ? undefined : authorSelect.value || undefined,
         reviewerModel: reviewerSelect.value || undefined,
-        resolverModel: kind === "design" || kind === "document" ? undefined : resolverSelect.value || undefined,
+        resolverModel: review || kind === "design" || kind === "document" ? undefined : resolverSelect.value || undefined,
         managerModel: kind === "auto" ? managerSelect.value || undefined : undefined,
+        peerReviewerModel: review ? peerSelect.value || undefined : undefined,
         maxRounds: Number(roundsInput.value) || undefined,
       });
       toast(`Created ${task.id}`, "success");
@@ -188,6 +249,7 @@ export function newTaskView(root) {
     } catch (error) {
       toast(error.message, "error");
       submitButton.disabled = false;
+      submitButton.textContent = "Create task";
     }
   }
 

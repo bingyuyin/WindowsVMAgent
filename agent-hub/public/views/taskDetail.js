@@ -1,4 +1,4 @@
-import { del, get, post } from "../lib/api.js";
+import { del, get, patch, post, put } from "../lib/api.js";
 import {
   agentStatusInfo,
   chip,
@@ -6,6 +6,7 @@ import {
   compactNumber,
   confirmDialog,
   copyButton,
+  copyText,
   duration,
   h,
   isDocStage,
@@ -53,6 +54,10 @@ const CHANGE_TEAMS = {
   document: "the technical writer revises the document, the doc reviewer verifies",
 };
 const PROVIDER_NAMES = { github: "GitHub", "azure-devops": "Azure DevOps", gitlab: "GitLab", bitbucket: "Bitbucket" };
+const REVIEW_PHASE_TITLES = { findings: "Independent reviews", positions: "Discussion", final: "Final review", signoff: "Sign-off" };
+const POSITION_CLASS = { agree: "success", disagree: "danger", refine: "info" };
+const REVIEW_EVENT_LABELS = { COMMENT: "Comment", REQUEST_CHANGES: "Request changes", APPROVE: "Approve" };
+const SEVERITY_ORDER = ["blocker", "major", "minor", "nit"];
 /** Testing stages pass or fail rather than being approved. */
 const stageStatus = (stage) =>
   stage.kind === "testing" && stage.status === "approved"
@@ -117,6 +122,15 @@ export function taskDetailView(root, { params }) {
   let docRound = null;
   let docMode = "rendered";
   let docFrame = null;
+  // The document shown in the Documents tab (null: the first one).
+  let docPath = null;
+  // Code review: comments being edited (id -> draft), the review text draft, and the publish state from the server.
+  const commentDrafts = new Map();
+  let bodyDraft = null;
+  let reviewBusy = false;
+  let publishInfo = null;
+  let publishInfoKey = null;
+  let showDropped = false;
   let diffSelection = null;
   let renderedInputId = null;
   const signatures = {};
@@ -352,13 +366,14 @@ export function taskDetailView(root, { params }) {
 
   function renderTitle() {
     const status = statusInfo(task);
+    const review = task.kind === "review";
     const actions = [];
     if (ACTIVE.includes(task.status)) actions.push(h("button", { class: "btn btn-danger-outline", onclick: cancelTask }, "Cancel"));
     if (["failed", "cancelled", "interrupted"].includes(task.status)) actions.push(h("button", { class: "btn btn-primary", onclick: () => retryTask(false) }, "Retry"));
-    if (task.status === "completed" && task.result && !task.result.approved) {
+    if (!review && task.status === "completed" && task.result && !task.result.approved) {
       actions.push(h("button", { class: "btn btn-primary", onclick: () => retryTask(true) }, task.stages.at(-1)?.kind === "testing" ? "Continue fixing" : "Continue review loop"));
     }
-    if (task.status === "completed" && task.result) actions.push(h("button", { class: "btn", onclick: requestChanges }, "✎ Request changes"));
+    if (!review && task.status === "completed" && task.result) actions.push(h("button", { class: "btn", onclick: requestChanges }, "✎ Request changes"));
     if (!ACTIVE.includes(task.status)) actions.push(h("button", { class: "btn btn-ghost-danger", onclick: deleteTask }, "Delete"));
     setContent(
       titleBox,
@@ -374,6 +389,26 @@ export function taskDetailView(root, { params }) {
 
   function renderMeta() {
     const usage = task.usage ?? {};
+    const usageText = `${compactNumber(usage.premiumRequests)} premium req · ${compactNumber((usage.inputTokens ?? 0) + (usage.outputTokens ?? 0))} tokens · ${usage.modelCalls ?? 0} calls`;
+    if (task.kind === "review") {
+      const target = task.review?.target;
+      setContent(
+        metaBox,
+        meta("Repository", task.repoName),
+        meta("Reviewing", target ? reviewTargetLabel(target) : "—"),
+        meta(
+          "Change",
+          h("span", { class: "mono" }, `${shortSha(task.baseSha)}..${shortSha(target?.headSha)}`),
+          task.review?.shortStat ? h("div", { class: "muted small" }, `${task.review.shortStat}${task.review.commits ? ` · ${task.review.commits} commit(s)` : ""}`) : null,
+        ),
+        meta("Local branch", task.branch ? [h("span", { class: "mono" }, task.branch), " ", copyButton(task.branch)] : "—", h("div", { class: "muted small" }, "points at the reviewed head")),
+        meta("Models", h("span", { class: "mono small" }, `lead ${task.reviewerModel} · peer ${task.peerReviewerModel || task.authorModel}`)),
+        meta("Final-review rounds", `up to ${task.roundsBudget ?? task.maxRounds}${task.attempt > 1 ? ` · attempt ${task.attempt}` : ""}`),
+        meta("Duration", task.startedAt ? duration(task.startedAt, ACTIVE.includes(task.status) ? null : task.finishedAt) : "—"),
+        meta("Usage", usageText),
+      );
+      return;
+    }
     const resolver = task.kind === "coding" || task.kind === "design-coding" || task.kind === "testing" || task.kind === "auto" ? (task.resolverModel && task.resolverModel !== task.authorModel ? ` · resolver/fixer ${task.resolverModel}` : "") : "";
     const manager = task.kind === "auto" && task.managerModel && task.managerModel !== task.authorModel ? `manager ${task.managerModel} · ` : "";
     setContent(
@@ -395,8 +430,23 @@ export function taskDetailView(root, { params }) {
       meta("Duration", task.startedAt ? duration(task.startedAt, ACTIVE.includes(task.status) ? null : task.finishedAt) : "—"),
       meta(
         "Usage",
-        `${compactNumber(usage.premiumRequests)} premium req · ${compactNumber((usage.inputTokens ?? 0) + (usage.outputTokens ?? 0))} tokens · ${usage.modelCalls ?? 0} calls`,
+        usageText,
       ),
+    );
+  }
+
+  /** "Pull request #12 ↗ Add retry support (feature/retry → main)" or "feature/x → main". */
+  function reviewTargetLabel(target) {
+    const pr = target.pullRequest;
+    const branches = `${pr?.headBranch ?? target.headRef} → ${pr?.baseBranch ?? target.baseRef}`;
+    if (!pr) return h("span", {}, h("span", { class: "mono" }, branches));
+    const name = `${pr.provider === "gitlab" ? "Merge request !" : "Pull request #"}${pr.number}`;
+    return h(
+      "span",
+      {},
+      pr.url ? h("a", { href: pr.url, target: "_blank", rel: "noopener noreferrer" }, `${name} ↗`) : name,
+      pr.title ? h("span", {}, ` ${pr.title}`) : null,
+      h("div", { class: "muted small mono" }, `${branches}${pr.author ? ` · by ${pr.author}` : ""}`),
     );
   }
 
@@ -430,6 +480,7 @@ export function taskDetailView(root, { params }) {
     }
     if (status === "running" || status === "needs-input") {
       const working = (task.agents ?? []).find((agent) => agent.status === "working");
+      const together = (task.agents ?? []).filter((agent) => agent.status === "working");
       const role = working?.role ?? task.activity?.role;
       const budget = task.roundsBudget ?? task.maxRounds;
       const now = task.activity && task.activity.role === role ? task.activity.text : working?.lastActivity;
@@ -457,9 +508,11 @@ export function taskDetailView(root, { params }) {
                   ? `${ROLE_LABELS[task.pendingInput?.role] ?? "An agent"} is waiting for your answer`
                   : role === "planner"
                     ? "Manager is planning: deciding which sub-agents to create and what each should do"
-                    : role
-                      ? `${ROLE_LABELS[role]}: ${working?.assignment ?? phaseLabel(task.currentStage, task.phase)}`
-                      : phaseLabel(task.currentStage, task.phase),
+                    : together.length > 1
+                      ? `${together.map((agent) => ROLE_LABELS[agent.role]).join(" and ")} are working in parallel: ${phaseLabel(task.currentStage, task.phase).toLowerCase()}`
+                      : role
+                        ? `${ROLE_LABELS[role]}: ${working?.assignment ?? phaseLabel(task.currentStage, task.phase)}`
+                        : phaseLabel(task.currentStage, task.phase),
               ),
               requestLine,
               now ? h("div", { class: "hero-now" }, h("span", { class: "muted" }, "Now: "), h("span", { class: "mono" }, now)) : null,
@@ -468,6 +521,10 @@ export function taskDetailView(root, { params }) {
           ),
         ),
       );
+      return;
+    }
+    if (status === "completed" && task.result && task.kind === "review") {
+      renderReviewHero();
       return;
     }
     if (status === "completed" && task.result) {
@@ -479,6 +536,7 @@ export function taskDetailView(root, { params }) {
       const reviewer = lastStage ? ROLE_LABELS[REVIEWER_ROLE[lastStage.kind]] : "reviewer";
       const docPath = result.docPath ?? result.designDocPath;
       const docStage = task.stages.find((stage) => isDocStage(stage.kind));
+      const documentCount = documentsOfTask().length;
       const tests = result.tests;
       // Later attempts (retries, change requests) report their own run time, not the time since the first run.
       const tookText =
@@ -512,7 +570,13 @@ export function taskDetailView(root, { params }) {
           h(
             "div",
             { class: "row wrap" },
-            docStage ? h("button", { class: "btn btn-sm btn-primary", onclick: () => selectTab("document") }, docStage.kind === "document" ? "View document" : "View design") : null,
+            docStage
+              ? h(
+                  "button",
+                  { class: "btn btn-sm btn-primary", onclick: () => selectTab("document") },
+                  documentCount > 1 ? `View documents (${documentCount})` : docStage.kind === "document" ? "View document" : "View design",
+                )
+              : null,
             h("button", { class: "btn btn-sm", onclick: () => selectTab("changes") }, "View changes"),
             h("button", { class: "btn btn-sm", onclick: () => selectTab("conversation") }, roundsTabLabel(task)),
             h("button", { class: "btn btn-sm", onclick: () => selectTab("result") }, "Merge instructions"),
@@ -535,9 +599,93 @@ export function taskDetailView(root, { params }) {
     }
   }
 
+  /** A finished code review: what changed, how many comments, whether the reviewers agree, and where it was published. */
+  function renderReviewHero() {
+    const review = task.review ?? {};
+    const final = review.final;
+    const kept = (review.curated ?? []).filter((comment) => comment.decision === "keep");
+    const signoff = review.signoff;
+    const main = review.publications?.find((publication) => publication.main);
+    const pr = review.target?.pullRequest;
+    const tookText =
+      task.attempt > 1 && task.attemptStartedAt ? `this run took ${duration(task.attemptStartedAt, task.finishedAt)}` : `took ${duration(task.startedAt, task.finishedAt)}`;
+    const consensus = signoff?.agreed
+      ? chip("Both reviewers agree", "success")
+      : signoff?.fallback
+        ? chip("The peer reviewer did not sign off", "warning")
+        : signoff
+          ? chip(`The peer reviewer objects to ${signoff.objections.length} item(s)`, "warning")
+          : null;
+    setContent(
+      heroBox,
+      h(
+        "div",
+        { class: `card hero hero-result ${signoff && !signoff.agreed ? "hero-warn" : "hero-ok"}` },
+        h("div", { class: "hero-top" }, h("span", { class: "hero-kicker" }, "CODE REVIEW"), h("span", { class: "spacer" }), h("span", { class: "muted small" }, tookText)),
+        h(
+          "div",
+          { class: "hero-title" },
+          main ? `✓ Review published on ${pr ? `pull request #${pr.number}` : "the pull request"}` : `Code review ready: ${kept.length} comment${kept.length === 1 ? "" : "s"} to publish`,
+        ),
+        h(
+          "div",
+          { class: "result-stats" },
+          consensus,
+          severityChips(kept),
+          final ? h("span", {}, `verdict: ${final.verdict === "approve" ? "approve" : "request changes"}`) : null,
+          review.shortStat ? h("span", {}, review.shortStat) : null,
+          main?.url ? h("a", { href: main.url, target: "_blank", rel: "noopener noreferrer" }, "View on the pull request ↗") : null,
+        ),
+        final?.changeSummary ? h("div", { class: "hero-summary" }, h("div", { class: "label" }, "What the change does"), renderMarkdown(final.changeSummary)) : null,
+        h(
+          "div",
+          { class: "row wrap" },
+          h("button", { class: "btn btn-sm btn-primary", onclick: () => selectTab("review") }, main ? "Review & update the comments" : "Review & publish the comments"),
+          h("button", { class: "btn btn-sm", onclick: () => selectTab("discussion") }, "Reviewers' discussion"),
+          h("button", { class: "btn btn-sm", onclick: () => selectTab("changes") }, "View changes"),
+        ),
+      ),
+    );
+  }
+
+  /** "2 major · 1 minor" as chips, most severe first. */
+  function severityChips(comments) {
+    return SEVERITY_ORDER.map((severity) => [severity, comments.filter((comment) => comment.severity === severity).length])
+      .filter(([, count]) => count)
+      .map(([severity, count]) => chip(`${count} ${severity}`, SEVERITY_CLASS[severity]));
+  }
+
+  /** Every document the task's design/document stages wrote, deliverables first, with the rounds each one changed in. */
+  function documentsOfTask() {
+    const documents = [];
+    for (const stage of task.stages.filter((candidate) => isDocStage(candidate.kind))) {
+      const rounds = new Map();
+      if (stage.docPath) rounds.set(stage.docPath, []);
+      for (const round of stage.rounds) {
+        const written = round.author?.documents ?? (round.author?.docSnapshot && stage.docPath ? [{ path: stage.docPath }] : []);
+        for (const doc of written) {
+          if (!rounds.has(doc.path)) rounds.set(doc.path, []);
+          rounds.get(doc.path).push(round.n);
+        }
+      }
+      for (const [path, versions] of rounds) {
+        if (!versions.length) continue;
+        const primary = path === stage.docPath;
+        documents.push({
+          stage,
+          path,
+          primary,
+          versions,
+          format: primary && stage.docFormat ? stage.docFormat : /\.html?$/i.test(path) ? "html" : "markdown",
+        });
+      }
+    }
+    return documents;
+  }
+
   /** Where the task branch stands on the remote, plus the push and pull request actions (hero and Result tab). */
   function renderDelivery() {
-    if (!task || task.status !== "completed" || !task.result) return;
+    if (!task || task.status !== "completed" || !task.result || task.kind === "review") return;
     refreshRemoteInfo();
     setContent(deliveryHero, deliveryContent());
     setContent(deliveryResult, deliveryContent());
@@ -729,6 +877,7 @@ export function taskDetailView(root, { params }) {
 
   function modelForRole(role) {
     if (role === "planner") return task.managerModel || task.authorModel;
+    if (role === "peer-reviewer") return task.peerReviewerModel || task.authorModel;
     if (isReviewerRole(role) || role === "executor") return task.reviewerModel;
     if (role === "resolver" || role === "fixer") return task.resolverModel || task.authorModel;
     return task.authorModel;
@@ -769,6 +918,10 @@ export function taskDetailView(root, { params }) {
   }
 
   function renderPipeline() {
+    if (task.kind === "review") {
+      renderReviewPipeline();
+      return;
+    }
     const signature = JSON.stringify([task.status, task.phase, task.currentStage, task.currentRound, task.stages.map((s) => [s.status, s.rounds.map((r) => [Boolean(r.author), r.review?.verdict, r.review?.comments.length])])]);
     if (signatures.pipeline === signature) return;
     signatures.pipeline = signature;
@@ -859,6 +1012,78 @@ export function taskDetailView(root, { params }) {
     );
   }
 
+  /** Code review progress: independent reviews → discussion → final review ↔ sign-off → your curation and publishing. */
+  function renderReviewPipeline() {
+    const review = task.review;
+    const kept = (review?.curated ?? []).filter((comment) => comment.decision === "keep").length;
+    const published = Boolean(review?.publications?.some((publication) => publication.main));
+    const signature = JSON.stringify([
+      task.status,
+      task.phase,
+      task.currentRound,
+      review?.rounds.map((round) => [round.phase, round.entries.map((entry) => [entry.role, entry.signoff?.agreed, entry.final?.comments.length, entry.comments?.length])]),
+      published,
+      kept,
+    ]);
+    if (signatures.pipeline === signature) return;
+    signatures.pipeline = signature;
+    const running = ["running", "needs-input"].includes(task.status);
+    const rounds = review?.rounds ?? [];
+    const rolesIn = (phase) => (phase === "findings" || phase === "positions" ? ["lead-reviewer", "peer-reviewer"] : phase === "final" ? ["lead-reviewer"] : ["peer-reviewer"]);
+    const step = (round, role) => {
+      const entry = round.entries.find((candidate) => candidate.role === role);
+      const who = role === "lead-reviewer" ? "Lead" : "Peer";
+      if (!entry) {
+        const active = running && task.currentRound === round.n;
+        return h("span", { class: `rn-step ${active ? "rn-active" : "rn-pending"}` }, active ? `${who}…` : who);
+      }
+      const text =
+        round.phase === "findings"
+          ? `✓ ${who}: ${entry.comments?.length ?? 0} comment(s)`
+          : round.phase === "positions"
+            ? `✓ ${who}: ${entry.positions?.length ?? 0} response(s)`
+            : round.phase === "final"
+              ? `✓ ${who}: ${entry.final?.comments.length ?? 0} comment(s)`
+              : entry.signoff?.agreed
+                ? `✓ ${who} agrees`
+                : `✕ ${who}: ${entry.signoff?.objections.length ?? 0} objection(s)`;
+      const cls = round.phase === "signoff" ? (entry.signoff?.agreed ? "rn-approved" : "rn-changes") : "rn-done";
+      return h("span", { class: `rn-step ${cls}`, title: excerpt(entry.summary, 300) }, text);
+    };
+    const nodes = rounds.map((round) =>
+      h(
+        "div",
+        { class: `round-node ${running && task.currentRound === round.n ? "current" : ""}` },
+        h("div", { class: "rn-title" }, `Round ${round.n} · ${REVIEW_PHASE_TITLES[round.phase]}`),
+        h("div", { class: "rn-steps" }, rolesIn(round.phase).map((role) => step(round, role))),
+      ),
+    );
+    const yours =
+      task.status === "completed" && review?.curated
+        ? h(
+            "div",
+            { class: "round-node round-node-user" },
+            h("div", { class: "rn-title" }, "You"),
+            h("div", { class: "rn-steps" }, h("span", { class: `rn-step ${published ? "rn-approved" : "rn-user"}` }, published ? `✓ Published ${kept} comment(s)` : `✎ Keep, drop or edit ${kept}, then publish`)),
+          )
+        : null;
+    const [label, cls] =
+      task.status === "completed" ? (published ? ["Published", "success"] : ["Ready for you", "success"]) : running ? ["In progress", "running"] : [statusInfo(task).label, statusInfo(task).cls];
+    setContent(
+      pipelineBox,
+      h(
+        "div",
+        { class: "card pipeline" },
+        h(
+          "div",
+          { class: `stage stage-${task.status === "completed" ? "approved" : running ? "running" : "pending"}` },
+          h("div", { class: "stage-head" }, h("span", { class: "stage-name" }, "Code review"), chip(label, cls)),
+          h("div", { class: "rounds" }, nodes.length ? [nodes, yours] : h("span", { class: "muted small" }, task.status === "queued" ? "Waiting to start" : "Not started")),
+        ),
+      ),
+    );
+  }
+
   function renderLive() {
     const running = ["running", "needs-input"].includes(task.status);
     liveBox.hidden = !running;
@@ -901,15 +1126,25 @@ export function taskDetailView(root, { params }) {
 
   function renderTabs() {
     const docStage = task.stages.find((stage) => isDocStage(stage.kind));
-    const tabs = [
-      ["conversation", roundsTabLabel(task)],
-      ["timeline", "Timeline"],
-      docStage ? ["document", docStage.kind === "document" ? "Document" : "Design doc"] : null,
-      ["changes", "Changes"],
-      ["context", "Context"],
-      ["result", "Result"],
-    ].filter(Boolean);
-    if (!tabs.some(([tabId]) => tabId === activeTab)) activeTab = "conversation";
+    const documentCount = documentsOfTask().length;
+    const tabs =
+      task.kind === "review"
+        ? [
+            ["review", "Review"],
+            ["discussion", "Discussion"],
+            ["changes", "Changes"],
+            ["timeline", "Timeline"],
+            ["context", "Context"],
+          ]
+        : [
+            ["conversation", roundsTabLabel(task)],
+            ["timeline", "Timeline"],
+            docStage ? ["document", documentCount > 1 ? `Documents (${documentCount})` : docStage.kind === "document" ? "Document" : "Design doc"] : null,
+            ["changes", "Changes"],
+            ["context", "Context"],
+            ["result", "Result"],
+          ].filter(Boolean);
+    if (!tabs.some(([tabId]) => tabId === activeTab)) activeTab = tabs[0][0];
     setContent(
       tabsBar,
       tabs.map(([tabId, label]) =>
@@ -944,6 +1179,8 @@ export function taskDetailView(root, { params }) {
       changes: renderChanges,
       context: renderContext,
       result: renderResult,
+      review: renderReview,
+      discussion: renderDiscussion,
     };
     renderers[activeTab]?.(force);
   }
@@ -1218,6 +1455,580 @@ export function taskDetailView(root, { params }) {
     );
   }
 
+  // ---- Code review: the summary of the change, the comments to curate, and publishing ---------------
+
+  const SEVERITY_TITLES = { blocker: "Blocker", major: "Major", minor: "Minor", nit: "Nit" };
+  /** The comment text as published on the pull request (mirrors the server's formatComment). */
+  const publishedText = (comment) => `**${SEVERITY_TITLES[comment.severity]}:** ${comment.body.trim()}`;
+
+  function renderReview(force) {
+    if (activeTab !== "review") return;
+    const review = task.review;
+    const signature = JSON.stringify([
+      task.status,
+      review?.final,
+      review?.curated,
+      review?.body,
+      review?.event,
+      review?.publications,
+      review?.lastPublish,
+      [...commentDrafts.keys()],
+      showDropped,
+      publishInfo,
+      reviewBusy,
+    ]);
+    if (!force && signatures.review === signature) return;
+    signatures.review = signature;
+    if (!review?.curated || !review.final) {
+      setContent(
+        tabBody,
+        h(
+          "div",
+          { class: "empty card muted" },
+          ACTIVE.includes(task.status)
+            ? spinner(task.status === "queued" ? "Waiting to start…" : "The reviewers are at work. Their comments appear here once they agree on the final review; follow them in the Discussion tab.")
+            : "The review did not finish. Retry resumes it from the last completed step.",
+        ),
+      );
+      return;
+    }
+    refreshPublishInfo();
+    const final = review.final;
+    const curated = review.curated;
+    const kept = curated.filter((comment) => comment.decision === "keep");
+    const files = review.files ?? [];
+    const summaryCard = h(
+      "section",
+      { class: "card review-summary" },
+      h("h3", {}, "Summary of the change"),
+      h(
+        "div",
+        { class: "row wrap small" },
+        reviewTargetLabel(review.target),
+        review.shortStat ? h("span", { class: "muted" }, `· ${review.shortStat}`) : null,
+        review.commits ? h("span", { class: "muted" }, `· ${review.commits} commit(s)`) : null,
+      ),
+      final.changeSummary ? renderMarkdown(final.changeSummary) : h("p", { class: "muted" }, "The reviewers gave no summary."),
+      files.length
+        ? h(
+            "details",
+            { class: "sub-block" },
+            h("summary", { class: "label" }, `Files changed (${files.length})`),
+            h(
+              "table",
+              { class: "file-table" },
+              h(
+                "tbody",
+                {},
+                files.map((file) =>
+                  h(
+                    "tr",
+                    {},
+                    h("td", { class: "mono small break" }, file.path),
+                    h("td", { class: "num add" }, file.additions === null ? "bin" : `+${file.additions}`),
+                    h("td", { class: "num del" }, file.deletions === null ? "" : `−${file.deletions}`),
+                  ),
+                ),
+              ),
+            ),
+          )
+        : null,
+      h("div", { class: "label sub-block" }, `Reviewers' assessment · verdict: ${final.verdict === "approve" ? "approve" : "request changes"}`),
+      renderMarkdown(final.assessment),
+      review.signoff
+        ? review.signoff.agreed
+          ? h("div", { class: "callout callout-success small" }, h("strong", {}, "Both reviewers agree on this review. "), review.signoff.summary)
+          : h(
+              "div",
+              { class: "callout callout-warning small" },
+              h("strong", {}, review.signoff.fallback ? "The peer reviewer did not sign off. " : "The peer reviewer still objects: "),
+              review.signoff.summary,
+              review.signoff.objections.length ? h("div", { class: "muted" }, "Its objections are shown on the comments they concern; you decide.") : null,
+            )
+        : null,
+    );
+    const commentsSection = h(
+      "section",
+      { class: "review-comments" },
+      h(
+        "div",
+        { class: "row between wrap" },
+        h("h2", { class: "section-title" }, `Comments · keeping ${kept.length} of ${curated.length}`),
+        h("div", { class: "row wrap" }, severityChips(kept)),
+      ),
+      h("p", { class: "muted small" }, "Keep, drop or edit each comment. Publishing posts the comments as they are now; after publishing, edits and drops are applied to the pull request the next time you publish."),
+      curated.length ? curated.map(curatedCard) : h("div", { class: "empty card muted" }, "The reviewers found nothing to comment on."),
+    );
+    setContent(tabBody, summaryCard, commentsSection, leftOutSection(), publishCard());
+  }
+
+  function sourcesLabel(sources) {
+    const lead = sources.some((id) => id.startsWith("L"));
+    const peer = sources.some((id) => id.startsWith("P"));
+    if (lead && peer) return "found by both reviewers";
+    if (lead) return "lead reviewer";
+    if (peer) return "peer reviewer";
+    return "added in the final review";
+  }
+
+  function curatedStatus(comment) {
+    if (comment.decision === "drop") return comment.published?.inline ? ["Dropped · deleted from the PR on publish", "danger"] : ["Dropped", "neutral"];
+    if (comment.published) return comment.published.body !== publishedText(comment) ? ["Edited since publishing", "warning"] : ["Published", "success"];
+    return comment.original ? ["Edited · keep", "info"] : ["Keep", "success"];
+  }
+
+  /** One comment of the final review, with keep/drop and edit controls. */
+  function curatedCard(comment) {
+    const draft = commentDrafts.get(comment.id);
+    const dropped = comment.decision === "drop";
+    const location = comment.file ? (comment.line ? `${comment.file}:${comment.line}` : comment.file) : null;
+    const head = h(
+      "div",
+      { class: "comment-head" },
+      h("span", { class: "mono comment-id" }, comment.id),
+      chip(comment.severity, SEVERITY_CLASS[comment.severity] ?? "neutral"),
+      location ? h("span", { class: "mono small break" }, location) : h("span", { class: "muted small" }, "general"),
+      chip(sourcesLabel(comment.sources), "outline", comment.sources.length ? `Reviewer comments: ${comment.sources.join(", ")}` : undefined),
+      comment.addedByUser ? chip("added by you", "info") : null,
+      h("span", { class: "spacer" }),
+      chip(...curatedStatus(comment)),
+    );
+    if (draft) {
+      const severity = h(
+        "select",
+        { class: "input input-inline", onchange: () => (draft.severity = severity.value) },
+        SEVERITY_ORDER.map((value) => h("option", { value, selected: value === draft.severity }, value)),
+      );
+      const text = h("textarea", { class: "input", rows: String(Math.min(16, Math.max(4, draft.body.split("\n").length + 1))), value: draft.body, oninput: () => (draft.body = text.value) });
+      return h(
+        "div",
+        { class: `comment review-comment sev-${comment.severity} editing` },
+        head,
+        h("div", { class: "row small" }, h("span", { class: "muted" }, "Severity"), severity),
+        text,
+        h(
+          "div",
+          { class: "row end" },
+          h("button", { class: "btn btn-sm", disabled: reviewBusy, onclick: () => cancelEdit(comment.id) }, "Cancel"),
+          h("button", { class: "btn btn-sm btn-primary", disabled: reviewBusy, onclick: () => saveEdit(comment.id) }, "Save"),
+        ),
+      );
+    }
+    const decision = (value, label) =>
+      h(
+        "button",
+        {
+          class: `seg-item ${comment.decision === value ? "active" : ""}`,
+          disabled: reviewBusy,
+          "aria-pressed": String(comment.decision === value),
+          onclick: () => comment.decision !== value && reviewRequest(() => patch(commentUrl(comment.id), { decision: value })),
+        },
+        label,
+      );
+    return h(
+      "div",
+      { class: `comment review-comment sev-${comment.severity} ${dropped ? "is-dropped" : ""}` },
+      head,
+      renderMarkdown(comment.body),
+      comment.objection ? h("div", { class: "callout callout-warning small" }, h("strong", {}, "Peer reviewer objects: "), comment.objection) : null,
+      comment.original
+        ? h("details", { class: "sub-block" }, h("summary", { class: "label" }, `The reviewers' version (${comment.original.severity})`), renderMarkdown(comment.original.body))
+        : null,
+      h(
+        "div",
+        { class: "row wrap comment-actions" },
+        h("div", { class: "seg seg-sm", role: "group", "aria-label": `Keep or drop ${comment.id}` }, decision("keep", "Keep"), decision("drop", "Drop")),
+        h("button", { class: "btn btn-sm", disabled: reviewBusy, onclick: () => startEdit(comment) }, "✎ Update"),
+        comment.original ? h("button", { class: "btn btn-sm btn-ghost", disabled: reviewBusy, onclick: () => reviewRequest(() => patch(commentUrl(comment.id), { revert: true })) }, "Undo edit") : null,
+        h("span", { class: "spacer" }),
+        comment.published
+          ? comment.published.inline
+            ? comment.published.url
+              ? h("a", { class: "small", href: comment.published.url, target: "_blank", rel: "noopener noreferrer" }, "On the pull request ↗")
+              : h("span", { class: "muted small" }, "inline on the pull request")
+            : h("span", { class: "muted small" }, "in the review's text")
+          : null,
+      ),
+    );
+  }
+
+  const commentUrl = (commentId) => `/api/tasks/${encodeURIComponent(task.id)}/review/comments/${encodeURIComponent(commentId)}`;
+
+  function startEdit(comment) {
+    commentDrafts.set(comment.id, { body: comment.body, severity: comment.severity });
+    renderReview(true);
+  }
+
+  function cancelEdit(commentId) {
+    commentDrafts.delete(commentId);
+    renderReview(true);
+  }
+
+  async function saveEdit(commentId) {
+    const draft = commentDrafts.get(commentId);
+    if (!draft) return;
+    if (!draft.body.trim()) {
+      toast("A comment needs text; drop it instead", "error");
+      return;
+    }
+    if (await reviewRequest(() => patch(commentUrl(commentId), { body: draft.body, severity: draft.severity }))) {
+      commentDrafts.delete(commentId);
+      renderReview(true);
+    }
+  }
+
+  /** Runs a review edit; the response (and the live stream) carry the updated task. */
+  async function reviewRequest(call, success) {
+    reviewBusy = true;
+    renderReview(true);
+    try {
+      const result = await call();
+      const updated = result?.task ?? (result?.id === task.id ? result : null);
+      if (updated) {
+        task = updated;
+        renderAll();
+      }
+      if (success) success(result);
+      return true;
+    } catch (error) {
+      toast(error.message, "error");
+      return false;
+    } finally {
+      reviewBusy = false;
+      renderReview(true);
+    }
+  }
+
+  /** Reviewer comments the final review leaves out (dropped, withdrawn or disputed), each one can be put back. */
+  function leftOutSection() {
+    const review = task.review;
+    const curated = review.curated ?? [];
+    const covered = new Set(curated.flatMap((comment) => comment.sources));
+    const leftOut = review.comments.filter((comment) => !covered.has(comment.id));
+    if (!leftOut.length) return null;
+    const objections = review.signoff && !review.signoff.agreed ? review.signoff.objections : [];
+    const disputed = leftOut.filter((comment) => objections.some((objection) => objection.commentId === comment.id)).length;
+    return h(
+      "details",
+      { class: "card left-out", open: showDropped || disputed > 0, ontoggle: (event) => (showDropped = event.target.open) },
+      h("summary", {}, `Left out of the final review (${leftOut.length})${disputed ? ` · the peer reviewer wants ${disputed} back` : ""}`),
+      h("p", { class: "muted small" }, "Comments a reviewer raised that the final review does not include. Add one back if you think it belongs in the review."),
+      leftOut.map((comment) => {
+        const reason = comment.withdrawn
+          ? `Withdrawn by the ${comment.id.startsWith("L") ? "lead" : "peer"} reviewer: ${comment.withdrawn.note}`
+          : (review.final?.dropped.find((entry) => entry.commentId === comment.id)?.reason ?? "Not included in the final review.");
+        const objection = objections.filter((entry) => entry.commentId === comment.id).map((entry) => entry.issue).join(" ");
+        return h(
+          "div",
+          { class: `comment sev-${comment.severity} is-dropped` },
+          h(
+            "div",
+            { class: "comment-head" },
+            h("span", { class: "mono comment-id" }, comment.id),
+            chip(comment.severity, SEVERITY_CLASS[comment.severity] ?? "neutral"),
+            comment.file ? h("span", { class: "mono small break" }, comment.line ? `${comment.file}:${comment.line}` : comment.file) : null,
+            chip(comment.id.startsWith("L") ? "lead reviewer" : "peer reviewer", "outline"),
+            h("span", { class: "spacer" }),
+            h(
+              "button",
+              { class: "btn btn-xs", disabled: reviewBusy, onclick: () => reviewRequest(() => post(`/api/tasks/${encodeURIComponent(task.id)}/review/comments`, { from: comment.id })) },
+              "+ Add to review",
+            ),
+          ),
+          renderMarkdown(comment.body),
+          h("div", { class: "muted small" }, reason),
+          objection ? h("div", { class: "callout callout-warning small" }, h("strong", {}, "Peer reviewer objects to leaving it out: "), objection) : null,
+        );
+      }),
+    );
+  }
+
+  function refreshPublishInfo() {
+    const review = task.review;
+    const key = JSON.stringify([task.id, review?.curated, review?.body, review?.publications]);
+    if (publishInfoKey === key) return;
+    publishInfoKey = key;
+    get(`/api/tasks/${encodeURIComponent(task.id)}/review/publish`)
+      .catch((error) => ({ available: false, reason: error.message, pending: null, inline: 0, inBody: 0, pullRequest: null }))
+      .then((info) => {
+        if (disposed || publishInfoKey !== key) return;
+        publishInfo = info;
+        if (activeTab === "review") renderReview(false);
+      });
+  }
+
+  /** The review text, the kind of review, and the Publish / Copy as Markdown actions. */
+  function publishCard() {
+    const review = task.review;
+    const pr = review.target.pullRequest;
+    const main = review.publications?.find((publication) => publication.main);
+    const info = publishInfo;
+    const prName = pr ? `${pr.provider === "gitlab" ? "merge request !" : "pull request #"}${pr.number}` : "the pull request";
+    const publishButton = h("button", { class: "btn btn-primary", onclick: publishComments });
+    // Typing in the review text must not re-render (and lose focus), so the controls it affects update in place.
+    const updatePublishButton = () => {
+      const pending = info?.pending ?? null;
+      const upToDate = Boolean(main) && pending === 0 && bodyDraft === null;
+      const blocked = !info
+        ? "Checking where the review can be published…"
+        : !info.available
+          ? info.reason
+          : commentDrafts.size
+            ? "Save or cancel the comment you are editing first"
+            : upToDate
+              ? "Nothing new to publish"
+              : null;
+      publishButton.disabled = Boolean(blocked) || reviewBusy;
+      publishButton.title = blocked ?? "";
+      publishButton.textContent = reviewBusy
+        ? "Working…"
+        : main
+          ? upToDate
+            ? "✓ Pull request is up to date"
+            : `Publish updates${pending ? ` (${pending})` : ""}`
+          : `Publish comments to ${prName}`;
+    };
+    const saveRow = h(
+      "div",
+      { class: "row end", hidden: bodyDraft === null },
+      h("button", { class: "btn btn-sm", disabled: reviewBusy, onclick: () => ((bodyDraft = null), renderReview(true)) }, "Discard"),
+      h("button", { class: "btn btn-sm btn-primary", disabled: reviewBusy, onclick: saveReviewText }, "Save text"),
+    );
+    const text = h("textarea", {
+      class: "input",
+      rows: "6",
+      value: bodyDraft ?? review.body ?? "",
+      oninput: () => {
+        bodyDraft = text.value;
+        saveRow.hidden = false;
+        updatePublishButton();
+      },
+    });
+    const event = h(
+      "select",
+      {
+        class: "input input-inline",
+        disabled: Boolean(main) || reviewBusy,
+        title: main ? "The review was published; its kind cannot change any more" : "How the review is submitted on the pull request",
+        onchange: () => reviewRequest(() => put(`/api/tasks/${encodeURIComponent(task.id)}/review/summary`, { event: event.value })),
+      },
+      Object.entries(REVIEW_EVENT_LABELS).map(([value, label]) => h("option", { value, selected: (review.event ?? "COMMENT") === value }, label)),
+    );
+    updatePublishButton();
+    const pending = info?.pending ?? null;
+    const status = info
+      ? info.available
+        ? h(
+            "div",
+            { class: "muted small" },
+            `Publishes on ${prName}: ${info.inline} inline comment(s)${info.inBody ? `, ${info.inBody} in the review's text (not on a changed line)` : ""}.`,
+            main && pending ? ` ${pending} change(s) are not on the pull request yet.` : "",
+          )
+        : h("div", { class: "callout callout-info small" }, info.reason)
+      : spinner("Checking the pull request…");
+    return h(
+      "section",
+      { class: "card publish-card" },
+      h("h3", {}, "Publish"),
+      h("label", { class: "field" }, h("span", { class: "field-label" }, "Review text (posted with the comments)"), text, saveRow),
+      h("div", { class: "row wrap" }, h("span", { class: "field-label" }, "Submit as"), event, h("span", { class: "muted small" }, "GitHub does not let you approve or request changes on your own pull request.")),
+      status,
+      h(
+        "div",
+        { class: "row wrap" },
+        publishButton,
+        h("button", { class: "btn", onclick: copyReviewMarkdown }, "Copy as Markdown"),
+        main?.url ? h("a", { class: "btn btn-ghost", href: main.url, target: "_blank", rel: "noopener noreferrer" }, "View the review ↗") : null,
+      ),
+      review.lastPublish
+        ? h(
+            "div",
+            { class: `callout small ${review.lastPublish.ok ? "callout-success" : "callout-danger"}` },
+            h("strong", {}, `${relTime(review.lastPublish.at)}: `),
+            review.lastPublish.message,
+          )
+        : null,
+    );
+  }
+
+  async function saveReviewText() {
+    const body = bodyDraft;
+    if (body === null) return;
+    if (await reviewRequest(() => put(`/api/tasks/${encodeURIComponent(task.id)}/review/summary`, { body }))) {
+      bodyDraft = null;
+      renderReview(true);
+    }
+  }
+
+  async function publishComments() {
+    if (bodyDraft !== null) {
+      const body = bodyDraft;
+      if (!(await reviewRequest(() => put(`/api/tasks/${encodeURIComponent(task.id)}/review/summary`, { body })))) return;
+      bodyDraft = null;
+    }
+    const main = task.review?.publications?.find((publication) => publication.main);
+    const kept = (task.review?.curated ?? []).filter((comment) => comment.decision === "keep").length;
+    if (!main) {
+      const confirmed = await confirmDialog({
+        title: "Publish the review?",
+        body: h(
+          "div",
+          {},
+          h("p", {}, `Posts the review text and ${kept} comment(s) on the pull request as ${REVIEW_EVENT_LABELS[task.review?.event ?? "COMMENT"]}.`),
+          h("p", { class: "muted small" }, "Later edits, drops and comments you add are applied to the pull request when you publish again."),
+        ),
+        confirmText: "Publish",
+      });
+      if (!confirmed) return;
+    }
+    await reviewRequest(
+      () => post(`/api/tasks/${encodeURIComponent(task.id)}/review/publish`, {}),
+      (result) => toast(result.message, result.ok ? "success" : "error"),
+    );
+  }
+
+  async function copyReviewMarkdown() {
+    try {
+      const { markdown } = await get(`/api/tasks/${encodeURIComponent(task.id)}/review/markdown`);
+      await copyText(markdown);
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+  /** The reviewers' discussion, round by round: independent findings, positions, final review and sign-off. */
+  function renderDiscussion(force) {
+    const review = task.review;
+    const signature = JSON.stringify([task.status, task.phase, task.currentRound, review?.rounds, review?.comments]);
+    if (!force && signatures.discussion === signature) return;
+    signatures.discussion = signature;
+    const rounds = review?.rounds ?? [];
+    if (!rounds.length) {
+      setContent(tabBody, h("div", { class: "empty card muted" }, ACTIVE.includes(task.status) ? spinner("The reviewers are starting…") : "No discussion was recorded."));
+      return;
+    }
+    const running = ["running", "needs-input"].includes(task.status);
+    const byId = new Map(review.comments.map((comment) => [comment.id, comment]));
+    const reviewerComment = (comment) =>
+      h(
+        "div",
+        { class: `comment sev-${comment.severity} ${comment.withdrawn ? "is-dropped" : ""}` },
+        h(
+          "div",
+          { class: "comment-head" },
+          h("span", { class: "mono comment-id" }, comment.id),
+          chip(comment.severity, SEVERITY_CLASS[comment.severity] ?? "neutral"),
+          comment.file ? h("span", { class: "mono small break" }, comment.line ? `${comment.file}:${comment.line}` : comment.file) : null,
+          h("span", { class: "spacer" }),
+          comment.withdrawn ? chip(`withdrawn in round ${comment.withdrawn.round}`, "neutral") : comment.revised ? chip(`revised in round ${comment.revised.round}`, "info") : null,
+        ),
+        renderMarkdown(comment.body),
+        comment.withdrawn ? h("div", { class: "muted small" }, `Withdrawn: ${comment.withdrawn.note}`) : null,
+        comment.revised ? h("div", { class: "muted small" }, `Revised: ${comment.revised.note}`) : null,
+      );
+    const entryBlock = (round, entry) => {
+      const parts = [];
+      if (round.phase === "findings") {
+        parts.push(
+          h("div", { class: "row wrap small" }, chip(entry.verdict === "approve" ? "approve" : "request changes", entry.verdict === "approve" ? "success" : "warning"), `${entry.comments?.length ?? 0} comment(s)`),
+          entry.changeSummary ? h("details", { class: "sub-block" }, h("summary", { class: "label" }, "What the change does"), renderMarkdown(entry.changeSummary)) : null,
+          renderMarkdown(entry.summary),
+          (entry.comments ?? []).map((commentId) => byId.get(commentId)).filter(Boolean).map(reviewerComment),
+        );
+      } else if (round.phase === "positions") {
+        parts.push(renderMarkdown(entry.summary));
+        for (const position of entry.positions ?? []) {
+          parts.push(
+            h(
+              "div",
+              { class: "response" },
+              h("span", { class: "mono comment-id" }, position.commentId),
+              chip(position.position, POSITION_CLASS[position.position] ?? "neutral"),
+              h("span", {}, position.note),
+              position.suggestedSeverity ? chip(`→ ${position.suggestedSeverity}`, "outline") : null,
+            ),
+            position.suggestedBody ? h("details", { class: "sub-block" }, h("summary", { class: "label" }, `Suggested text for ${position.commentId}`), renderMarkdown(position.suggestedBody)) : null,
+          );
+        }
+        for (const update of entry.updates ?? []) {
+          parts.push(h("div", { class: "response" }, h("span", { class: "mono comment-id" }, update.commentId), chip(update.action === "withdraw" ? "withdrew own" : "revised own", "neutral"), h("span", {}, update.note)));
+        }
+        const added = (entry.comments ?? []).map((commentId) => byId.get(commentId)).filter(Boolean);
+        if (added.length) parts.push(h("div", { class: "label sub-block" }, `New comments (${added.length})`), added.map(reviewerComment));
+      } else if (round.phase === "final" && entry.final) {
+        const final = entry.final;
+        parts.push(
+          h("div", { class: "row wrap small" }, chip(final.verdict === "approve" ? "approve" : "request changes", final.verdict === "approve" ? "success" : "warning"), `${final.comments.length} comment(s), ${final.dropped.length} dropped`, final.fallback ? chip("assembled by the hub", "warning") : null),
+          renderMarkdown(final.assessment),
+        );
+        if (final.objectionResponses?.length) {
+          parts.push(h("div", { class: "label sub-block" }, "Answers to the peer reviewer's objections"), final.objectionResponses.map((answer) => h("div", { class: "response" }, h("span", { class: "muted" }, answer.objection), h("span", {}, `→ ${answer.response}`))));
+        }
+        parts.push(
+          final.comments.map((comment) =>
+            h(
+              "div",
+              { class: `comment sev-${comment.severity}` },
+              h(
+                "div",
+                { class: "comment-head" },
+                h("span", { class: "mono comment-id" }, comment.id),
+                chip(comment.severity, SEVERITY_CLASS[comment.severity] ?? "neutral"),
+                comment.file ? h("span", { class: "mono small break" }, comment.line ? `${comment.file}:${comment.line}` : comment.file) : null,
+                h("span", { class: "spacer" }),
+                h("span", { class: "muted small" }, comment.sources.length ? `from ${comment.sources.join(", ")}` : "new"),
+              ),
+              renderMarkdown(comment.body),
+            ),
+          ),
+          final.dropped.length
+            ? h(
+                "details",
+                { class: "sub-block" },
+                h("summary", { class: "label" }, `Dropped (${final.dropped.length})`),
+                final.dropped.map((entryDropped) => h("div", { class: "response" }, h("span", { class: "mono comment-id" }, entryDropped.commentId), h("span", {}, entryDropped.reason))),
+              )
+            : null,
+        );
+      } else if (round.phase === "signoff" && entry.signoff) {
+        const signoff = entry.signoff;
+        parts.push(
+          h("div", { class: "row wrap small" }, signoff.agreed ? chip("agrees", "success") : chip(signoff.fallback ? "no sign-off" : "objects", "warning")),
+          renderMarkdown(signoff.summary),
+          signoff.objections.map((objection) => h("div", { class: "response" }, objection.commentId ? h("span", { class: "mono comment-id" }, objection.commentId) : chip("whole review", "outline"), h("span", {}, objection.issue))),
+        );
+      }
+      return h(
+        "div",
+        { class: "conv-block" },
+        h("div", { class: "conv-block-head" }, roleTag(entry.role), h("span", { class: "muted small" }, clock(entry.at)), entry.fallback ? chip("no structured submission", "warning") : null),
+        parts,
+      );
+    };
+    setContent(
+      tabBody,
+      rounds.map((round) => {
+        const expected = round.phase === "findings" || round.phase === "positions" ? ["lead-reviewer", "peer-reviewer"] : round.phase === "final" ? ["lead-reviewer"] : ["peer-reviewer"];
+        const waiting = expected.filter((role) => !round.entries.some((entry) => entry.role === role));
+        return h(
+          "div",
+          { class: `card round-card ${running && task.currentRound === round.n ? "current" : ""}` },
+          h(
+            "div",
+            { class: "round-head" },
+            h("strong", {}, `Round ${round.n} · ${REVIEW_PHASE_TITLES[round.phase]}`),
+            round.attempt > 1 ? chip(`attempt ${round.attempt}`, "outline") : null,
+            h("span", { class: "muted small" }, clock(round.startedAt)),
+          ),
+          round.entries.map((entry) => entryBlock(round, entry)),
+          running && task.currentRound === round.n
+            ? waiting.map((role) => h("div", { class: "conv-block" }, spinner(`${ROLE_LABELS[role]} is working…`)))
+            : null,
+        );
+      }),
+    );
+  }
+
   function renderTimeline(force) {
     if (!force && signatures.timelineRendered) return;
     signatures.timelineRendered = true;
@@ -1273,23 +2084,28 @@ export function taskDetailView(root, { params }) {
     el.title = status && !status.success ? status.error || "failed" : "";
   }
 
+  /** The Documents tab: every document the task wrote (a list when there are several) and the selected one, version by version. */
   async function renderDocument(force) {
-    const stage = task.stages.find((candidate) => isDocStage(candidate.kind));
-    const versions = (stage?.rounds ?? []).filter((round) => round.author?.docSnapshot).map((round) => round.n);
-    const signature = JSON.stringify([versions, stage?.status, docRound, docMode]);
+    const documents = documentsOfTask();
+    const selectedDoc = documents.find((doc) => doc.path === docPath) ?? documents[0];
+    const signature = JSON.stringify([documents.map((doc) => [doc.path, doc.versions, doc.stage.status]), selectedDoc?.path, docRound, docMode]);
     if (!force && signatures.document === signature) return;
     signatures.document = signature;
     docFrame = null;
-    const author = ROLE_LABELS[AUTHOR_ROLE[stage?.kind ?? "design"]].toLowerCase();
-    if (!versions.length) {
+    const firstStage = task.stages.find((candidate) => isDocStage(candidate.kind));
+    const author = ROLE_LABELS[AUTHOR_ROLE[firstStage?.kind ?? "design"]].toLowerCase();
+    if (!selectedDoc) {
       setContent(tabBody, h("div", { class: "empty card muted" }, ACTIVE.includes(task.status) ? spinner(`The ${author} is writing the first draft…`) : "No document was submitted."));
       return;
     }
+    const stage = selectedDoc.stage;
+    const versions = selectedDoc.versions;
     const selected = docRound && versions.includes(docRound) ? docRound : versions.at(-1);
     const latest = versions.at(-1);
     const final = stage.status === "approved" || stage.status === "not-approved";
-    const format = stage.docFormat ?? (/\.html?$/i.test(stage.docPath ?? "") ? "html" : "markdown");
-    const viewUrl = `/api/tasks/${encodeURIComponent(task.id)}/doc/view?round=${selected}`;
+    const format = selectedDoc.format;
+    const query = `round=${selected}&path=${encodeURIComponent(selectedDoc.path)}`;
+    const viewUrl = `/api/tasks/${encodeURIComponent(task.id)}/doc/view?${query}`;
     const modeButton = (mode, label) =>
       h(
         "button",
@@ -1303,51 +2119,80 @@ export function taskDetailView(root, { params }) {
         label,
       );
     const content = h("div", { class: `doc-host ${format === "html" && docMode === "rendered" ? "doc-host-frame" : "card doc"}` });
-    setContent(
-      tabBody,
+    const toolbar = h(
+      "div",
+      { class: "row between wrap doc-toolbar" },
       h(
         "div",
-        { class: "row between wrap doc-toolbar" },
+        { class: "row wrap" },
         h(
           "div",
-          { class: "row wrap" },
-          h(
-            "div",
-            { class: "seg" },
-            versions.map((n) =>
+          { class: "seg" },
+          versions.map((n) =>
+            h(
+              "button",
+              {
+                class: `seg-item ${n === selected ? "active" : ""}`,
+                title: `Version written in round ${n}`,
+                onclick: () => {
+                  docRound = n;
+                  renderDocument(true);
+                },
+              },
+              n === latest && final ? `v${n} · final` : `v${n}`,
+            ),
+          ),
+        ),
+        format === "html" ? h("div", { class: "seg" }, modeButton("rendered", "Rendered"), modeButton("source", "HTML source")) : null,
+      ),
+      h(
+        "div",
+        { class: "row" },
+        h("span", { class: "mono small" }, selectedDoc.path),
+        stage.status === "approved" && selected === latest ? chip("Approved", "success") : selected === latest && final ? chip("Final (not approved)", "warning") : chip("Draft", "neutral"),
+        h("a", { class: "btn btn-xs", href: viewUrl, target: "_blank", rel: "noopener noreferrer", title: "Open the document in a new tab" }, "Open ↗"),
+      ),
+    );
+    const list =
+      documents.length > 1
+        ? h(
+            "nav",
+            { class: "doc-list card", "aria-label": "Documents" },
+            h("div", { class: "label" }, `Documents (${documents.length})`),
+            documents.map((doc) =>
               h(
                 "button",
                 {
-                  class: `seg-item ${n === selected ? "active" : ""}`,
-                  title: `Version written in review round ${n}`,
+                  class: `doc-item ${doc === selectedDoc ? "active" : ""}`,
+                  "aria-current": doc === selectedDoc ? "true" : undefined,
+                  title: doc.path,
                   onclick: () => {
-                    docRound = n;
+                    docPath = doc.path;
+                    docRound = null;
                     renderDocument(true);
                   },
                 },
-                n === latest && final ? `v${n} · final` : `v${n}`,
+                h("span", { class: "doc-item-name" }, doc.path.split("/").at(-1)),
+                h("span", { class: "mono small muted doc-item-path" }, doc.path),
+                h(
+                  "span",
+                  { class: "row small" },
+                  chip(doc.stage.kind === "design" ? "Design" : "Document", "outline"),
+                  doc.primary ? chip("main", "info") : null,
+                  h("span", { class: "muted" }, `${doc.versions.length} version${doc.versions.length === 1 ? "" : "s"}`),
+                ),
               ),
             ),
-          ),
-          format === "html" ? h("div", { class: "seg" }, modeButton("rendered", "Rendered"), modeButton("source", "HTML source")) : null,
-        ),
-        h(
-          "div",
-          { class: "row" },
-          h("span", { class: "mono small" }, stage.docPath ?? ""),
-          stage.status === "approved" && selected === latest ? chip("Approved", "success") : selected === latest && final ? chip("Final (not approved)", "warning") : chip("Draft", "neutral"),
-          h("a", { class: "btn btn-xs", href: viewUrl, target: "_blank", rel: "noopener noreferrer", title: "Open the document in a new tab" }, "Open ↗"),
-        ),
-      ),
-      content,
-    );
+          )
+        : null;
+    setContent(tabBody, list ? h("div", { class: "doc-layout" }, list, h("div", { class: "doc-main" }, toolbar, content)) : [toolbar, content]);
     if (format === "html" && docMode === "rendered") {
       // Sandboxed (no same-origin): the document's scripts cannot reach the hub UI or its API.
       docFrame = h("iframe", {
         class: "doc-frame",
         sandbox: "allow-scripts allow-popups",
         referrerpolicy: "no-referrer",
-        title: `${stage.docPath ?? "Document"} (version ${selected})`,
+        title: `${selectedDoc.path} (version ${selected})`,
         height: "720",
         src: viewUrl,
       });
@@ -1356,7 +2201,7 @@ export function taskDetailView(root, { params }) {
     }
     setContent(content, spinner("Loading document…"));
     try {
-      const doc = await get(`/api/tasks/${encodeURIComponent(task.id)}/doc?round=${selected}`);
+      const doc = await get(`/api/tasks/${encodeURIComponent(task.id)}/doc?${query}`);
       if (!doc.content) setContent(content, h("div", { class: "muted" }, "Document not available."));
       else if (format === "html") setContent(content, h("div", { class: "code-block" }, h("pre", { class: "doc-source" }, doc.content), copyButton(doc.content, "Copy HTML")));
       else setContent(content, renderMarkdown(doc.content));
@@ -1366,7 +2211,7 @@ export function taskDetailView(root, { params }) {
   }
 
   async function renderChanges(force) {
-    const ranges = [{ key: "all", label: "All changes (base → branch)", from: "", to: "" }];
+    const ranges = [{ key: "all", label: task.kind === "review" ? "The change under review (merge-base → head)" : "All changes (base → branch)", from: "", to: "" }];
     for (const stage of task.stages) {
       for (const round of stage.rounds) {
         if (round.author?.commit) {

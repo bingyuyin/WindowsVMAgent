@@ -47,6 +47,16 @@ export interface TaskSummary {
   tests?: Pick<TestRunInfo, "status" | "total" | "passed" | "failed" | "skipped">;
   push?: Pick<PushInfo, "status" | "remote" | "branch" | "webUrl" | "reason">;
   pullRequest?: Pick<PullRequestInfo, "url" | "number" | "draft">;
+  /** Code review tasks: what is reviewed and where the review stands. */
+  review?: {
+    target: string;
+    pullRequest?: { number: number; url?: string };
+    comments: number;
+    kept: number;
+    agreed: boolean | null;
+    published: boolean;
+  };
+  peerReviewerModel?: string;
   needsInput: boolean;
   error?: string;
   stages: Array<{
@@ -113,6 +123,17 @@ export function summarizeTask(task: Task): TaskSummary {
       ? { status: task.push.status, remote: task.push.remote, branch: task.push.branch, webUrl: task.push.webUrl, reason: task.push.reason }
       : undefined,
     pullRequest: task.pullRequest ? { url: task.pullRequest.url, number: task.pullRequest.number, draft: task.pullRequest.draft } : undefined,
+    review: task.review
+      ? {
+          target: task.review.target.pullRequest ? `#${task.review.target.pullRequest.number}` : task.review.target.headRef,
+          pullRequest: task.review.target.pullRequest ? { number: task.review.target.pullRequest.number, url: task.review.target.pullRequest.url } : undefined,
+          comments: task.review.curated?.length ?? task.review.final?.comments.length ?? 0,
+          kept: task.review.curated?.filter((comment) => comment.decision === "keep").length ?? 0,
+          agreed: task.review.signoff ? task.review.signoff.agreed : null,
+          published: Boolean(task.review.publications?.some((publication) => publication.main)),
+        }
+      : undefined,
+    peerReviewerModel: task.peerReviewerModel,
     needsInput: Boolean(task.pendingInput),
     error: task.error,
     stages: task.stages.map((stage) => ({

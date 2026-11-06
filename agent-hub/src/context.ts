@@ -37,6 +37,8 @@ export const ROLE_SKILLS: Record<AgentRole, string[]> = {
   "code-reviewer": ["code-review"],
   executor: ["test-execution"],
   fixer: ["test-fixing", "coding-best-practices"],
+  "lead-reviewer": ["code-review"],
+  "peer-reviewer": ["code-review"],
 };
 
 /** Hub skills with the best practices of each technology, keyed by the stack labels `discoverContext` reports. */
@@ -54,7 +56,7 @@ const STACK_SKILLS: Record<string, string> = {
 };
 
 /** Roles that design, write, review or test code also apply the best practices of the repository's technologies. */
-const TECH_ROLES: ReadonlySet<AgentRole> = new Set(["designer", "design-reviewer", "coder", "resolver", "code-reviewer", "executor", "fixer"]);
+const TECH_ROLES: ReadonlySet<AgentRole> = new Set(["designer", "design-reviewer", "coder", "resolver", "code-reviewer", "executor", "fixer", "lead-reviewer", "peer-reviewer"]);
 
 export function techSkillsFor(stack: readonly string[]): string[] {
   return [...new Set(stack.map((label) => STACK_SKILLS[label]).filter((skill): skill is string => Boolean(skill)))];

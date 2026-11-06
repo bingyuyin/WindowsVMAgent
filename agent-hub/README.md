@@ -12,8 +12,9 @@ tests pass.
 | **Coding** | **Coder** implements the request with unit tests and gets them passing · the **manager re-runs the unit tests** and only then hands the round to the **Code reviewer** · the **Comment resolver** fixes review comments (same model as the coder by default) and gets the unit tests passing again before the next review, until the reviewer approves |
 | **Execute & verify** | **Test executor** runs the test automation and verifies the results · **Test fixer** fixes failures at the root cause · the executor re-runs and checks the fixes are legitimate, until everything passes |
 | **Design** | **Designer** writes the design document and revises it · **Design reviewer** critiques it until a finalized version is approved |
-| **Document** | **Technical writer** writes documentation grounded in the repository · **Doc reviewer** checks accuracy and clarity until it is approved |
+| **Document** | **Technical writer** writes documentation grounded in the repository (several documents when the request calls for them) · **Doc reviewer** checks accuracy and clarity until it is approved |
 | **Design → Coding** | Designer + design reviewer finalize the design, then coder + code reviewer + comment resolver implement it |
+| **Code review** | Reviews someone else's change - a **pull request** (number or URL) or a **branch** - with two reviewers, usually on different models: the **Lead reviewer** and the **Peer reviewer** review independently, respond to each other's findings, then the lead writes the final review and the peer signs off. You keep, drop or edit each comment and **publish** them on the pull request with one click (see [Code review](#code-review-two-reviewers-then-you-publish)) |
 
 Every sub-agent works on **its own branch** (reviewers and the test executor in their own worktree pinned
 to the commit under review/test), and every task has its own branches and worktrees, so **several tasks
@@ -160,6 +161,64 @@ and the round budget:
 - The task then completes again and its branch is pushed, so an open pull request picks up the change.
   The Result tab lists every change request with its status and the agent's response.
 
+## Code review: two reviewers, then you publish
+
+A **Code review** task reviews a change someone else wrote; it changes no code. Enter what to review:
+
+- a **pull request**: `#12`, `12`, `PR 12`, `!12` (GitLab) or its URL. The hub fetches its head from the
+  repository's remote that hosts it (`refs/pull/N/head` on GitHub and GitHub-like hosts,
+  `refs/merge-requests/N/head` on GitLab, `refs/pull/N/merge` on Azure DevOps; Bitbucket does not expose
+  pull requests to git, so review the source branch there) and fetches its target branch. URLs also match
+  remotes on custom domains and SSH host aliases. With the GitHub CLI signed in to the host (github.com,
+  GitHub Enterprise Cloud, or GitHub Enterprise Server on its own domain), the hub also reads the pull
+  request's title, description, author and target branch;
+- or a **branch, tag or commit** (`feature/login`, `origin/feature/login`), compared with the target branch
+  you pick (the repository's default branch by default). On GitHub, a branch with an open pull request is
+  reviewed like that pull request - against its target branch - and its review can be published there.
+
+The review covers `merge-base(target, head)..head`, the same change the pull request shows, and the hub
+keeps the reviewed head on a local branch `agent-hub/<task>-<title>` (never pushed). The optional focus
+tells the reviewers what to look at.
+
+1. **Independent reviews** (round 1, both reviewers in parallel, each in its own read-only worktree at the
+   head): each one reads the change, its context and the repository's guidance and calls
+   `submit_findings` with a summary of what the change does, an assessment, a verdict and comments
+   anchored to file and line (`L1`, `L2`, … for the lead; `P1`, `P2`, … for the peer).
+2. **Discussion** (round 2, in parallel): each reviewer responds to every comment of the other -
+   *agree*, *disagree* with evidence, or *refine* (better text, severity or line) - withdraws or revises its
+   own comments, and may add issues both missed (`submit_positions`).
+3. **Final review**: the lead merges duplicates, applies agreed refinements, decides disputed comments
+   and writes the final summary, assessment, verdict and comments `R1`, `R2`, …; every reviewer comment
+   must end up in a final comment or be dropped with a reason (`submit_final_review`).
+4. **Sign-off**: the peer accepts the final review or objects (`submit_signoff`). The lead revises for the
+   objections and the peer checks again, for up to the task's **Max final-review rounds** (default 3);
+   remaining objections are shown to you on the comments they concern.
+
+The **Review** tab then shows the **summary of the change** (what it does, files with line counts, the
+reviewers' assessment and whether both agree) and the **comments**, each with **Keep / Drop**, **✎ Update**
+(edit its text and severity; *Undo edit* restores the reviewers' version) and who raised it. Comments
+the final review left out (dropped or withdrawn) are listed with the reason and an **+ Add to review**
+button. Edit the review text and pick how to submit it (*Comment*, *Request changes*, *Approve*), then:
+
+- **Publish comments to pull request #N** (GitHub, with the GitHub CLI signed in to the host:
+  `gh auth login`) posts one review: comments on lines of the diff become inline comments, the others go
+  into the review's text. Nothing is posted until you click it. If GitHub rejects a line, every comment
+  goes into the review's text instead.
+- After publishing, keep curating: **Publish updates** applies your changes to the pull request - edited
+  comments are edited there, dropped ones deleted, new ones added in a follow-up review, and the review's
+  text updated - so the pull request always shows the latest version without duplicates. (If GitHub
+  created the review but the hub could not read back its comments' IDs, later edits of those comments are
+  made on GitHub; the hub says so and never posts the review twice.)
+- **Copy as Markdown** copies the whole review for hosts the hub can't publish to (Azure DevOps, GitLab,
+  Bitbucket) or for a branch without a pull request.
+
+The **Discussion** tab shows every round: each reviewer's findings, their stances on each other's
+comments, the final review with what was dropped and why, and the sign-offs. Both reviewers are monitored
+and recovered like any agent, a failed or cancelled review resumes from the last finished step on
+**Retry**, and code review tasks are never pushed. The lead reviewer uses the reviewer model, the peer
+reviewer the **Peer reviewer model** (Settings or the New task form; default: the author model); pick two
+different models for a real second opinion.
+
 ## Execute & verify: running test automation
 
 The testing stage (the **Execute & verify** task type, or chosen by the manager for Auto tasks) loops
@@ -251,6 +310,13 @@ the hub's local Mermaid copy may run) with a Rendered / HTML source toggle and a
 committed file includes a small Mermaid loader so diagrams also render when the file is opened directly.
 Designs go to `docs/designs/` and documents to `docs/` by default (both configurable).
 
+When a request calls for several documents (for example a guide per component, or a runbook plus an
+FAQ), the technical writer makes the configured file the main document and writes each further document
+next to it, linked from the main one; the doc reviewer reviews all of them. The tab then becomes
+**Documents (N)**: a list of every document the task wrote (deliverables first, with their stage and number
+of versions); click one to view it, version by version. Further HTML documents are rejected while they
+still contain template placeholders.
+
 ## Agents, branches and worktrees
 
 | What | Where |
@@ -260,6 +326,7 @@ Designs go to `docs/designs/` and documents to `docs/` by default (both configur
 | Author worktree | `data/worktrees/<task>/author` (authors switch to their own branch for their turn, so installed dependencies and build output are reused) |
 | Reviewer / planner worktree | `data/worktrees/<task>/review`, detached at the commit under review (the base commit for the planner) |
 | Test executor worktree | `data/worktrees/<task>/run`, detached at the commit under test; kept across runs so installed dependencies and build output are reused |
+| Code review tasks | lead reviewer in `data/worktrees/<task>/review`, peer reviewer in `data/worktrees/<task>/review-peer`, both detached at the reviewed head; the head is kept on the local branch `agent-hub/<task>-…` |
 
 Set **Agent isolation** to "own worktree and branch per agent" to give every sub-agent its own worktree
 (`data/worktrees/<task>/<role>`) at the cost of more disk and per-agent dependency installs. Tasks never
@@ -321,7 +388,7 @@ repository instructions and skills always take precedence:
 | --- | --- |
 | `coding-best-practices` | Coder, comment resolver, test fixer |
 | `review-comment-resolution` | Comment resolver |
-| `code-review` | Code reviewer |
+| `code-review` | Code reviewer, lead reviewer, peer reviewer |
 | `test-execution` | Test executor |
 | `test-fixing` | Test fixer |
 | `system-design` | Designer |
@@ -330,7 +397,7 @@ repository instructions and skills always take precedence:
 | `doc-review` | Doc reviewer |
 
 Technology skills apply to the agents that design, write, review or test code (designer, design reviewer,
-coder, comment resolver, code reviewer, test executor, test fixer), one per technology the hub detects
+coder, comment resolver, code reviewer, lead and peer reviewers, test executor, test fixer), one per technology the hub detects
 in the repository:
 
 | Skill | Detected from |
@@ -363,7 +430,9 @@ store. After a successful sign-in the hub restarts its runtime to load the new c
 ## Safety model
 
 - **Read-only reviewers and planner**: file writes are rejected. Shell commands are limited to read-only
-  tools and read-only git subcommands (`diff`, `log`, `show`, `status`, …).
+  tools and read-only git subcommands (`diff`, `log`, `show`, `status`, …). This includes both code review
+  reviewers; only the hub fetches pull requests and, when you click **Publish**, posts the review through
+  the GitHub CLI.
 - **Test executor**: may run any build/test command in its own pinned checkout, but file edits are
   rejected and git is limited to read-only subcommands (plus `submodule`/`lfs` to fetch test content).
 - **Authors** may write only inside their own worktree. `git push`, branch switching (`checkout <branch>`,
@@ -397,7 +466,8 @@ Environment variables:
 | `HUB_COPILOT_HOME` | `<data>/copilot-home` | Copilot runtime home (sessions, sign-in) |
 | `HUB_RUNTIME_LOG_LEVEL` | `error` | Copilot runtime log level |
 
-Settings page: default manager, author, comment-resolver/test-fixer and reviewer/test-executor models,
+Settings page: default manager, author, comment-resolver/test-fixer, reviewer/test-executor (also the lead
+reviewer of code reviews) and peer reviewer models,
 agent isolation (own branch per agent, or own worktree per agent), worktree cleanup on completion, pushing
 task branches when tasks complete (default on), max
 review rounds / test runs (default 3), parallel tasks (default and maximum 10; more tasks are queued; also adjustable live from the Tasks and Agents pages), agent turn timeout (default 90 minutes),
@@ -417,11 +487,12 @@ data/
   settings.json              settings
   repos.json                 registered repositories
   manager-log.jsonl          manager <-> sub-agent messages (Agents view; rotated at 8 MB)
-  tasks/<id>/task.json       last known state of the task (stages, rounds, comments, agents, result, change requests, push, pull request)
+  tasks/<id>/task.json       last known state of the task (stages, rounds, comments, agents, result, change requests, push, pull request; for code reviews the target, the discussion, the final review, your edits and what was published)
   tasks/<id>/events.jsonl    timeline (append-only)
-  tasks/<id>/doc-rN.html     design/document snapshot for round N (.md for Markdown documents)
+  tasks/<id>/doc-rN.html     design/document snapshot for round N (.md for Markdown documents; doc-rN-K.* for further documents)
   worktrees/<id>/author/     author agents' worktree (or <id>/<role>/ with per-agent worktrees)
   worktrees/<id>/review/     reviewer (and planner) worktree, detached at the reviewed commit
+  worktrees/<id>/review-peer/ code review tasks: the peer reviewer's worktree
   worktrees/<id>/run/        test executor worktree, detached at the commit under test
   worktrees/<id>/tmp/        temp folder of the manager's unit test runs (emptied before each run)
   repos/                     repositories cloned from a URL
@@ -444,13 +515,17 @@ deletes the task branch.
 | `GET /api/models` | Models available to the signed-in account |
 | `GET/PUT /api/settings` · `GET /api/storage` | Settings and where data is stored |
 | `GET/POST /api/repos` · `DELETE /api/repos/:id` · `GET /api/repos/:id/branches` | Repository registry |
-| `GET/POST /api/tasks` · `GET/DELETE /api/tasks/:id` | Tasks (`kind`: `auto`, `coding`, `testing`, `design`, `document`, `design-coding`; optional `managerModel` for Auto) |
+| `GET/POST /api/tasks` · `GET/DELETE /api/tasks/:id` | Tasks (`kind`: `auto`, `coding`, `testing`, `design`, `document`, `design-coding`, `review`; optional `managerModel` for Auto; `reviewTarget` (pull request number/URL or branch) and optional `peerReviewerModel` for Code review) |
 | `POST /api/tasks/:id/cancel` · `POST /api/tasks/:id/retry` · `POST /api/tasks/:id/input` | Control and answers |
 | `POST /api/tasks/:id/change-request` | Request further changes to a finished task (`request`, optional `stage` and `rounds`) |
 | `GET /api/tasks/:id/diff?from=&to=` | Changes |
 | `POST /api/tasks/:id/push` | Push the task branch to the remote now (retry, or with automatic pushes off) |
 | `GET /api/tasks/:id/pull-request` · `POST /api/tasks/:id/pull-request` | What the remote supports / open the pull request (returns it, or the host's `createUrl`) |
-| `GET /api/tasks/:id/doc?round=` · `GET /api/tasks/:id/doc/view?round=` | Design/document versions (JSON, or the sandboxed HTML page) |
+| `GET /api/tasks/:id/doc?round=&path=` · `GET /api/tasks/:id/doc/view?round=&path=` | Design/document versions (JSON, or the sandboxed HTML page); `path` picks one of several documents |
+| `PATCH /api/tasks/:id/review/comments/:commentId` · `POST /api/tasks/:id/review/comments` | Code review: keep/drop (`decision`), edit (`body`, `severity`) or undo an edit (`revert`) of a final comment; put a dropped reviewer comment back (`from`) |
+| `PUT /api/tasks/:id/review/summary` | Code review: the review's text (`body`) and, before publishing, its kind (`event`: `COMMENT`, `REQUEST_CHANGES`, `APPROVE`) |
+| `GET /api/tasks/:id/review/publish` · `POST /api/tasks/:id/review/publish` | Code review: whether and where it can be published (and pending changes) / publish it or its updates |
+| `GET /api/tasks/:id/review/markdown` | Code review as Markdown |
 | `GET /api/agents/overview?taskId=&limit=` | Manager state and its recent messages with sub-agents |
 | `GET /api/stream` · `GET /api/tasks/:id/stream?after=<seq>` | Server-Sent Events (global incl. manager messages / per task) |
 
@@ -459,7 +534,7 @@ Mutating requests must send `Content-Type: application/json`.
 ## Development
 
 ```powershell
-npm test             # node:test – workflow engine (scripted agents + real git), planning, unit-test gate, test execution, concurrency and isolation between tasks, documents, manager log, stuck-agent recovery, skills, storage, policy
+npm test             # node:test – workflow engine (scripted agents + real git), planning, unit-test gate, test execution, code review (discussion, curation, publishing), documents, concurrency and isolation between tasks, manager log, stuck-agent recovery, skills, storage, policy
 npm run typecheck    # tsc for src and tests
 npm run dev          # restart on file changes
 ```
@@ -469,7 +544,8 @@ src/
   main.ts                 wiring and graceful shutdown
   copilot/service.ts      CopilotClient lifecycle, sign-in flows, model catalog
   agents/                 driver interface, Copilot SDK driver, prompts, submit tools, permission policy
-  workflow/               runner (manager: queue, workspaces, monitoring, resume), engine (planning, sub-agent loops, unit-test gate, stuck-agent recovery), validation
+  workflow/               runner (manager: queue, workspaces, monitoring, resume, review curation), engine (planning, sub-agent loops, unit-test gate, code review discussion, stuck-agent recovery), validation
+  review/                 code review: targets (pull requests, branches), the reviewers' discussion rules, publishing (diff anchoring, GitHub CLI)
   http/                   dependency-free router, SSE, API routes, sandboxed document viewer
   context.ts              repository context discovery and hub skills
   docs.ts                 HTML document templates, validation and viewer preparation

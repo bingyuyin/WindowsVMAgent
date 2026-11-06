@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { git } from "./git.ts";
+import type { RemoteProvider } from "./types.ts";
 import { truncate } from "./util.ts";
 
-export type RemoteProvider = "github" | "azure-devops" | "gitlab" | "bitbucket" | "other";
+export type { RemoteProvider };
 
 /** A git remote, parsed enough to link to its web pages. URLs never carry credentials. */
 export interface RemoteDetails {
@@ -116,6 +117,33 @@ function azure(base: RemoteDetails, host: string, org: string, project: string, 
   return { ...base, provider: "azure-devops", host, webUrl, azure: { org, project, repo, base: webUrl } };
 }
 
+/**
+ * Host and repository path of any remote URL, lower-cased and without ".git" - also for hosts the hub does not
+ * recognize (GitHub Enterprise or GitLab on a custom domain, Gitea, SSH host aliases). Null for local paths.
+ */
+export function remoteLocation(remote: Pick<RemoteDetails, "url" | "host" | "slug">): { host: string; path: string } | null {
+  if (remote.host && remote.slug) return { host: remote.host.toLowerCase(), path: remote.slug.toLowerCase() };
+  let host: string;
+  let path: string;
+  const scp = /^[\w.-]+@([\w.-]+):(.+)$/.exec(remote.url);
+  if (scp && !/^[a-z]+:\/\//i.test(remote.url)) {
+    host = scp[1]!;
+    path = scp[2]!;
+  } else {
+    let parsed: URL;
+    try {
+      parsed = new URL(remote.url);
+    } catch {
+      return null;
+    }
+    if (!["http:", "https:", "ssh:", "git:"].includes(parsed.protocol)) return null;
+    host = parsed.hostname;
+    path = decodeURIComponent(parsed.pathname);
+  }
+  path = path.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+  return path ? { host: host.toLowerCase(), path: path.toLowerCase() } : null;
+}
+
 /** Web page of a branch on the remote's host. */
 export function branchWebUrl(remote: RemoteDetails, branch: string): string | null {
   if (!remote.webUrl) return null;
@@ -166,6 +194,19 @@ export async function primaryRemote(repoPath: string): Promise<RemoteDetails | n
   return url.code === 0 && url.stdout.trim() ? parseRemote(name, url.stdout.trim()) : null;
 }
 
+/** Every remote of the repository, "origin" first. */
+export async function listRemotes(repoPath: string): Promise<RemoteDetails[]> {
+  const list = await git(repoPath, ["remote"], { allowFailure: true });
+  const names = list.stdout.split(/\r?\n/).map((name) => name.trim()).filter(Boolean);
+  names.sort((a, b) => Number(b === "origin") - Number(a === "origin"));
+  const remotes: RemoteDetails[] = [];
+  for (const name of names) {
+    const url = await git(repoPath, ["remote", "get-url", name], { allowFailure: true });
+    if (url.code === 0 && url.stdout.trim()) remotes.push(parseRemote(name, url.stdout.trim()));
+  }
+  return remotes;
+}
+
 /** Pushes a local branch to the remote under the same name (fast-forward only; never forced). */
 export async function pushBranch(repoPath: string, remote: string, branch: string, timeoutMs = 5 * 60_000): Promise<void> {
   try {
@@ -206,11 +247,16 @@ export class GhPullRequestCreator implements PullRequestCreator {
   }
 }
 
-function repoArg(remote: RemoteDetails): string {
+export function ghRepoArg(remote: Pick<RemoteDetails, "host" | "slug">): string {
   return remote.host === "github.com" ? remote.slug! : `${remote.host}/${remote.slug}`;
 }
 
-function runGh(args: string[], options: { allowFailure?: boolean; input?: string } = {}): Promise<{ stdout: string; stderr: string; code: number }> {
+function repoArg(remote: RemoteDetails): string {
+  return ghRepoArg(remote);
+}
+
+/** Runs the GitHub CLI non-interactively; rejects with a readable error unless `allowFailure`. */
+export function runGh(args: string[], options: { allowFailure?: boolean; input?: string } = {}): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve, reject) => {
     const child = execFile(
       "gh",
