@@ -9,6 +9,7 @@ import {
   copyText,
   duration,
   h,
+  isCodeReviewTask,
   isDocStage,
   isReviewerRole,
   KIND_LABELS,
@@ -294,7 +295,7 @@ export function taskDetailView(root, { params }) {
 
   /** Auto tasks: what the manager decided - which stages (sub-agent teams) to run and each team's assignment. */
   function renderPlan() {
-    const signature = JSON.stringify([task.kind, task.plan, task.status, task.phase]);
+    const signature = JSON.stringify([task.kind, task.plan, task.status, task.phase, task.review?.target]);
     if (signatures.plan === signature) return;
     signatures.plan = signature;
     if (task.kind !== "auto") {
@@ -317,6 +318,9 @@ export function taskDetailView(root, { params }) {
       );
       return;
     }
+    const plannedReview = plan.review;
+    const reviewTarget = task.review?.target;
+    const reviewStatus = task.status === "completed" ? "approved" : ACTIVE.includes(task.status) ? "running" : task.status === "failed" ? "failed" : "pending";
     setContent(
       planBox,
       h(
@@ -327,46 +331,68 @@ export function taskDetailView(root, { params }) {
           { class: "plan-head" },
           h("span", { class: "plan-badge", "aria-hidden": "true" }, "◆"),
           h("strong", {}, "Manager's plan"),
-          plan.fallback ? chip("derived from keywords", "warning", "The planner did not submit a plan; the hub chose stages from the request") : null,
+          plan.fallback ? chip("derived from keywords", "warning", "The planner did not submit a plan; the hub chose from the request") : null,
           h("span", { class: "spacer" }),
           h("span", { class: "muted small" }, plan.plannedAt ? `planned ${clock(plan.plannedAt)}` : ""),
         ),
         h(
           "div",
           { class: "plan-flow" },
-          plan.stages.map((stage, index) => [
-            index ? h("span", { class: "plan-arrow", "aria-hidden": "true" }, "→") : null,
-            h(
-              "span",
-              { class: `plan-stage plan-${task.stages.find((candidate) => candidate.kind === stage)?.status ?? "pending"}` },
-              STAGE_LABELS[stage],
-              h("span", { class: "plan-roles" }, rolesForTask({ kind: "auto", plan: { stages: [stage] } }).slice(1).map((role) => ROLE_LABELS[role]).join(" · ")),
-            ),
-          ]),
+          plannedReview
+            ? h(
+                "span",
+                { class: `plan-stage plan-${reviewStatus}` },
+                "Code review",
+                h("span", { class: "plan-roles" }, `${ROLE_LABELS["lead-reviewer"]} · ${ROLE_LABELS["peer-reviewer"]}`),
+              )
+            : plan.stages.map((stage, index) => [
+                index ? h("span", { class: "plan-arrow", "aria-hidden": "true" }, "→") : null,
+                h(
+                  "span",
+                  { class: `plan-stage plan-${task.stages.find((candidate) => candidate.kind === stage)?.status ?? "pending"}` },
+                  STAGE_LABELS[stage],
+                  h("span", { class: "plan-roles" }, rolesForTask({ kind: "auto", plan: { stages: [stage] } }).slice(1).map((role) => ROLE_LABELS[role]).join(" · ")),
+                ),
+              ]),
         ),
         h("p", { class: "plan-rationale" }, plan.rationale),
+        plannedReview
+          ? h(
+              "p",
+              { class: "small" },
+              h("span", { class: "muted" }, "Reviewing "),
+              reviewTarget ? reviewTargetLabel(reviewTarget) : h("span", { class: "mono" }, plannedReview.target),
+            )
+          : null,
         plan.briefing
           ? h("details", { class: "plan-assignments" }, h("summary", {}, "Briefing on the repository the manager gave every sub-agent"), h("div", { class: "plan-assignment" }, renderMarkdown(plan.briefing)))
           : null,
-        plan.stages.some((stage) => plan.instructions?.[stage])
+        plannedReview?.instructions
           ? h(
               "details",
               { class: "plan-assignments" },
-              h("summary", {}, "Assignments the manager gave each team"),
-              plan.stages.map((stage) =>
-                plan.instructions?.[stage]
-                  ? h("div", { class: "plan-assignment" }, h("div", { class: "label" }, `${STAGE_LABELS[stage]} team`), renderMarkdown(plan.instructions[stage]))
-                  : null,
-              ),
+              h("summary", {}, "Assignment the manager gave the reviewers"),
+              h("div", { class: "plan-assignment" }, renderMarkdown(plannedReview.instructions)),
             )
-          : null,
+          : plan.stages.some((stage) => plan.instructions?.[stage])
+            ? h(
+                "details",
+                { class: "plan-assignments" },
+                h("summary", {}, "Assignments the manager gave each team"),
+                plan.stages.map((stage) =>
+                  plan.instructions?.[stage]
+                    ? h("div", { class: "plan-assignment" }, h("div", { class: "label" }, `${STAGE_LABELS[stage]} team`), renderMarkdown(plan.instructions[stage]))
+                    : null,
+                ),
+              )
+            : null,
       ),
     );
   }
 
   function renderTitle() {
     const status = statusInfo(task);
-    const review = task.kind === "review";
+    const review = isCodeReviewTask(task);
     const actions = [];
     if (ACTIVE.includes(task.status)) actions.push(h("button", { class: "btn btn-danger-outline", onclick: cancelTask }, "Cancel"));
     if (["failed", "cancelled", "interrupted"].includes(task.status)) actions.push(h("button", { class: "btn btn-primary", onclick: () => retryTask(false) }, "Retry"));
@@ -390,8 +416,9 @@ export function taskDetailView(root, { params }) {
   function renderMeta() {
     const usage = task.usage ?? {};
     const usageText = `${compactNumber(usage.premiumRequests)} premium req · ${compactNumber((usage.inputTokens ?? 0) + (usage.outputTokens ?? 0))} tokens · ${usage.modelCalls ?? 0} calls`;
-    if (task.kind === "review") {
+    if (isCodeReviewTask(task)) {
       const target = task.review?.target;
+      const manager = task.kind === "auto" && task.managerModel ? `manager ${task.managerModel} · ` : "";
       setContent(
         metaBox,
         meta("Repository", task.repoName),
@@ -402,7 +429,7 @@ export function taskDetailView(root, { params }) {
           task.review?.shortStat ? h("div", { class: "muted small" }, `${task.review.shortStat}${task.review.commits ? ` · ${task.review.commits} commit(s)` : ""}`) : null,
         ),
         meta("Local branch", task.branch ? [h("span", { class: "mono" }, task.branch), " ", copyButton(task.branch)] : "—", h("div", { class: "muted small" }, "points at the reviewed head")),
-        meta("Models", h("span", { class: "mono small" }, `lead ${task.reviewerModel} · peer ${task.peerReviewerModel || task.authorModel}`)),
+        meta("Models", h("span", { class: "mono small" }, `${manager}lead ${task.reviewerModel} · peer ${task.peerReviewerModel || task.authorModel}`)),
         meta("Final-review rounds", `up to ${task.roundsBudget ?? task.maxRounds}${task.attempt > 1 ? ` · attempt ${task.attempt}` : ""}`),
         meta("Duration", task.startedAt ? duration(task.startedAt, ACTIVE.includes(task.status) ? null : task.finishedAt) : "—"),
         meta("Usage", usageText),
@@ -523,7 +550,7 @@ export function taskDetailView(root, { params }) {
       );
       return;
     }
-    if (status === "completed" && task.result && task.kind === "review") {
+    if (status === "completed" && task.result && isCodeReviewTask(task)) {
       renderReviewHero();
       return;
     }
@@ -685,7 +712,7 @@ export function taskDetailView(root, { params }) {
 
   /** Where the task branch stands on the remote, plus the push and pull request actions (hero and Result tab). */
   function renderDelivery() {
-    if (!task || task.status !== "completed" || !task.result || task.kind === "review") return;
+    if (!task || task.status !== "completed" || !task.result || isCodeReviewTask(task)) return;
     refreshRemoteInfo();
     setContent(deliveryHero, deliveryContent());
     setContent(deliveryResult, deliveryContent());
@@ -918,7 +945,7 @@ export function taskDetailView(root, { params }) {
   }
 
   function renderPipeline() {
-    if (task.kind === "review") {
+    if (isCodeReviewTask(task)) {
       renderReviewPipeline();
       return;
     }
@@ -1128,7 +1155,7 @@ export function taskDetailView(root, { params }) {
     const docStage = task.stages.find((stage) => isDocStage(stage.kind));
     const documentCount = documentsOfTask().length;
     const tabs =
-      task.kind === "review"
+      isCodeReviewTask(task)
         ? [
             ["review", "Review"],
             ["discussion", "Discussion"],
@@ -2211,7 +2238,7 @@ export function taskDetailView(root, { params }) {
   }
 
   async function renderChanges(force) {
-    const ranges = [{ key: "all", label: task.kind === "review" ? "The change under review (merge-base → head)" : "All changes (base → branch)", from: "", to: "" }];
+    const ranges = [{ key: "all", label: isCodeReviewTask(task) ? "The change under review (merge-base → head)" : "All changes (base → branch)", from: "", to: "" }];
     for (const stage of task.stages) {
       for (const round of stage.rounds) {
         if (round.author?.commit) {

@@ -42,8 +42,8 @@ export interface TaskSummary {
   shortStat?: string;
   openComments?: number;
   docPath?: string;
-  /** Auto tasks: the stages the manager planned (agents are created per stage). */
-  plan?: { stages: StageKind[]; rationale: string; fallback?: boolean };
+  /** Auto tasks: the stages the manager planned (agents are created per stage), or the change it planned to review. */
+  plan?: { stages: StageKind[]; rationale: string; fallback?: boolean; review?: { target: string } };
   tests?: Pick<TestRunInfo, "status" | "total" | "passed" | "failed" | "skipped">;
   push?: Pick<PushInfo, "status" | "remote" | "branch" | "webUrl" | "reason">;
   pullRequest?: Pick<PullRequestInfo, "url" | "number" | "draft">;
@@ -109,7 +109,14 @@ export function summarizeTask(task: Task): TaskSummary {
     shortStat: task.result?.shortStat,
     openComments: task.result?.openComments,
     docPath: task.result?.docPath ?? task.stages.find((stage) => stage.docPath)?.docPath,
-    plan: task.plan ? { stages: task.plan.stages, rationale: task.plan.rationale, fallback: task.plan.fallback } : undefined,
+    plan: task.plan
+      ? {
+          stages: task.plan.stages,
+          rationale: task.plan.rationale,
+          fallback: task.plan.fallback,
+          ...(task.plan.review ? { review: { target: task.plan.review.target } } : {}),
+        }
+      : undefined,
     tests: task.result?.tests
       ? {
           status: task.result.tests.status,

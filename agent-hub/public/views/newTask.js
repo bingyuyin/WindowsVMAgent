@@ -7,8 +7,8 @@ const TYPES = [
   {
     id: "auto",
     title: "Auto",
-    text: "The manager agent reads your request and the repository, then decides which sub-agents to create (design, coding, test execution & fixing, documentation), gives each its assignment and monitors them.",
-    placeholder: "Describe what you need in plain words, e.g. \"Add retry support to the uploader and make sure the Pester tests pass\" or \"Run the end-to-end automation and fix the failures\"…",
+    text: "The manager agent reads your request and the repository, then decides which sub-agents to create (design, coding, test execution & fixing, documentation; or a lead and a peer reviewer when you ask to review a pull request or branch), gives each its assignment and monitors them.",
+    placeholder: "Describe what you need in plain words, e.g. \"Add retry support to the uploader and make sure the Pester tests pass\", \"Run the end-to-end automation and fix the failures\" or \"Review pull request #42, focusing on error handling\"…",
   },
   {
     id: "coding",
@@ -79,7 +79,8 @@ export function newTaskView(root) {
   const reviewerLabel = h("span", { class: "field-label" }, "Reviewer / test executor model");
   const resolverField = h("label", { class: "field" }, h("span", { class: "field-label" }, "Comment resolver / test fixer model"), resolverSelect);
   const managerField = h("label", { class: "field" }, h("span", { class: "field-label" }, "Manager model (plans the task)"), managerSelect);
-  const peerField = h("label", { class: "field", hidden: true }, h("span", { class: "field-label" }, "Peer reviewer model"), peerSelect);
+  const peerLabel = h("span", { class: "field-label" }, "Peer reviewer model");
+  const peerField = h("label", { class: "field", hidden: true }, peerLabel, peerSelect);
   const roundsLabel = h("span", { class: "field-label" }, "Max review rounds / test runs");
   const roundsInput = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(state.settings?.maxRounds ?? 3) });
   const advanced = h("details", { class: "advanced" });
@@ -155,7 +156,9 @@ export function newTaskView(root) {
     authorField.hidden = review;
     resolverField.hidden = review || kind === "design" || kind === "document";
     managerField.hidden = kind !== "auto";
-    peerField.hidden = !review;
+    // Auto tasks become code reviews when the manager plans one, so their peer reviewer model is offered too.
+    peerField.hidden = !review && kind !== "auto";
+    peerLabel.textContent = review ? "Peer reviewer model" : "Peer reviewer model (when the manager plans a code review)";
     reviewerLabel.textContent = review ? "Lead reviewer model" : "Reviewer / test executor model";
     roundsLabel.textContent = review ? "Max final-review rounds (lead ↔ peer)" : "Max review rounds / test runs";
     if (review) advanced.open = true;
@@ -241,7 +244,7 @@ export function newTaskView(root) {
         reviewerModel: reviewerSelect.value || undefined,
         resolverModel: review || kind === "design" || kind === "document" ? undefined : resolverSelect.value || undefined,
         managerModel: kind === "auto" ? managerSelect.value || undefined : undefined,
-        peerReviewerModel: review ? peerSelect.value || undefined : undefined,
+        peerReviewerModel: review || kind === "auto" ? peerSelect.value || undefined : undefined,
         maxRounds: Number(roundsInput.value) || undefined,
       });
       toast(`Created ${task.id}`, "success");

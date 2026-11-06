@@ -10,7 +10,7 @@ import {
   type Task,
 } from "../types.ts";
 import { truncate } from "../util.ts";
-import { contextBlock } from "./prompts.ts";
+import { briefingBlock, contextBlock } from "./prompts.ts";
 
 /** Diffs up to this size are inlined in the reviewers' first prompt; larger ones are truncated (the rest is in git). */
 export const MAX_REVIEW_DIFF = 120_000;
@@ -70,7 +70,7 @@ function requestBlock(task: Task): string {
     lines.push(`- The change is git diff ${short(task.baseSha ?? "")}..${short(target.headSha)} (merge-base with ${target.baseRef} → head); your worktree is pinned to the head.`);
     if (pr?.body?.trim()) lines.push("", "Pull request description:", "", quote(truncate(pr.body, 6000)));
   }
-  lines.push("", "## The user's focus", "", task.description.trim());
+  lines.push("", task.kind === "review" ? "## The user's focus" : "## The request", "", task.description.trim());
   return lines.join("\n");
 }
 
@@ -96,6 +96,11 @@ function preamble(input: ReviewTurnBase): string[] {
   const parts = [requestBlock(task)];
   const context = contextBlock(input.context, input.role);
   if (context) parts.push(context);
+  // Auto tasks: what the manager learned while planning the review, and what it asks the reviewers to focus on.
+  const briefing = briefingBlock(task);
+  if (briefing) parts.push(briefing);
+  const assignment = task.plan?.review?.instructions.trim();
+  if (assignment) parts.push(["", "## Manager's assignment for the review", "", assignment].join("\n"));
   if (task.review && task.baseSha) parts.push(changeBlock(input.change, task.baseSha, task.review.target.headSha));
   parts.push("");
   return parts;

@@ -297,6 +297,21 @@ async function commitOf(repoPath: string, ref: string): Promise<string | null> {
   return result.code === 0 && sha ? sha : null;
 }
 
+/** The branch changes merge into by default: the primary remote's default branch, else the registered one, else main or master. */
+export async function defaultBranchOf(repoPath: string, registered?: string): Promise<string> {
+  const remote = await primaryRemote(repoPath);
+  if (remote) {
+    const head = await git(repoPath, ["symbolic-ref", "--quiet", "--short", `refs/remotes/${remote.name}/HEAD`], { allowFailure: true });
+    const name = head.stdout.trim();
+    if (head.code === 0 && name.startsWith(`${remote.name}/`)) return name.slice(remote.name.length + 1);
+  }
+  if (registered && registered !== "HEAD") return registered;
+  for (const candidate of ["main", "master"]) {
+    if (await commitOf(repoPath, `refs/heads/${candidate}`)) return candidate;
+  }
+  return "main";
+}
+
 async function mergeBase(repoPath: string, a: string, b: string, what: string): Promise<string> {
   try {
     const sha = (await git(repoPath, ["merge-base", a, b])).stdout.trim();

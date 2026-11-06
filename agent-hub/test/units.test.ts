@@ -31,6 +31,7 @@ import {
   normalizeTestRun,
   normalizeUnitTests,
   normalizeWork,
+  reviewTargetIn,
 } from "../src/workflow/submissions.ts";
 
 const cwd = path.resolve("/work/tree");
@@ -228,6 +229,44 @@ describe("manager plans", () => {
     assert.deepEqual(heuristicPlan("Run the test automation in tests/ and verify the results").stages, ["testing"]);
     assert.deepEqual(heuristicPlan("Design and implement a retry policy, then document it").stages, ["design", "coding", "document"]);
     assert.deepEqual(heuristicPlan("Something vague").stages, ["coding"]);
+  });
+
+  test("a request to review a pull request or branch gets the code review team, never the test executor", () => {
+    const plan = normalizePlan({
+      stages: ["Code Review"],
+      review_target: " PR 12 ",
+      review_base: "refs/heads/develop",
+      rationale: "The request is to review pull request #12",
+      instructions: { review: "Focus on error handling", testing: "ignored" },
+      briefing: "src/calc.js holds the math",
+    });
+    assert.deepEqual(plan.stages, []);
+    assert.deepEqual(plan.review, { target: "PR 12", base: "develop", instructions: "Focus on error handling" });
+    assert.deepEqual(plan.instructions, {});
+    assert.equal(normalizePlan({ stages: ["pr-review"], review_target: "feature/x", rationale: "r", instructions: { review: "x" }, briefing: "b" }).review?.base, undefined);
+    const review = { review_target: "#12", rationale: "r", instructions: { review: "x" }, briefing: "b" };
+    assert.throws(() => normalizePlan({ ...review, stages: ["review", "testing"] }), /A code review stands alone: .*submit stages \["review"\] only/);
+    assert.throws(() => normalizePlan({ ...review, stages: ["review"], review_target: "" }), /`review_target` is required with the review stage/);
+    assert.throws(() => normalizePlan({ ...review, stages: ["review"], review_target: "the pull request" }), /review_target: .*neither a pull request nor a branch/);
+    assert.throws(() => normalizePlan({ ...review, stages: ["review"], instructions: {} }), /instructions\.review is required/);
+    assert.throws(() => normalizePlan({ ...review, stages: ["review"], review_base: "main branch" }), /`review_base` must be a branch name/);
+
+    // The keyword fallback: review requests name what to review; addressing review feedback is coding.
+    assert.deepEqual(heuristicPlan("Review pull request #7 for error handling").review, { target: "#7", instructions: "Review pull request #7 for error handling" });
+    assert.deepEqual(heuristicPlan("Review pull request #7 for error handling").stages, []);
+    assert.equal(heuristicPlan("Can you do a code review of https://github.com/acme/calc/pull/42?").review?.target, "https://github.com/acme/calc/pull/42");
+    assert.equal(heuristicPlan("Please review PR 15, which should fix the login bug").review?.target, "#15");
+    assert.equal(heuristicPlan("Review !5 before we merge").review?.target, "!5");
+    assert.deepEqual(heuristicPlan("Review the branch feature/login against develop").review, {
+      target: "feature/login",
+      base: "develop",
+      instructions: "Review the branch feature/login against develop",
+    });
+    assert.equal(heuristicPlan("Address the review comments on PR #12").review, undefined);
+    assert.deepEqual(heuristicPlan("Address the review comments on PR #12").stages, ["coding"]);
+    assert.equal(heuristicPlan("Implement retries; the code review module needs them").review, undefined);
+    assert.throws(() => heuristicPlan("Please review my changes"), /asks for a code review but names no pull request or branch/);
+    assert.deepEqual(reviewTargetIn("see #3 and https://github.com/a/b/pull/9."), { target: "https://github.com/a/b/pull/9" });
   });
 
   test("roles follow the plan; the planner and executor work in pinned checkouts", () => {

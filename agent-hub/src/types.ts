@@ -535,9 +535,21 @@ export interface TaskPlan {
   instructions: Partial<Record<StageKind, string>>;
   /** What the manager learned about the repository while planning; every sub-agent starts with it. */
   briefing?: string;
+  /** The request is to review an existing change: the manager assigned the two code reviewers instead of stages. */
+  review?: PlannedReview;
   /** True when the planner never submitted a plan and the hub derived one from the request. */
   fallback?: boolean;
   plannedAt: string;
+}
+
+/** A code review the manager planned for an Auto task. */
+export interface PlannedReview {
+  /** The pull request (number or URL) or the branch to review, as the manager named it. */
+  target: string;
+  /** Branch the change is compared with, when the manager named one (pull requests use their own target branch). */
+  base?: string;
+  /** The manager's assignment for the reviewers: what to focus on. */
+  instructions: string;
 }
 
 /** Last attempt to push the task branch to the repository's remote. */
@@ -715,6 +727,11 @@ export function stagesFor(kind: TaskKind): StageKind[] {
 /** Stages a task runs: the manager's plan for Auto tasks, otherwise fixed by the task kind. */
 export function stageKindsOf(task: Pick<Task, "kind" | "plan">): StageKind[] {
   return task.plan?.stages ?? stagesFor(task.kind);
+}
+
+/** A code review of an existing change: a Code review task, or an Auto task the manager planned as one. */
+export function isCodeReview(task: Pick<Task, "kind" | "review">): boolean {
+  return task.kind === "review" || Boolean(task.review);
 }
 
 /** Stages whose deliverable is a document (design doc or other documentation) rather than code. */

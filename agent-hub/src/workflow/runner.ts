@@ -6,7 +6,7 @@ import { describeContext, discoverContext, type HubSkills } from "../context.ts"
 import { formatOfPath, type DocTemplates } from "../docs.ts";
 import { branchWebUrl, primaryRemote, pullRequestPageUrl, pushBranch, sanitizeRemoteUrl, type PullRequestCreator } from "../remote.ts";
 import { commentableLines, pendingChanges, publishReview, REVIEW_EVENTS, reviewMarkdown, type ReviewPublisher } from "../review/publish.ts";
-import { resolveReviewTarget, type PullRequestLookup } from "../review/target.ts";
+import { defaultBranchOf, resolveReviewTarget, type PullRequestLookup, type ResolvedReviewTarget } from "../review/target.ts";
 import type { CommandRunner } from "../shell.ts";
 import {
   deleteBranch,
@@ -23,6 +23,7 @@ import {
 import type { Store } from "../store.ts";
 import {
   ACTIVE_STATUSES,
+  isCodeReview,
   isDocStage,
   MAX_PARALLEL_TASKS,
   ROLE_LABELS,
@@ -51,7 +52,7 @@ import {
   type TaskKind,
 } from "../types.ts";
 import { CancelledError, errorMessage, firstLine, HttpError, KeyedMutex, nowIso, randomId, slugify, truncate } from "../util.ts";
-import { modelFor, WorkflowEngine, type EngineHooks } from "./engine.ts";
+import { modelFor, reviewedChange, WorkflowEngine, type EngineHooks } from "./engine.ts";
 import { summarizeTask } from "./summary.ts";
 
 export interface SubmitTaskInput {
@@ -239,7 +240,8 @@ export class TaskRunner {
     const reviewerModel = (input.reviewerModel || settings.reviewerModel || authorModel).trim();
     const resolverModel = (input.resolverModel || settings.resolverModel || authorModel).trim();
     const managerModel = input.kind === "auto" ? (input.managerModel || settings.managerModel || authorModel).trim() : undefined;
-    const peerReviewerModel = isReview ? (input.peerReviewerModel || settings.peerReviewerModel || authorModel || reviewerModel).trim() : undefined;
+    const peerReviewerModel =
+      isReview || input.kind === "auto" ? (input.peerReviewerModel || settings.peerReviewerModel || authorModel || reviewerModel).trim() : undefined;
     if (isReview) {
       if (!reviewerModel || !peerReviewerModel) throw new HttpError(400, "Choose the lead and peer reviewer models first");
       authorModel ||= peerReviewerModel;
@@ -259,7 +261,7 @@ export class TaskRunner {
         if (!target) throw new Error("Enter the pull request (number or URL) or the branch to review");
         const resolved = await resolveReviewTarget(repo.path, target, {
           baseRef: input.baseRef?.trim() || undefined,
-          defaultBranch: repo.defaultBranch && repo.defaultBranch !== "HEAD" ? repo.defaultBranch : (info.branch ?? "main"),
+          defaultBranch: await defaultBranchOf(repo.path, repo.defaultBranch),
           lookup: this.deps.reviewHost,
         });
         review = { target: resolved.target, rounds: [], comments: [] };
@@ -363,7 +365,7 @@ export class TaskRunner {
   retry(id: string, extraRounds?: number): Task {
     const task = this.get(id);
     const unapproved = task.status === "completed" && task.result?.approved === false;
-    if (task.kind === "review" && task.status === "completed") {
+    if (isCodeReview(task) && task.status === "completed") {
       throw new HttpError(409, "This code review is finished: keep, drop or edit its comments and publish them, or start a new review");
     }
     if (!["failed", "cancelled", "interrupted"].includes(task.status) && !unapproved) {
@@ -388,7 +390,7 @@ export class TaskRunner {
    */
   requestChanges(id: string, input: { request: string; stage?: string; rounds?: number }): Task {
     const task = this.get(id);
-    if (task.kind === "review") throw new HttpError(409, "Code review tasks do not change code: edit, keep or drop the review's comments instead");
+    if (isCodeReview(task)) throw new HttpError(409, "Code review tasks do not change code: edit, keep or drop the review's comments instead");
     if (this.running.has(id) || task.status !== "completed") throw new HttpError(409, "Changes can be requested once the task has finished");
     const text = (input.request ?? "").trim();
     if (!text) throw new HttpError(400, "Describe the changes you want");
@@ -613,7 +615,7 @@ export class TaskRunner {
   /** Pushes the task branch now (e.g. after a failed automatic push, or with automatic pushes turned off). */
   async pushNow(id: string): Promise<Task> {
     const task = this.get(id);
-    if (task.kind === "review") throw new HttpError(409, "Code review tasks review an existing change; they have no branch of their own to push");
+    if (isCodeReview(task)) throw new HttpError(409, "Code review tasks review an existing change; they have no branch of their own to push");
     if (this.running.has(id) || ACTIVE_STATUSES.includes(task.status)) throw new HttpError(409, "Wait until the task has finished before pushing its branch");
     if (task.push?.status === "pushing") throw new HttpError(409, "The branch is being pushed right now");
     await this.pushTask(task, false);
@@ -626,7 +628,7 @@ export class TaskRunner {
    */
   async pullRequest(id: string): Promise<PullRequestOutcome> {
     const task = this.get(id);
-    if (task.kind === "review") throw new HttpError(409, "Code review tasks review an existing change; publish the review's comments instead");
+    if (isCodeReview(task)) throw new HttpError(409, "Code review tasks review an existing change; publish the review's comments instead");
     if (this.running.has(id) || ACTIVE_STATUSES.includes(task.status)) throw new HttpError(409, "Wait until the task has finished before opening a pull request");
     if (task.pullRequest) return { pullRequest: task.pullRequest, message: `Pull request ${prName(task.pullRequest)} already exists` };
     const repo = this.deps.store.getRepo(task.repoId);
@@ -689,7 +691,7 @@ export class TaskRunner {
 
   private finishedReview(id: string): { task: Task; review: CodeReview; curated: CuratedComment[] } {
     const task = this.get(id);
-    if (task.kind !== "review" || !task.review) throw new HttpError(404, "This task is not a code review");
+    if (!task.review) throw new HttpError(404, "This task is not a code review");
     if (task.status !== "completed" || !task.review.curated) throw new HttpError(409, "The reviewers have not finished the review yet");
     return { task, review: task.review, curated: task.review.curated };
   }
@@ -917,6 +919,11 @@ export class TaskRunner {
         docTemplates: this.deps.docTemplates,
         runCommand: this.deps.runCommand,
         testRuns: { busy: () => this.repoLocks.busy(testRunsKey), run: (work) => this.repoLocks.run(testRunsKey, work) },
+        codeReviews: {
+          resolve: async (target, base) =>
+            resolveReviewTarget(repo.path, target, { baseRef: base, defaultBranch: await defaultBranchOf(repo.path, repo.defaultBranch), lookup: this.deps.reviewHost }),
+          adopt: (resolved) => this.adoptPlannedReview(task, repo, resolved),
+        },
       });
       entry.engine = engine;
       await engine.run();
@@ -951,7 +958,7 @@ export class TaskRunner {
       this.heartbeatsPublished.delete(task.id);
       this.publish(task);
       this.pump();
-      if (task.status === "completed" && store.settings.pushOnComplete && task.kind !== "review" && !this.shuttingDown) this.afterTask(this.pushTask(task, true));
+      if (task.status === "completed" && store.settings.pushOnComplete && !isCodeReview(task) && !this.shuttingDown) this.afterTask(this.pushTask(task, true));
     }
   }
 
@@ -993,6 +1000,36 @@ export class TaskRunner {
       isolation: task.isolation ?? this.deps.store.settings.isolation,
       lock: (work) => this.repoLocks.run(repo.path, work),
     });
+  }
+
+  /**
+   * Turns an Auto task the manager planned as a code review into that review: the task branch points at the reviewed
+   * head (the planner only read the repository, so the branch has nothing of its own), the base becomes the
+   * merge-base and the repository context is that of the reviewed change. Returns the reviewers' workspace.
+   */
+  private async adoptPlannedReview(task: Task, repo: Repo, resolved: ResolvedReviewTarget): Promise<GitTaskWorkspace> {
+    const { target, baseSha } = resolved;
+    const context = await discoverContext(repo.path, target.headSha);
+    await this.repoLocks.run(repo.path, async () => {
+      const ref = `refs/heads/${task.branch}`;
+      const current = await resolveCommit(repo.path, ref).catch(() => null);
+      if (current && current !== task.baseSha && current !== target.headSha) {
+        throw new Error(`The task branch ${task.branch} already has commits, so the task cannot become a code review; create a Code review task instead`);
+      }
+      await git(repo.path, ["update-ref", ref, target.headSha]);
+    });
+    task.review = { target, rounds: [], comments: [] };
+    task.baseSha = baseSha;
+    task.baseRef = target.baseRef;
+    task.context = context;
+    this.emit(task, {
+      type: "info",
+      text: `Reviewing ${reviewedChange(target)} (${target.headSha.slice(0, 10)}) against ${target.baseRef}: the task branch ${task.branch} now points at the reviewed head`,
+    });
+    this.emit(task, { type: "info", text: `Repository context of the reviewed change: ${describeContext(context)}`, data: { context: true } });
+    this.comm(task, { from: "manager", to: "manager", kind: "lifecycle", text: `Fetched ${reviewedChange(target)} (${target.headSha.slice(0, 10)}) to review against ${target.baseRef}` });
+    this.publish(task);
+    return this.workspaceFor(task, repo);
   }
 
   private async prepareWorkspace(task: Task, repo: Repo): Promise<GitTaskWorkspace> {
@@ -1272,7 +1309,7 @@ function clampInt(value: unknown, min: number, max: number): number {
 
 function completionText(task: Task): string {
   const result = task.result;
-  if (task.kind === "review") {
+  if (isCodeReview(task)) {
     const comments = result?.openComments ?? 0;
     return `Completed: code review ready with ${comments} comment(s) (${result?.approved ? "both reviewers agree" : "the reviewers did not fully agree"}); review and publish them`;
   }

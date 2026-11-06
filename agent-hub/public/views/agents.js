@@ -2,6 +2,7 @@ import {
   chip,
   clock,
   h,
+  isCodeReviewTask,
   KIND_LABELS,
   phaseLabel,
   relTime,
@@ -135,12 +136,12 @@ function taskLine(task) {
   if (task.status === "needs-input") return "Waiting for your answer";
   if (task.status === "running") {
     if (task.phase === "planning") return "Manager is planning the sub-agents";
-    if (task.kind === "review") return `${task.phase === "reviewing" ? "Reviewing the change independently" : phaseLabel(task.currentStage, task.phase)}${task.currentRound ? ` · round ${task.currentRound}` : ""}`;
+    if (isCodeReviewTask(task)) return `${task.phase === "reviewing" ? "Reviewing the change independently" : phaseLabel(task.currentStage, task.phase)}${task.currentRound ? ` · round ${task.currentRound}` : ""}`;
     const budget = task.roundsBudget ?? task.maxRounds;
     return `${phaseLabel(task.currentStage, task.phase)}${task.currentRound ? ` · round ${task.currentRound}/${Math.max(budget, task.currentRound)}` : ""}`;
   }
   if (task.status === "completed") {
-    if (task.kind === "review") {
+    if (isCodeReviewTask(task)) {
       const review = task.review;
       return review ? `${review.published ? "Review published" : "Review ready"}: keeping ${review.kept} of ${review.comments} comment(s)` : "Review ready";
     }
@@ -656,10 +657,10 @@ export function agentsView(root) {
                   h("div", { class: "pipe-sub" }, task.kind === "auto" ? (task.plan ? "planned · assigns" : task.phase === "planning" ? "planning…" : "plans first") : "assigns · relays"),
                 ),
               ),
-              !task.stages.length && task.kind !== "review"
+              !task.stages.length && !isCodeReviewTask(task)
                 ? [h("span", { class: "pipe-arrow pipe-arrow-stage" }, "→"), h("div", { class: "pipe-lane current" }, h("div", { class: "pipe-lane-head" }, h("span", {}, "Planning"), h("span", { class: "muted small" }, "agents are created from the plan")))]
                 : null,
-              task.kind === "review" ? [h("span", { class: "pipe-arrow pipe-arrow-stage" }, "→"), reviewLane(task)] : null,
+              isCodeReviewTask(task) ? [h("span", { class: "pipe-arrow pipe-arrow-stage" }, "→"), reviewLane(task)] : null,
               task.stages.map((stage, index) => [h("span", { class: "pipe-arrow pipe-arrow-stage" }, index ? "⇒" : "→"), stageLane(task, stage)]),
             ),
           );

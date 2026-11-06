@@ -1,4 +1,4 @@
-import type { AgentRole, FailureCategory, Severity, StageKind, TestStatus, UnrelatedFailure, Verdict } from "../types.ts";
+import type { AgentRole, FailureCategory, PlannedReview, Severity, StageKind, TestStatus, UnrelatedFailure, Verdict } from "../types.ts";
 
 /** Arguments of the `submit_work` tool called by author agents (designer / writer / coder / resolver / fixer). */
 export interface WorkSubmissionInput {
@@ -48,6 +48,8 @@ export interface PlanSubmissionInput {
   instructions: Partial<Record<StageKind, string>>;
   /** What every sub-agent should know about the repository (absent in plans the hub derives itself). */
   briefing?: string;
+  /** A code review of an existing change instead of stages (`stages` is then empty). */
+  review?: PlannedReview;
 }
 
 /** The tools of the two code review reviewers, one per step of their discussion. */

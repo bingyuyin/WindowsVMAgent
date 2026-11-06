@@ -3,11 +3,13 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { describe, test } from "node:test";
+import type { PlanSubmissionInput } from "../src/agents/driver.ts";
 import type { CopilotService } from "../src/copilot/service.ts";
 import { createApiRouter } from "../src/http/api.ts";
 import { createHttpServer } from "../src/http/server.ts";
 import type { RepoService } from "../src/repos.ts";
 import { LineOutsideDiffError } from "../src/review/publish.ts";
+import { summarizeTask } from "../src/workflow/summary.ts";
 import {
   addRemote,
   bareGit,
@@ -28,6 +30,7 @@ import {
   submitWork,
   waitFor,
   writeFile,
+  type Harness,
   type Step,
 } from "./helpers.ts";
 
@@ -484,6 +487,127 @@ describe("code review tasks", () => {
       assert.match(first, /> Adds greet\(\)\./);
     } finally {
       h.cleanup();
+    }
+  });
+});
+
+/** A bare "origin" holding main and a feature branch published as pull request #N (refs/pull/N/head); returns the head. */
+function pullRequestOnOrigin(h: Harness, number = 7): string {
+  const head = featureBranch(h, "feature/greet", { "greet.js": GREET });
+  const bare = path.join(h.root, "origin.git");
+  git(h.root, "init", "-q", "--bare", bare);
+  git(h.repoPath, "remote", "add", "origin", bare);
+  git(h.repoPath, "push", "-q", "origin", "main", `feature/greet:refs/pull/${number}/head`);
+  git(h.repoPath, "branch", "-D", "feature/greet");
+  return head;
+}
+
+describe("auto tasks: the manager assigns code reviews to the reviewers", () => {
+  test("a request to review a pull request gets the lead and peer reviewers, never a test executor", async () => {
+    const host = new FakeReviewHost();
+    host.lookup.pullRequest = githubPullRequest(7, { title: "Add greet", baseBranch: "main", headBranch: "feature/greet" });
+    const plan = (target: string, stages = ["review"]) =>
+      ({
+        stages,
+        review_target: target,
+        rationale: "The request is to review pull request #7",
+        instructions: { review: "Focus on error handling" },
+        briefing: "greet.js holds the greeting helpers.",
+      }) as unknown as PlanSubmissionInput;
+    const reviewers = agreeingReview();
+    const leadFindings = reviewers["lead-reviewer"][0]!;
+    reviewers["lead-reviewer"][0] = steps((_spec, prompt) => {
+      assert.match(prompt, /## The request\n\nPlease review PR #7/);
+      assert.match(prompt, /## Manager's briefing on the repository\n\ngreet\.js holds the greeting helpers\./);
+      assert.match(prompt, /## Manager's assignment for the review\n\nFocus on error handling/);
+      assert.match(prompt, /Pull request #7 "Add greet"/);
+      assert.match(prompt, /\+export function greet\(name\)/);
+    }, leadFindings);
+    const h = createHarness(
+      {
+        planner: [
+          async (spec) => {
+            if (spec.submit.kind !== "plan") throw new Error("the planner submits plans");
+            const submit = spec.submit.onSubmit;
+            assert.match(spec.systemPrompt, /- review: a lead reviewer and a peer reviewer/);
+            assert.match(spec.systemPrompt, /Never answer it with `testing`/);
+            // A pull request the remote does not have goes back to the planner, as does mixing teams.
+            await assert.rejects(async () => submit(plan("#99")), /The hub cannot review '#99': Could not fetch pull request #99 from origin/);
+            await assert.rejects(async () => submit(plan("#7", ["review", "testing"])), /A code review stands alone/);
+            await submit(plan("PR 7"));
+          },
+        ],
+        ...reviewers,
+      },
+      { reviewHost: host },
+    );
+    try {
+      const head = pullRequestOnOrigin(h);
+      const created = await h.runner.submit({ description: "Please review PR #7 and check the error handling", kind: "auto", repoId: "sample" });
+      assert.equal(created.peerReviewerModel, "fake-author", "Auto tasks carry a peer reviewer model in case the manager plans a code review");
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed", String(task.error));
+      assert.equal(task.kind, "auto");
+      assert.deepEqual(task.plan?.stages, []);
+      assert.deepEqual(task.plan?.review, { target: "PR 7", instructions: "Focus on error handling" });
+      assert.deepEqual(task.stages, []);
+
+      // The manager assigned the two reviewers: no test executor, test fixer or coder.
+      assert.deepEqual((task.agents ?? []).map((agent) => agent.role).sort(), ["lead-reviewer", "peer-reviewer", "planner"]);
+      for (const role of ["executor", "fixer", "coder", "code-reviewer"] as const) assert.equal(h.driver.specsFor(role).length, 0, role);
+
+      // The task became the review of the pull request: its branch points at the head, its base is the merge-base.
+      const target = task.review!.target;
+      assert.deepEqual([target.kind, target.headSha, target.baseRef, target.pullRequest?.number], ["pr", head, "main", 7]);
+      assert.equal(task.baseSha, git(h.repoPath, "rev-parse", "main"));
+      assert.equal(branchHead(h.repoPath, task.branch!), head);
+      assert.deepEqual(task.review!.curated?.map((comment) => comment.id), ["R1", "R2"]);
+      assert.equal(task.result?.approved, true);
+      assert.equal(task.push, undefined, "a code review is never pushed");
+      const comm = h.store.recentComm({ taskId: task.id });
+      assert.ok(comm.some((entry) => entry.kind === "plan" && /^Plan: Code review of pull request #7 - /.test(entry.text)));
+      assert.ok(comm.some((entry) => entry.text === "Creating sub-agents: Lead reviewer, Peer reviewer"));
+      assert.throws(() => h.runner.retry(task.id), /This code review is finished/);
+      await assert.rejects(h.runner.pushNow(task.id), /no branch of their own to push/);
+      assert.equal(summarizeTask(task).plan?.review?.target, "PR 7");
+      assert.equal((await h.runner.reviewPublishStatus(task.id)).pullRequest?.number, 7);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("without a plan from the planner, a review request still gets the reviewers; a pull request that does not exist fails clearly", async () => {
+    const h = createHarness({ planner: [() => {}, () => {}, () => {}], ...agreeingReview() }, { reviewHost: new FakeReviewHost() });
+    try {
+      pullRequestOnOrigin(h);
+      const created = await h.runner.submit({ description: "Review pull request #7 for error handling", kind: "auto", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed", String(task.error));
+      assert.equal(task.plan?.fallback, true);
+      assert.deepEqual(task.plan?.review, { target: "#7", instructions: "Review pull request #7 for error handling" });
+      assert.equal(task.review?.target.headRef, "refs/pull/7/head");
+      assert.deepEqual(task.review!.rounds.map((round) => round.phase), ["findings", "positions", "final", "signoff"]);
+      assert.equal(h.driver.specsFor("executor").length, 0);
+    } finally {
+      h.cleanup();
+    }
+
+    const missing = createHarness({ planner: [() => {}, () => {}, () => {}] }, { reviewHost: new FakeReviewHost() });
+    try {
+      pullRequestOnOrigin(missing);
+      const created = await missing.runner.submit({ description: "Review pull request #99", kind: "auto", repoId: "sample" });
+      await missing.runner.idle();
+      const task = missing.store.getTask(created.id)!;
+      assert.equal(task.status, "failed");
+      assert.match(task.error ?? "", /The request asks to review #99, but the hub cannot find it: Could not fetch pull request #99/);
+      assert.equal(task.review, undefined);
+      assert.equal(task.plan, undefined, "Retry plans the task again");
+      assert.equal(missing.driver.specsFor("executor").length, 0);
+      assert.equal(branchHead(missing.repoPath, task.branch!), git(missing.repoPath, "rev-parse", "main"), "the task branch was not moved");
+    } finally {
+      missing.cleanup();
     }
   });
 });

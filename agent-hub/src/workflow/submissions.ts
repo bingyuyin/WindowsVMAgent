@@ -1,6 +1,7 @@
 import type { PlanSubmissionInput, ReviewSubmissionInput, TestRunSubmissionInput, UnitTestsInput, WorkSubmissionInput } from "../agents/driver.ts";
+import { parseReviewTarget } from "../review/target.ts";
 import { FAILURE_CATEGORIES, SEVERITIES, STAGE_ORDER, type FailureCategory, type Severity, type StageKind, type TestStatus, type UnrelatedFailure, type Verdict } from "../types.ts";
-import { truncate } from "../util.ts";
+import { errorMessage, truncate } from "../util.ts";
 
 /**
  * Validation for agent submissions. Errors thrown here are returned to the agent as a failed
@@ -355,12 +356,14 @@ const STAGE_ALIASES: Record<string, StageKind> = {
 export function normalizePlan(input: unknown): PlanSubmissionInput {
   const raw = (input ?? {}) as Record<string, unknown>;
   if (!Array.isArray(raw.stages) || !raw.stages.length) {
-    throw new Error(`\`stages\` must be a non-empty array using: ${STAGE_ORDER.join(", ")}.`);
+    throw new Error(`\`stages\` must be a non-empty array using: ${STAGE_ORDER.join(", ")}, or review.`);
   }
+  const names = raw.stages.map((value) => String(value ?? "").trim().toLowerCase());
+  if (names.some(isReviewStage)) return normalizeReviewPlan(raw, names);
   const chosen = new Set<StageKind>();
-  for (const value of raw.stages) {
-    const stage = STAGE_ALIASES[String(value ?? "").trim().toLowerCase()];
-    if (!stage) throw new Error(`Unknown stage '${String(value)}'. Use: ${STAGE_ORDER.join(", ")}.`);
+  for (const [index, name] of names.entries()) {
+    const stage = STAGE_ALIASES[name];
+    if (!stage) throw new Error(`Unknown stage '${String(raw.stages[index])}'. Use: ${STAGE_ORDER.join(", ")}, or review.`);
     chosen.add(stage);
   }
   const stages = STAGE_ORDER.filter((stage) => chosen.has(stage));
@@ -382,8 +385,91 @@ export function normalizePlan(input: unknown): PlanSubmissionInput {
   return { stages, rationale: truncate(rationale, 2000), instructions, briefing: truncate(briefing, 6000) };
 }
 
+/** Names a planner may use for the code review team. */
+function isReviewStage(name: string): boolean {
+  return /^(?:(?:code|pr|pull request|merge request|mr)[\s_-]*)?review(?:ing)?$/.test(name.replace(/[\s_-]+/g, " "));
+}
+
+/** A plan for a code review: the review team alone, the change to review, and what the reviewers should focus on. */
+function normalizeReviewPlan(raw: Record<string, unknown>, names: string[]): PlanSubmissionInput {
+  if (names.some((name) => !isReviewStage(name))) {
+    throw new Error(
+      'A code review stands alone: when the request is to review an existing change (a pull request or a branch), submit stages ["review"] only - the reviewers read and judge the change; they do not change code or run tests. When the request is to make a change, leave review out (the coding team reviews its own work).',
+    );
+  }
+  const rationale = typeof raw.rationale === "string" ? raw.rationale.trim() : "";
+  if (!rationale) throw new Error("`rationale` is required: explain why these stages fit the request.");
+  const target = typeof raw.review_target === "string" ? raw.review_target.trim() : "";
+  if (!target) {
+    throw new Error("`review_target` is required with the review stage: the pull request to review (#12 or its URL) or the branch, as the request names it.");
+  }
+  try {
+    parseReviewTarget(target);
+  } catch (error) {
+    throw new Error(`review_target: ${errorMessage(error)}.`);
+  }
+  const base = typeof raw.review_base === "string" && raw.review_base.trim() ? raw.review_base.trim().replace(/^refs\/heads\//, "") : undefined;
+  if (base && (/\s/.test(base) || base.startsWith("-"))) throw new Error("`review_base` must be a branch name, or omitted.");
+  const given = (raw.instructions && typeof raw.instructions === "object" ? raw.instructions : {}) as Record<string, unknown>;
+  const instructions = typeof given.review === "string" ? given.review.trim() : "";
+  if (!instructions) throw new Error("instructions.review is required: tell the reviewers what to focus on (from the request), or ask for a full review.");
+  const briefing = typeof raw.briefing === "string" ? raw.briefing.trim() : "";
+  if (!briefing) {
+    throw new Error("`briefing` is required: tell the reviewers what you learned about the repository (architecture, conventions, how it is built and tested).");
+  }
+  return {
+    stages: [],
+    rationale: truncate(rationale, 2000),
+    instructions: {},
+    briefing: truncate(briefing, 6000),
+    review: { target: truncate(target, 1000), ...(base ? { base } : {}), instructions: truncate(instructions, 4000) },
+  };
+}
+
+/** The request asks to review an existing change (not to address review feedback). */
+const REVIEW_REQUEST = [
+  /^\s*(?:please\s+|can you\s+|could you\s+)?(?:do\s+an?\s+|run\s+an?\s+)?(?:code[- ]?)?review\b/i,
+  /\b(?:code[- ]?)?review(?:ing)?\b(?:\s+(?:of|on|for))?\s+(?:(?:the|this|that|my|our|a)\s+)?(?:pull request|merge request|pr|mr|branch|change|changes|commit|#\d|!\d|https?:\/\/)/i,
+];
+const ADDRESS_REVIEW_FEEDBACK = /\b(?:address|resolve|apply|fix|handle|respond to)\b[^.!?\n]{0,40}\breview\b[^.!?\n]{0,20}\b(?:comments?|feedback|findings|suggestions|notes)\b/i;
+
+/** The pull request (URL, #12, PR 12, !12) or branch a review request names, and the branch to compare with when it says so. */
+export function reviewTargetIn(description: string): { target: string; base?: string } | null {
+  const candidates = [
+    ...[...description.matchAll(/https?:\/\/[^\s<>()'"`]+/gi)].map((match) => match[0].replace(/[.,;:!?]+$/, "")),
+    ...[...description.matchAll(/(?:^|[\s(,:])([#!]\d{1,9})\b/g)].map((match) => match[1]!),
+    ...[...description.matchAll(/\b(?:pull request|merge request|PR|MR)\s*[#!:]?\s*(\d{1,9})\b/gi)].map((match) => `#${match[1]}`),
+  ];
+  const pr = candidates.find((candidate) => {
+    try {
+      return parseReviewTarget(candidate).kind === "pr";
+    } catch {
+      return false;
+    }
+  });
+  const base = /\b(?:against|into|onto|versus|vs\.?)\s+(?:the\s+)?[`'"]?([\w./-]*[\w/-])[`'"]?/i.exec(description)?.[1];
+  const branch = /\bbranch\s+[`'"]?([\w./-]*[\w/-])[`'"]?/i.exec(description)?.[1];
+  const target = pr ?? branch;
+  if (!target) return null;
+  return { target, ...(base && base !== target && !/^(the|main branch|default)$/i.test(base) ? { base } : {}) };
+}
+
 /** Plan derived from keywords in the request, used when the planner never submits one. */
 export function heuristicPlan(description: string): PlanSubmissionInput {
+  if (REVIEW_REQUEST.some((pattern) => pattern.test(description)) && !ADDRESS_REVIEW_FEEDBACK.test(description)) {
+    const found = reviewTargetIn(description);
+    if (!found) {
+      throw new Error(
+        "The request asks for a code review but names no pull request or branch to review. Create a Code review task and enter the pull request (number or URL) or the branch, or name it in the request.",
+      );
+    }
+    return {
+      stages: [],
+      rationale: `The planner did not submit a plan; the request asks to review ${found.target}, so the hub assigned the code review team.`,
+      instructions: {},
+      review: { target: found.target, ...(found.base ? { base: found.base } : {}), instructions: description.trim() },
+    };
+  }
   const text = description.toLowerCase();
   const stages = new Set<StageKind>();
   if (/\b(design|architecture|architect|proposal|rfc|adr)\b/.test(text)) stages.add("design");

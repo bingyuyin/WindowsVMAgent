@@ -8,7 +8,7 @@ tests pass.
 
 | Task type | Sub-agents |
 | --- | --- |
-| **Auto** (default) | The **manager's planner** reads the request and the repository, picks the stages below (for example *Coding → Execute & verify*), writes each team's assignment, and the hub creates those sub-agents |
+| **Auto** (default) | The **manager's planner** reads the request and the repository, picks the stages below (for example *Coding → Execute & verify*), writes each team's assignment, and the hub creates those sub-agents. A request to review a pull request or branch gets the **Code review** team (lead + peer reviewer) instead |
 | **Coding** | **Coder** implements the request with unit tests and gets them passing · the **manager re-runs the unit tests** and only then hands the round to the **Code reviewer** · the **Comment resolver** fixes review comments (same model as the coder by default) and gets the unit tests passing again before the next review, until the reviewer approves |
 | **Execute & verify** | **Test executor** runs the test automation and verifies the results · **Test fixer** fixes failures at the root cause · the executor re-runs and checks the fixes are legitimate, until everything passes |
 | **Design** | **Designer** writes the design document and revises it · **Design reviewer** critiques it until a finalized version is approved |
@@ -80,8 +80,10 @@ flowchart LR
    rationale, an assignment for each stage's team (scope, acceptance criteria, the exact test commands)
    and a **briefing** on the repository (relevant modules and files, conventions, verified build/test
    commands, pitfalls). The hub creates the corresponding sub-agents and gives each the briefing and its
-   assignment, so no agent has to rediscover the repository. If the planner does not submit a plan, the
-   hub derives the stages from keywords in the request.
+   assignment, so no agent has to rediscover the repository. A request to review an existing change
+   gets the `review` team instead, on its own (see [Code review](#code-review-two-reviewers-then-you-publish)).
+   If the planner does not submit a plan, the hub derives the stages from keywords in the request (a
+   request to review a named pull request or branch becomes a code review).
 1. **Context**: at the task's base commit the hub looks for instruction files (`AGENTS.md`,
    `.github/copilot-instructions.md`, `.github/instructions/*.instructions.md`, `CLAUDE.md`, and
    `AGENTS.md` files in subfolders), guides (`CONTRIBUTING.md`, `ARCHITECTURE.md`, `TESTING.md`,
@@ -180,6 +182,13 @@ The review covers `merge-base(target, head)..head`, the same change the pull req
 keeps the reviewed head on a local branch `agent-hub/<task>-<title>` (never pushed). The optional focus
 tells the reviewers what to look at.
 
+You can also just ask an **Auto** task, for example *"Review PR #42, focusing on error handling"*: the
+manager assigns the `review` team (never the test executor or a coder), names the pull request or branch
+to review (the hub fetches it right away and sends a wrong one back to the manager to correct), and gives
+the reviewers its briefing and what to focus on. The task then runs exactly like a Code review task; its
+plan card shows *Code review* with the reviewed pull request. Requests to *address* review comments are
+coding, not review.
+
 1. **Independent reviews** (round 1, both reviewers in parallel, each in its own read-only worktree at the
    head): each one reads the change, its context and the repository's guidance and calls
    `submit_findings` with a summary of what the change does, an assessment, a verdict and comments
@@ -216,8 +225,8 @@ The **Discussion** tab shows every round: each reviewer's findings, their stance
 comments, the final review with what was dropped and why, and the sign-offs. Both reviewers are monitored
 and recovered like any agent, a failed or cancelled review resumes from the last finished step on
 **Retry**, and code review tasks are never pushed. The lead reviewer uses the reviewer model, the peer
-reviewer the **Peer reviewer model** (Settings or the New task form; default: the author model); pick two
-different models for a real second opinion.
+reviewer the **Peer reviewer model** (Settings or the New task form, also for Auto tasks; default: the
+author model); pick two different models for a real second opinion.
 
 ## Execute & verify: running test automation
 

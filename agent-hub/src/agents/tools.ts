@@ -155,7 +155,7 @@ export const submitTestResultsSchema = {
   required: ["status", "summary", "commands", "failures"],
 } as const;
 
-const STAGE_ENUM = ["design", "coding", "testing", "document"] as const;
+const STAGE_ENUM = ["design", "coding", "testing", "document", "review"] as const;
 
 export const submitPlanSchema = {
   type: "object",
@@ -163,19 +163,31 @@ export const submitPlanSchema = {
     stages: {
       type: "array",
       description:
-        "Stages to run, i.e. which sub-agent teams to create: design (designer + design reviewer), coding (coder + code reviewer + comment resolver), testing (test executor + test fixer), document (technical writer + doc reviewer). They run in the order design, coding, testing, document.",
+        "Which sub-agent teams to create: design (designer + design reviewer), coding (coder + code reviewer + comment resolver), testing (test executor + test fixer), document (technical writer + doc reviewer); they run in the order design, coding, testing, document. Or review (lead reviewer + peer reviewer) for a request to review an existing change - a pull request or a branch: it always stands alone, with `review_target`.",
       items: { type: "string", enum: STAGE_ENUM },
     },
     rationale: { type: "string", description: "Why these stages (and not others) fit the request, in 1-3 sentences." },
     instructions: {
       type: "object",
-      description: "Your assignment for each chosen stage's agents: scope, acceptance criteria, files/areas, and for testing the exact commands or suites to run.",
+      description:
+        "Your assignment for each chosen stage's agents: scope, acceptance criteria, files/areas, and for testing the exact commands or suites to run. For review: what the reviewers should focus on.",
       properties: {
         design: { type: "string" },
         coding: { type: "string" },
         testing: { type: "string" },
         document: { type: "string" },
+        review: { type: "string" },
       },
+    },
+    review_target: {
+      type: "string",
+      description:
+        "With the review stage only: the pull request to review (#12, 12 or its URL) or the branch, as the request names it. The hub fetches it from the repository's remote.",
+    },
+    review_base: {
+      type: "string",
+      description:
+        "With the review stage only, optional: the branch the change is compared with. Omit it for a pull request (the hub reads its target branch) and for a branch that merges into the default branch.",
     },
     briefing: {
       type: "string",

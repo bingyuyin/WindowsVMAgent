@@ -2,6 +2,7 @@ import {
   agentStatusInfo,
   chip,
   h,
+  isCodeReviewTask,
   KIND_LABELS,
   phaseLabel,
   relTime,
@@ -27,7 +28,7 @@ let currentFilter = "all";
 
 /** Compact stage/round pipeline: one pill per stage, one dot per review round (or test run). */
 export function pipelineMini(task) {
-  if (task.kind === "review") {
+  if (isCodeReviewTask(task)) {
     const running = ["running", "needs-input"].includes(task.status);
     const review = task.review;
     const label = running
@@ -238,7 +239,7 @@ function liveLine(task) {
 }
 
 function resultLine(task) {
-  if (task.status === "completed" && task.kind === "review") {
+  if (task.status === "completed" && isCodeReviewTask(task)) {
     const review = task.review;
     return h(
       "div",

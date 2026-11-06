@@ -180,9 +180,13 @@ export function rolesFor(kind) {
   return kind === "auto" ? ["planner"] : rolesForStages(KIND_STAGES[kind] ?? ["coding"]);
 }
 
-/** Sub-agents of a task: for Auto tasks the manager's planner plus the agents of the planned stages. */
+/** A code review of an existing change: a Code review task, or an Auto task the manager planned as one (full tasks and summaries). */
+export const isCodeReviewTask = (task) => task.kind === "review" || Boolean(task.review) || Boolean(task.plan?.review);
+
+/** Sub-agents of a task: for Auto tasks the manager's planner plus the team it planned (stages, or the two reviewers). */
 export function rolesForTask(task) {
   if (task.kind !== "auto") return rolesFor(task.kind);
+  if (isCodeReviewTask(task)) return ["planner", "lead-reviewer", "peer-reviewer"];
   const stages = task.plan?.stages ?? task.stages?.map((stage) => stage.kind) ?? [];
   return ["planner", ...rolesForStages(stages)];
 }
@@ -260,11 +264,11 @@ export function statusInfo(task) {
     case "queued":
       return { label: "Queued", cls: "neutral" };
     case "running":
-      return { label: task.kind === "review" && task.phase === "reviewing" ? "Reviewing the change" : phaseLabel(task.currentStage, task.phase), cls: "running" };
+      return { label: isCodeReviewTask(task) && task.phase === "reviewing" ? "Reviewing the change" : phaseLabel(task.currentStage, task.phase), cls: "running" };
     case "needs-input":
       return { label: "Needs your input", cls: "attention" };
     case "completed": {
-      if (task.kind === "review") {
+      if (isCodeReviewTask(task)) {
         // Works for task summaries (review.published/agreed) and full tasks (review.publications/signoff).
         const review = task.review;
         const published = review?.published ?? Boolean(review?.publications?.some((publication) => publication.main));

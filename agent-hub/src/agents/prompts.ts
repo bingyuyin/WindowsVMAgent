@@ -273,10 +273,14 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- testing: a test executor runs the test automation and verifies the results, a test fixer fixes failures at the root cause, and the executor re-runs until everything passes. Use when the request asks to run, verify or fix tests or automation, and after coding when the repository has a test suite that can run locally (check for test files, scripts and CI pipelines).",
         "- document: a technical writer writes documentation and a doc reviewer checks it. Use when the request asks for documentation, guides, runbooks or READMEs.",
         "",
+        "Or, for a request to review an existing change:",
+        "- review: a lead reviewer and a peer reviewer (on different models) review a change someone else wrote - a pull request, merge request or branch - discuss each other's findings and agree on a final review, which the user curates and publishes on the pull request. They read the code; they do not change it or run tests. The hub fetches the change: give `review_target` (the pull request number or URL, or the branch, as the request names it).",
+        "",
         "Rules:",
         "- You are read-only: never create, modify or delete files and never run commands with side effects. Inspect the repository with view/grep/glob and read-only git commands.",
+        "- A request to review a pull request, merge request or branch is a code review: choose `review`, alone. Never answer it with `testing` (the test executor runs automation; it does not review code) or `coding` (that would change the code instead of reviewing it). Requests to address or fix review comments are coding, not review.",
         "- Choose the smallest set of stages that fully covers the request. Do not add design or documentation the request does not need; do add testing when the request asks to verify behavior or when code changes and runnable tests exist.",
-        "- For each chosen stage write a concrete assignment: what to do, scope (files, areas), acceptance criteria, for coding the unit test commands that cover the change and must pass before each review, and for testing the exact commands or suites to run (verify they exist in the repository).",
+        "- For each chosen stage write a concrete assignment: what to do, scope (files, areas), acceptance criteria, for coding the unit test commands that cover the change and must pass before each review, for testing the exact commands or suites to run (verify they exist in the repository), and for review what the reviewers should focus on.",
         "- Write a `briefing` that every sub-agent starts with, so none of them has to rediscover the repository: the architecture and the modules/files relevant to this request, the conventions to follow, how to build and test (commands you verified), and pitfalls. Make it specific to this request; the agents already get the repository context and best-practice skills.",
         "- Be quick: a few minutes of targeted inspection is enough. Finish by calling the `submit_plan` tool exactly once. Never end your turn without calling it.",
       ].join("\n");
@@ -321,7 +325,7 @@ function managerBlock(task: Task, stage: StageKind): string {
 }
 
 /** What the manager learned about the repository while planning (Auto tasks), given to every sub-agent. */
-function briefingBlock(task: Task): string {
+export function briefingBlock(task: Task): string {
   const text = task.plan?.briefing?.trim();
   return text ? ["", "## Manager's briefing on the repository", "", text].join("\n") : "";
 }
@@ -761,6 +765,7 @@ export function plannerPrompt(task: Task, context: RepoContext | undefined): str
     "Inspect the repository as much as you need to understand what the request involves (structure, relevant code, how it is built and tested).",
     `Every sub-agent you create starts with the repository context above, the instruction files and the hub's best-practice skills for its role${skills}. Your briefing adds what you learned that is specific to this request.`,
     "Then call `submit_plan` with the stages to run, your rationale, a concrete assignment for each stage's agents and the briefing.",
+    'If the request is to review an existing change (a pull request or a branch), call it with stages ["review"], `review_target` and the reviewers\' focus in `instructions.review` instead.',
   ].join("\n");
 }
 

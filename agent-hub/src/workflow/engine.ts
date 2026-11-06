@@ -32,6 +32,7 @@ import {
   type DesignContext,
 } from "../agents/prompts.ts";
 import { findingsPrompt, finalPrompt, MAX_REVIEW_DIFF, nudgeFor, positionsPrompt, signoffPrompt, type ReviewTurnBase } from "../agents/reviewPrompts.ts";
+import type { ResolvedReviewTarget } from "../review/target.ts";
 import { evaluatePermission } from "../agents/policy.ts";
 import { skillsForRole, type HubSkills } from "../context.ts";
 import { DOC_EXTENSIONS, documentProblem, formatOfPath, isDocumentPath, placeholderProblem, renderDocTemplate, type DocTemplates } from "../docs.ts";
@@ -56,6 +57,7 @@ import {
 import {
   authorRoleFor,
   CODE_REVIEW_ROLES,
+  isCodeReview,
   isCodeReviewRole,
   isDocStage,
   isReviewerRole,
@@ -77,6 +79,8 @@ import {
   type ReviewerComment,
   type ReviewerEntry,
   type ReviewPhase,
+  type PlannedReview,
+  type ReviewTarget,
   type ReviewRound,
   type ReviewSubmission,
   type Round,
@@ -131,6 +135,14 @@ export interface EngineOptions {
    * may still share ports, databases or fixed paths outside their worktrees.
    */
   testRuns?: { busy(): boolean; run<T>(work: () => Promise<T>): Promise<T> };
+  /**
+   * Code reviews the manager plans for Auto tasks: `resolve` finds the change to review (fetching a pull request);
+   * `adopt` points the task at it (its branch, base and repository context) and returns the reviewers' workspace.
+   */
+  codeReviews?: {
+    resolve(target: string, base?: string): Promise<ResolvedReviewTarget>;
+    adopt(resolved: ResolvedReviewTarget): Promise<TaskWorkspace>;
+  };
 }
 
 interface ActiveAgent {
@@ -237,6 +249,8 @@ export class WorkflowEngine {
   /** Code review reviewers work in parallel: what each one's current turn must submit, and what it submitted. */
   private readonly reviewSteps = new Map<AgentRole, ReviewStep>();
   private readonly reviewSubmissions = new Map<AgentRole, unknown>();
+  /** The change a planned code review reviews, found when the planner submitted its plan. */
+  private plannedReview: ResolvedReviewTarget | null = null;
 
   constructor(task: Task, options: EngineOptions) {
     this.task = task;
@@ -244,11 +258,12 @@ export class WorkflowEngine {
   }
 
   async run(): Promise<void> {
-    if (this.task.kind === "review") {
+    if (this.task.kind === "auto" && !this.task.plan) await this.plan();
+    // A Code review task, or an Auto task the manager planned as a code review: the two reviewers, no stages.
+    if (isCodeReview(this.task)) {
       await this.runCodeReview();
       return;
     }
-    if (this.task.kind === "auto" && !this.task.plan) await this.plan();
     const kinds = stageKindsOf(this.task);
     for (const kind of kinds) {
       if (!this.task.stages.some((stage) => stage.kind === kind)) {
@@ -313,6 +328,7 @@ export class WorkflowEngine {
       });
       hooks.comm({ from: "manager", to: role, kind: "assign", text: "Plan the task: choose the sub-agent teams to create and write their assignments" });
       this.pendingPlan = null;
+      this.plannedReview = null;
       const prompt = plannerPrompt(task, task.context);
       let result: TurnResult = {};
       let lost: AgentUnrecoverableError | null = null;
@@ -332,6 +348,7 @@ export class WorkflowEngine {
       }
       this.throwIfAborted();
       let plan = this.submittedPlan();
+      let resolved: ResolvedReviewTarget | null = plan ? this.plannedReview : null;
       const fallback = !plan;
       if (!plan) {
         hooks.emit({
@@ -343,20 +360,32 @@ export class WorkflowEngine {
         });
         plan = heuristicPlan(task.description);
       }
+      if (plan.review) {
+        // A code review: the hub fetches the change, and the task becomes that review (the two reviewers, no stages).
+        if (!resolved) {
+          try {
+            resolved = await this.resolvePlannedReview(plan.review);
+          } catch (error) {
+            throw new Error(`The request asks to review ${plan.review.target}, but the hub cannot find it: ${errorMessage(error)}`);
+          }
+        }
+        this.options.workspace = await this.options.codeReviews!.adopt(resolved);
+      }
       task.plan = {
         stages: plan.stages,
         rationale: plan.rationale,
         instructions: plan.instructions,
         briefing: plan.briefing,
+        ...(plan.review ? { review: plan.review } : {}),
         fallback: fallback || undefined,
         plannedAt: nowIso(),
       };
       task.stages = plan.stages.map((kind) => ({ kind, status: "pending", rounds: [], nextCommentNumber: 1 }));
-      const flow = plan.stages.map((kind) => STAGE_LABELS[kind]).join(" → ");
+      const flow = task.review ? `Code review of ${reviewedChange(task.review.target)}` : plan.stages.map((kind) => STAGE_LABELS[kind]).join(" → ");
       hooks.emit({ type: "info", role, text: `Manager's plan: ${flow}. ${plan.rationale}`, data: { plan: task.plan } });
       hooks.comm({ from: role, to: "manager", kind: "plan", text: `Plan: ${flow} - ${truncate(plan.rationale, 240)}` });
       // The resolver and the fixer only start when a review requests changes or a test run fails.
-      const team = rolesForStages(plan.stages);
+      const team = task.review ? [...CODE_REVIEW_ROLES] : rolesForStages(plan.stages);
       const onDemand: AgentRole[] = team.filter((candidate) => candidate === "resolver" || candidate === "fixer");
       hooks.comm({
         from: "manager",
@@ -398,7 +427,7 @@ export class WorkflowEngine {
     review.shortStat ??= await workspace.shortStat(base, head);
     review.commits ??= await workspace.commitCount(base, head);
     const change = { stat: await workspace.diffStat(base, head), diff: await workspace.diff(base, head, MAX_REVIEW_DIFF) };
-    const what = review.target.pullRequest ? `pull request #${review.target.pullRequest.number}` : review.target.headRef;
+    const what = reviewedChange(review.target);
     hooks.comm({
       from: "manager",
       to: "manager",
@@ -512,7 +541,7 @@ export class WorkflowEngine {
       round: round.n,
       text:
         phase === "findings"
-          ? `Review ${review.target.pullRequest ? `pull request #${review.target.pullRequest.number}` : review.target.headRef} at ${review.target.headSha.slice(0, 10)} independently`
+          ? `Review ${reviewedChange(review.target)} at ${review.target.headSha.slice(0, 10)} independently`
           : phase === "positions"
             ? `Respond to the ${ROLE_LABELS[otherRole].toLowerCase()}'s comments${theirs.length ? ` ${theirs.map((comment) => comment.id).join(", ")}` : " (none)"} and re-check your own`
             : phase === "final"
@@ -1080,7 +1109,7 @@ export class WorkflowEngine {
 
   /** The terminal tool through which each kind of agent hands back its structured result. */
   private submitChannelFor(role: AgentRole, stageKind: StageKind | undefined): SubmitChannel {
-    if (role === "planner") return { kind: "plan", onSubmit: (input) => void (this.pendingPlan = normalizePlan(input)) };
+    if (role === "planner") return { kind: "plan", onSubmit: (input) => this.acceptPlan(input) };
     if (role === "executor") return { kind: "test", onSubmit: (input) => void (this.pendingTest = normalizeTestRun(input)) };
     if (isCodeReviewRole(role)) {
       return {
@@ -1106,6 +1135,31 @@ export class WorkflowEngine {
       );
     }
     return review;
+  }
+
+  /**
+   * Validates the planner's plan. A planned code review must name a change the hub can find, so the hub fetches it
+   * now: a wrong pull request or branch goes back to the planner to fix.
+   */
+  private async acceptPlan(input: PlanSubmissionInput): Promise<void> {
+    const plan = normalizePlan(input);
+    let resolved: ResolvedReviewTarget | null = null;
+    if (plan.review) {
+      try {
+        resolved = await this.resolvePlannedReview(plan.review);
+      } catch (error) {
+        throw new Error(
+          `The hub cannot review '${plan.review.target}': ${errorMessage(error)}. Check \`review_target\` (and \`review_base\`) against the request and the repository (git branch -a, git remote -v), then call submit_plan again.`,
+        );
+      }
+    }
+    this.plannedReview = resolved;
+    this.pendingPlan = plan;
+  }
+
+  private resolvePlannedReview(review: PlannedReview): Promise<ResolvedReviewTarget> {
+    if (!this.options.codeReviews) return Promise.reject(new Error("this hub cannot run code reviews"));
+    return this.options.codeReviews.resolve(review.target, review.base);
   }
 
   private async releaseAgent(role: AgentRole, status: AgentStatus): Promise<void> {
@@ -1934,6 +1988,13 @@ function describeComments(comments: readonly ReviewComment[]): string {
   const counts = new Map<string, number>();
   for (const comment of comments) counts.set(comment.severity, (counts.get(comment.severity) ?? 0) + 1);
   return `${comments.length} comment${comments.length === 1 ? "" : "s"} (${[...counts].map(([severity, count]) => `${count} ${severity}`).join(", ")})`;
+}
+
+/** "pull request #12", "merge request !5", or the reviewed branch. */
+export function reviewedChange(target: ReviewTarget): string {
+  const pr = target.pullRequest;
+  if (!pr) return target.headRef;
+  return pr.provider === "gitlab" ? `merge request !${pr.number}` : `pull request #${pr.number}`;
 }
 
 /** " (1 blocker, 2 minor)" in severity order, or "" for no comments. */
