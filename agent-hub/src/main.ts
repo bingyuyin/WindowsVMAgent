@@ -1,6 +1,6 @@
 import fs from "node:fs";
-import path from "node:path";
 import { CopilotAgentDriver } from "./agents/copilotDriver.ts";
+import { describeBuild, readBuildInfo } from "./build.ts";
 import { Bus } from "./bus.ts";
 import { loadConfig } from "./config.ts";
 import { loadHubSkills } from "./context.ts";
@@ -16,7 +16,7 @@ import { errorMessage } from "./util.ts";
 import { TaskRunner } from "./workflow/runner.ts";
 
 const config = loadConfig();
-const version = (JSON.parse(fs.readFileSync(path.join(config.projectRoot, "package.json"), "utf8")) as { version: string }).version;
+const build = readBuildInfo(config.projectRoot, config.publicDir);
 
 const store = new Store(config.dataDir);
 store.load();
@@ -41,6 +41,7 @@ const runner = new TaskRunner({
   docTemplates,
   pullRequests: new GhPullRequestCreator(),
   reviewHost: new GhReviewHost(),
+  hubBuild: describeBuild(build),
 });
 const repos = new RepoService(store, bus, config.reposDir);
 runner.init();
@@ -54,8 +55,9 @@ const server = createHttpServer({
   host: config.host,
   port: config.port,
   publicDir: config.publicDir,
-  router: createApiRouter({ store, bus, copilot, runner, repos, version }),
+  router: createApiRouter({ store, bus, copilot, runner, repos, build }),
   vendor: config.vendorFiles,
+  uiBuild: build.ui,
 });
 
 server.on("error", (error) => {
@@ -65,7 +67,7 @@ server.on("error", (error) => {
 
 server.listen(config.port, config.host, () => {
   const loopback = ["127.0.0.1", "localhost", "::1"].includes(config.host);
-  console.log(`Copilot Agent Hub v${version}`);
+  console.log(`Copilot Agent Hub ${describeBuild(build)}`);
   console.log(`  UI:          http://localhost:${config.port}`);
   console.log(`  Data:        ${config.dataDir}`);
   console.log(`  Copilot home: ${config.copilotHome}`);

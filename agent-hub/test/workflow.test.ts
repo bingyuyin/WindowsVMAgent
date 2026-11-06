@@ -982,7 +982,7 @@ describe("HTML documents", () => {
         runner: h.runner,
         copilot: {} as CopilotService,
         repos: {} as RepoService,
-        version: "test",
+        build: { version: "test", commit: null, ui: "test" },
       }),
     });
     try {

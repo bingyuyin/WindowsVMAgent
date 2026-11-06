@@ -93,6 +93,8 @@ export interface RunnerDeps {
   pullRequests?: PullRequestCreator;
   /** Code review tasks: pull request details and publishing; without it, reviews can only be copied as Markdown. */
   reviewHost?: ReviewHost;
+  /** The hub's version and commit, recorded when a task starts (shows which code ran it). */
+  hubBuild?: string;
   /** How often the manager checks on working agents (default 60 s). */
   monitorIntervalMs?: number;
   /** Silence after which the manager posts a check-in about a working agent (default 5 min). */
@@ -893,7 +895,7 @@ export class TaskRunner {
       task.attemptStartedAt = nowIso();
       task.finishedAt = undefined;
       task.error = undefined;
-      this.emit(task, { type: "status", text: `Started (attempt ${task.attempt})` });
+      this.emit(task, { type: "status", text: `Started (attempt ${task.attempt})${this.deps.hubBuild ? ` on hub ${this.deps.hubBuild}` : ""}` });
       this.comm(task, {
         from: "manager",
         to: "manager",

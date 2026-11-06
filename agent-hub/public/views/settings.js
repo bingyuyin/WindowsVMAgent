@@ -113,6 +113,31 @@ export function settingsView(root) {
     ),
     h("h2", { class: "section-title" }, "Storage"),
     storage,
+    h("h2", { class: "section-title" }, "About"),
+    h(
+      "div",
+      { class: "card" },
+      h(
+        "dl",
+        { class: "storage-list" },
+        h("dt", {}, "Version"),
+        h("dd", { class: "mono small" }, state.build ? `v${state.build.version}` : "unknown"),
+        h("dt", {}, "Commit"),
+        h(
+          "dd",
+          {},
+          h("span", { class: "mono small" }, state.build?.commit ?? "not a git checkout"),
+          h("div", { class: "muted small" }, "The hub's code; +changes means its files differ from that commit. Each task's timeline shows the version it started on."),
+        ),
+        h("dt", {}, "UI build"),
+        h(
+          "dd",
+          {},
+          h("span", { class: "mono small" }, state.build?.ui ?? "unknown"),
+          h("div", { class: "muted small" }, "When the hub is updated while this page is open, a banner asks you to reload it."),
+        ),
+      ),
+    ),
   );
 
   async function renderStorage() {

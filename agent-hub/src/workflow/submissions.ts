@@ -432,6 +432,18 @@ const REVIEW_REQUEST = [
   /\b(?:code[- ]?)?review(?:ing)?\b(?:\s+(?:of|on|for))?\s+(?:(?:the|this|that|my|our|a)\s+)?(?:pull request|merge request|pr|mr|branch|change|changes|commit|#\d|!\d|https?:\/\/)/i,
 ];
 const ADDRESS_REVIEW_FEEDBACK = /\b(?:address|resolve|apply|fix|handle|respond to)\b[^.!?\n]{0,40}\breview\b[^.!?\n]{0,20}\b(?:comments?|feedback|findings|suggestions|notes)\b/i;
+/** Verbs asking for changes: a request that wants changes besides (or instead of) a review is for the planner to judge. */
+const EDIT_REQUEST = /\b(?:fix|implement|refactor|rewrite|apply|rename|remove|delete|modify|change|update|address|resolve)\b/i;
+
+/**
+ * A request to review a pull request or branch it names, or null. `direct`: it asks for nothing else (no changes),
+ * so the manager can assign the two reviewers without planning.
+ */
+export function reviewRequestIn(description: string): { target: string; base?: string; direct: boolean } | null {
+  if (!REVIEW_REQUEST.some((pattern) => pattern.test(description)) || ADDRESS_REVIEW_FEEDBACK.test(description)) return null;
+  const found = reviewTargetIn(description);
+  return found ? { ...found, direct: !EDIT_REQUEST.test(description) } : null;
+}
 
 /** The pull request (URL, #12, PR 12, !12) or branch a review request names, and the branch to compare with when it says so. */
 export function reviewTargetIn(description: string): { target: string; base?: string } | null {
@@ -467,7 +479,7 @@ export function heuristicPlan(description: string): PlanSubmissionInput {
       stages: [],
       rationale: `The planner did not submit a plan; the request asks to review ${found.target}, so the hub assigned the code review team.`,
       instructions: {},
-      review: { target: found.target, ...(found.base ? { base: found.base } : {}), instructions: description.trim() },
+      review: { target: found.target, ...(found.base ? { base: found.base } : {}) },
     };
   }
   const text = description.toLowerCase();

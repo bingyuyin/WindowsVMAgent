@@ -99,7 +99,7 @@ function preamble(input: ReviewTurnBase): string[] {
   // Auto tasks: what the manager learned while planning the review, and what it asks the reviewers to focus on.
   const briefing = briefingBlock(task);
   if (briefing) parts.push(briefing);
-  const assignment = task.plan?.review?.instructions.trim();
+  const assignment = task.plan?.review?.instructions?.trim();
   if (assignment) parts.push(["", "## Manager's assignment for the review", "", assignment].join("\n"));
   if (task.review && task.baseSha) parts.push(changeBlock(input.change, task.baseSha, task.review.target.headSha));
   parts.push("");

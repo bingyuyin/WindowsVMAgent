@@ -43,7 +43,7 @@ export interface TaskSummary {
   openComments?: number;
   docPath?: string;
   /** Auto tasks: the stages the manager planned (agents are created per stage), or the change it planned to review. */
-  plan?: { stages: StageKind[]; rationale: string; fallback?: boolean; review?: { target: string } };
+  plan?: { stages: StageKind[]; rationale: string; fallback?: boolean; direct?: boolean; review?: { target: string } };
   tests?: Pick<TestRunInfo, "status" | "total" | "passed" | "failed" | "skipped">;
   push?: Pick<PushInfo, "status" | "remote" | "branch" | "webUrl" | "reason">;
   pullRequest?: Pick<PullRequestInfo, "url" | "number" | "draft">;
@@ -114,6 +114,7 @@ export function summarizeTask(task: Task): TaskSummary {
           stages: task.plan.stages,
           rationale: task.plan.rationale,
           fallback: task.plan.fallback,
+          ...(task.plan.direct ? { direct: true } : {}),
           ...(task.plan.review ? { review: { target: task.plan.review.target } } : {}),
         }
       : undefined,

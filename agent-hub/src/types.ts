@@ -537,6 +537,8 @@ export interface TaskPlan {
   briefing?: string;
   /** The request is to review an existing change: the manager assigned the two code reviewers instead of stages. */
   review?: PlannedReview;
+  /** The manager assigned the team itself, without its planner: the request names the change to review and asks for nothing else. */
+  direct?: boolean;
   /** True when the planner never submitted a plan and the hub derived one from the request. */
   fallback?: boolean;
   plannedAt: string;
@@ -548,8 +550,8 @@ export interface PlannedReview {
   target: string;
   /** Branch the change is compared with, when the manager named one (pull requests use their own target branch). */
   base?: string;
-  /** The manager's assignment for the reviewers: what to focus on. */
-  instructions: string;
+  /** The planner's assignment for the reviewers: what to focus on (the request itself is always shown to them). */
+  instructions?: string;
 }
 
 /** Last attempt to push the task branch to the repository's remote. */

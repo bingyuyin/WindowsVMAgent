@@ -92,7 +92,16 @@ export interface ServerOptions {
   router: Router;
   /** Extra static files outside `publicDir` (URL path -> absolute file), e.g. vendored browser bundles. */
   vendor?: Record<string, string>;
+  /**
+   * Fingerprint of the browser files being served. Pages send the fingerprint they were loaded with; changes from a
+   * page loaded from other files (left open across a hub update) are refused, so an outdated UI cannot act on the hub.
+   */
+  uiBuild?: string;
 }
+
+/** Header in which the UI sends the fingerprint of the files it was loaded from. */
+export const UI_BUILD_HEADER = "x-hub-ui";
+export const STALE_PAGE_MESSAGE = "This page was loaded from an older version of Agent Hub. Reload the page (Ctrl+F5), then try again.";
 
 export function createHttpServer(options: ServerOptions): http.Server {
   const allowedHosts = new Set(
@@ -135,6 +144,11 @@ export function createHttpServer(options: ServerOptions): http.Server {
       const vendorFile = options.vendor?.[url.pathname];
       if (vendorFile) serveFile(vendorFile, method, res, "public, max-age=86400");
       else serveStatic(options.publicDir, url.pathname, method, res);
+      return;
+    }
+    // Browsers send an Origin with every change; scripts and tests don't, and are not pages that can be out of date.
+    if (method !== "GET" && method !== "HEAD" && options.uiBuild && req.headers.origin && req.headers[UI_BUILD_HEADER] !== options.uiBuild) {
+      sendJson(res, 409, { error: STALE_PAGE_MESSAGE, reload: true });
       return;
     }
 

@@ -503,10 +503,68 @@ function pullRequestOnOrigin(h: Harness, number = 7): string {
 }
 
 describe("auto tasks: the manager assigns code reviews to the reviewers", () => {
-  test("a request to review a pull request gets the lead and peer reviewers, never a test executor", async () => {
+  test("a request that names a pull request to review goes straight to the lead and peer reviewers, without planning", async () => {
     const host = new FakeReviewHost();
     host.lookup.pullRequest = githubPullRequest(7, { title: "Add greet", baseBranch: "main", headBranch: "feature/greet" });
-    const plan = (target: string, stages = ["review"]) =>
+    const reviewers = agreeingReview();
+    const leadFindings = reviewers["lead-reviewer"][0]!;
+    reviewers["lead-reviewer"][0] = steps((_spec, prompt) => {
+      assert.match(prompt, /## The request\n\nPlease review PR #7 and check the error handling/);
+      assert.doesNotMatch(prompt, /## Manager's (briefing|assignment)/);
+      assert.match(prompt, /Pull request #7 "Add greet"/);
+      assert.match(prompt, /\+export function greet\(name\)/);
+    }, leadFindings);
+    const h = createHarness({ planner: [], ...reviewers }, { reviewHost: host });
+    try {
+      const head = pullRequestOnOrigin(h);
+      const created = await h.runner.submit({ description: "Please review PR #7 and check the error handling", kind: "auto", repoId: "sample" });
+      assert.equal(created.peerReviewerModel, "fake-author", "Auto tasks carry a peer reviewer model in case the manager plans a code review");
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed", String(task.error));
+      assert.equal(task.kind, "auto");
+      assert.equal(h.driver.specsFor("planner").length, 0, "no planning: the request named the change to review");
+      assert.deepEqual(task.plan?.stages, []);
+      assert.deepEqual(task.plan?.review, { target: "#7" });
+      assert.equal(task.plan?.direct, true);
+      assert.match(task.plan?.rationale ?? "", /^The request asks to review pull request #7, so the manager assigned the code review team directly/);
+      assert.deepEqual(task.stages, []);
+
+      // Only the two reviewers worked: no planner, test executor, test fixer or coder.
+      assert.deepEqual((task.agents ?? []).map((agent) => agent.role).sort(), ["lead-reviewer", "peer-reviewer"]);
+      for (const role of ["executor", "fixer", "coder", "code-reviewer"] as const) assert.equal(h.driver.specsFor(role).length, 0, role);
+
+      // The task became the review of the pull request: its branch points at the head, its base is the merge-base.
+      const target = task.review!.target;
+      assert.deepEqual([target.kind, target.headSha, target.baseRef, target.pullRequest?.number], ["pr", head, "main", 7]);
+      assert.equal(task.baseSha, git(h.repoPath, "rev-parse", "main"));
+      assert.equal(branchHead(h.repoPath, task.branch!), head);
+      assert.deepEqual(task.review!.rounds.map((round) => [round.phase, round.entries.map((entry) => entry.role).sort()]), [
+        ["findings", ["lead-reviewer", "peer-reviewer"]],
+        ["positions", ["lead-reviewer", "peer-reviewer"]],
+        ["final", ["lead-reviewer"]],
+        ["signoff", ["peer-reviewer"]],
+      ]);
+      assert.deepEqual(task.review!.curated?.map((comment) => comment.id), ["R1", "R2"]);
+      assert.equal(task.push, undefined, "a code review is never pushed");
+      const comm = h.store.recentComm({ taskId: task.id });
+      assert.ok(comm.some((entry) => entry.text === "The request asks to review #7: fetching it and assigning the code review team (no planning needed)"));
+      assert.ok(comm.some((entry) => entry.kind === "plan" && entry.from === "manager" && /^Plan: Code review of pull request #7 - /.test(entry.text)));
+      assert.ok(comm.some((entry) => entry.text === "Creating sub-agents: Lead reviewer, Peer reviewer"));
+      assert.throws(() => h.runner.retry(task.id), /This code review is finished/);
+      await assert.rejects(h.runner.pushNow(task.id), /no branch of their own to push/);
+      assert.deepEqual(summarizeTask(task).plan?.review, { target: "#7" });
+      assert.equal(summarizeTask(task).plan?.direct, true);
+      assert.equal((await h.runner.reviewPublishStatus(task.id)).pullRequest?.number, 7);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("when a review request also asks for more, the planner must choose the reviewers or confirm otherwise", async () => {
+    const host = new FakeReviewHost();
+    host.lookup.pullRequest = githubPullRequest(7, { title: "Add greet", baseBranch: "main", headBranch: "feature/greet" });
+    const reviewPlan = (target: string, stages = ["review"]) =>
       ({
         stages,
         review_target: target,
@@ -514,14 +572,12 @@ describe("auto tasks: the manager assigns code reviews to the reviewers", () => 
         instructions: { review: "Focus on error handling" },
         briefing: "greet.js holds the greeting helpers.",
       }) as unknown as PlanSubmissionInput;
+    const codingPlan = { stages: ["coding"], rationale: "Fix risky code", instructions: { coding: "Fix it" }, briefing: "greet.js" } as unknown as PlanSubmissionInput;
     const reviewers = agreeingReview();
     const leadFindings = reviewers["lead-reviewer"][0]!;
     reviewers["lead-reviewer"][0] = steps((_spec, prompt) => {
-      assert.match(prompt, /## The request\n\nPlease review PR #7/);
       assert.match(prompt, /## Manager's briefing on the repository\n\ngreet\.js holds the greeting helpers\./);
       assert.match(prompt, /## Manager's assignment for the review\n\nFocus on error handling/);
-      assert.match(prompt, /Pull request #7 "Add greet"/);
-      assert.match(prompt, /\+export function greet\(name\)/);
     }, leadFindings);
     const h = createHarness(
       {
@@ -531,10 +587,12 @@ describe("auto tasks: the manager assigns code reviews to the reviewers", () => 
             const submit = spec.submit.onSubmit;
             assert.match(spec.systemPrompt, /- review: a lead reviewer and a peer reviewer/);
             assert.match(spec.systemPrompt, /Never answer it with `testing`/);
+            // The request reads as a review: a plan without the reviewers goes back once, with the reason.
+            await assert.rejects(async () => submit(codingPlan), /The request reads as a request to review #7, an existing change\. A code review goes to the review team/);
             // A pull request the remote does not have goes back to the planner, as does mixing teams.
-            await assert.rejects(async () => submit(plan("#99")), /The hub cannot review '#99': Could not fetch pull request #99 from origin/);
-            await assert.rejects(async () => submit(plan("#7", ["review", "testing"])), /A code review stands alone/);
-            await submit(plan("PR 7"));
+            await assert.rejects(async () => submit(reviewPlan("#99")), /The hub cannot review '#99': Could not fetch pull request #99 from origin/);
+            await assert.rejects(async () => submit(reviewPlan("#7", ["review", "testing"])), /A code review stands alone/);
+            await submit(reviewPlan("PR 7"));
           },
         ],
         ...reviewers,
@@ -542,38 +600,46 @@ describe("auto tasks: the manager assigns code reviews to the reviewers", () => 
       { reviewHost: host },
     );
     try {
-      const head = pullRequestOnOrigin(h);
-      const created = await h.runner.submit({ description: "Please review PR #7 and check the error handling", kind: "auto", repoId: "sample" });
-      assert.equal(created.peerReviewerModel, "fake-author", "Auto tasks carry a peer reviewer model in case the manager plans a code review");
+      pullRequestOnOrigin(h);
+      const created = await h.runner.submit({ description: "Review PR #7 and fix anything risky you find", kind: "auto", repoId: "sample" });
       await h.runner.idle();
       const task = h.store.getTask(created.id)!;
       assert.equal(task.status, "completed", String(task.error));
-      assert.equal(task.kind, "auto");
-      assert.deepEqual(task.plan?.stages, []);
+      assert.equal(h.driver.specsFor("planner").length, 1);
       assert.deepEqual(task.plan?.review, { target: "PR 7", instructions: "Focus on error handling" });
-      assert.deepEqual(task.stages, []);
-
-      // The manager assigned the two reviewers: no test executor, test fixer or coder.
+      assert.equal(task.plan?.direct, undefined);
       assert.deepEqual((task.agents ?? []).map((agent) => agent.role).sort(), ["lead-reviewer", "peer-reviewer", "planner"]);
-      for (const role of ["executor", "fixer", "coder", "code-reviewer"] as const) assert.equal(h.driver.specsFor(role).length, 0, role);
-
-      // The task became the review of the pull request: its branch points at the head, its base is the merge-base.
-      const target = task.review!.target;
-      assert.deepEqual([target.kind, target.headSha, target.baseRef, target.pullRequest?.number], ["pr", head, "main", 7]);
-      assert.equal(task.baseSha, git(h.repoPath, "rev-parse", "main"));
-      assert.equal(branchHead(h.repoPath, task.branch!), head);
-      assert.deepEqual(task.review!.curated?.map((comment) => comment.id), ["R1", "R2"]);
-      assert.equal(task.result?.approved, true);
-      assert.equal(task.push, undefined, "a code review is never pushed");
+      assert.equal(task.review?.target.pullRequest?.number, 7);
+      for (const role of ["executor", "fixer", "coder"] as const) assert.equal(h.driver.specsFor(role).length, 0, role);
       const comm = h.store.recentComm({ taskId: task.id });
-      assert.ok(comm.some((entry) => entry.kind === "plan" && /^Plan: Code review of pull request #7 - /.test(entry.text)));
-      assert.ok(comm.some((entry) => entry.text === "Creating sub-agents: Lead reviewer, Peer reviewer"));
-      assert.throws(() => h.runner.retry(task.id), /This code review is finished/);
-      await assert.rejects(h.runner.pushNow(task.id), /no branch of their own to push/);
-      assert.equal(summarizeTask(task).plan?.review?.target, "PR 7");
-      assert.equal((await h.runner.reviewPublishStatus(task.id)).pullRequest?.number, 7);
+      assert.ok(comm.some((entry) => entry.kind === "plan" && entry.from === "planner" && /^Plan: Code review of pull request #7 - /.test(entry.text)));
     } finally {
       h.cleanup();
+    }
+
+    // A planner that confirms its plan keeps it: the request asked for changes after all.
+    const coding = createHarness({
+      planner: [
+        async (spec) => {
+          if (spec.submit.kind !== "plan") throw new Error("the planner submits plans");
+          const submit = spec.submit.onSubmit;
+          await assert.rejects(async () => submit(codingPlan), /If the request really asks for changes rather than a review, call submit_plan again with your plan unchanged/);
+          await submit(codingPlan);
+        },
+      ],
+      coder: [steps(writeFile("README.md", "# Sample\n\nFixed.\n"), submitWork("Fixed the README"))],
+      "code-reviewer": [submitReview("approve")],
+    });
+    try {
+      const created = await coding.runner.submit({ description: "Review the branch main and fix the README typo", kind: "auto", repoId: "sample" });
+      await coding.runner.idle();
+      const task = coding.store.getTask(created.id)!;
+      assert.equal(task.status, "completed", String(task.error));
+      assert.deepEqual(task.plan?.stages, ["coding"]);
+      assert.equal(task.review, undefined);
+      assert.equal(coding.driver.specsFor("lead-reviewer").length, 0);
+    } finally {
+      coding.cleanup();
     }
   });
 
@@ -581,12 +647,12 @@ describe("auto tasks: the manager assigns code reviews to the reviewers", () => 
     const h = createHarness({ planner: [() => {}, () => {}, () => {}], ...agreeingReview() }, { reviewHost: new FakeReviewHost() });
     try {
       pullRequestOnOrigin(h);
-      const created = await h.runner.submit({ description: "Review pull request #7 for error handling", kind: "auto", repoId: "sample" });
+      const created = await h.runner.submit({ description: "Review pull request #7 and fix anything risky", kind: "auto", repoId: "sample" });
       await h.runner.idle();
       const task = h.store.getTask(created.id)!;
       assert.equal(task.status, "completed", String(task.error));
       assert.equal(task.plan?.fallback, true);
-      assert.deepEqual(task.plan?.review, { target: "#7", instructions: "Review pull request #7 for error handling" });
+      assert.deepEqual(task.plan?.review, { target: "#7" });
       assert.equal(task.review?.target.headRef, "refs/pull/7/head");
       assert.deepEqual(task.review!.rounds.map((round) => round.phase), ["findings", "positions", "final", "signoff"]);
       assert.equal(h.driver.specsFor("executor").length, 0);
@@ -594,7 +660,7 @@ describe("auto tasks: the manager assigns code reviews to the reviewers", () => 
       h.cleanup();
     }
 
-    const missing = createHarness({ planner: [() => {}, () => {}, () => {}] }, { reviewHost: new FakeReviewHost() });
+    const missing = createHarness({}, { reviewHost: new FakeReviewHost() });
     try {
       pullRequestOnOrigin(missing);
       const created = await missing.runner.submit({ description: "Review pull request #99", kind: "auto", repoId: "sample" });
@@ -604,6 +670,7 @@ describe("auto tasks: the manager assigns code reviews to the reviewers", () => 
       assert.match(task.error ?? "", /The request asks to review #99, but the hub cannot find it: Could not fetch pull request #99/);
       assert.equal(task.review, undefined);
       assert.equal(task.plan, undefined, "Retry plans the task again");
+      assert.equal(missing.driver.specsFor("planner").length, 0);
       assert.equal(missing.driver.specsFor("executor").length, 0);
       assert.equal(branchHead(missing.repoPath, task.branch!), git(missing.repoPath, "rev-parse", "main"), "the task branch was not moved");
     } finally {
@@ -623,11 +690,14 @@ describe("code review over HTTP", () => {
         probe.close(() => resolve(free));
       });
     });
+    const build = { version: "0.1.0", commit: "abc1234", ui: "ui-1" };
+    const copilot = { getState: () => ({ authenticated: true }) } as unknown as CopilotService;
     const server = createHttpServer({
       host: "127.0.0.1",
       port,
       publicDir: path.join(import.meta.dirname, "..", "public"),
-      router: createApiRouter({ store: h.store, bus: h.bus, runner: h.runner, copilot: {} as CopilotService, repos: {} as RepoService, version: "test" }),
+      router: createApiRouter({ store: h.store, bus: h.bus, runner: h.runner, copilot, repos: {} as RepoService, build }),
+      uiBuild: build.ui,
     });
     const origin = `http://127.0.0.1:${port}`;
     const call = async (method: string, url: string, body?: unknown) => {
@@ -642,6 +712,29 @@ describe("code review over HTTP", () => {
       addRemote(h);
       featureBranch(h, "feature/greet", { "greet.js": GREET });
       await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+
+      // Pages learn which code the hub runs; a page loaded from other UI files cannot change anything.
+      assert.deepEqual((await call("GET", "/api/health")).json, { ok: true, ...build });
+      const stream = await fetch(`${origin}/api/stream`);
+      const reader = stream.body!.getReader();
+      const first = new TextDecoder().decode((await reader.read()).value);
+      await reader.cancel();
+      assert.deepEqual(JSON.parse(/^data: (.*)$/m.exec(first)![1]!).build, build);
+      const fromPage = (ui?: string) =>
+        fetch(`${origin}/api/settings`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", Origin: origin, ...(ui ? { "X-Hub-UI": ui } : {}) },
+          body: JSON.stringify({ maxRounds: 2 }),
+        });
+      for (const ui of [undefined, "ui-0"]) {
+        const stale = await fromPage(ui);
+        assert.equal(stale.status, 409);
+        assert.deepEqual(await stale.json(), { error: "This page was loaded from an older version of Agent Hub. Reload the page (Ctrl+F5), then try again.", reload: true });
+      }
+      assert.equal(h.store.settings.maxRounds, 3, "the outdated page changed nothing");
+      assert.equal((await fromPage("ui-1")).status, 200);
+      assert.equal(h.store.settings.maxRounds, 2);
+
       const missing = await call("POST", "/api/tasks", { kind: "review", repoId: "sample" });
       assert.equal(missing.status, 400);
       assert.match(missing.json.error, /Enter the pull request/);

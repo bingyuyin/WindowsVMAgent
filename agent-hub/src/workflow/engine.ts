@@ -102,6 +102,7 @@ import {
   normalizeReview,
   normalizeTestRun,
   normalizeWork,
+  reviewRequestIn,
   severityForCategory,
 } from "./submissions.ts";
 
@@ -251,6 +252,9 @@ export class WorkflowEngine {
   private readonly reviewSubmissions = new Map<AgentRole, unknown>();
   /** The change a planned code review reviews, found when the planner submitted its plan. */
   private plannedReview: ResolvedReviewTarget | null = null;
+  /** The request reads as a review of a named change, but also asks for more: the planner must confirm a non-review plan. */
+  private reviewRequest: { target: string; base?: string } | null = null;
+  private reviewRequestChallenged = false;
 
   constructor(task: Task, options: EngineOptions) {
     this.task = task;
@@ -307,12 +311,20 @@ export class WorkflowEngine {
 
   /**
    * The manager plans an Auto task: its planner reads the request and the repository and decides which
-   * stages (and so which sub-agents) to create, with an assignment for each.
+   * stages (and so which sub-agents) to create, with an assignment for each. A request that names a pull
+   * request or branch to review, and asks for nothing else, goes straight to the two code reviewers.
    */
   private async plan(): Promise<void> {
     const { hooks, workspace } = this.options;
     const task = this.task;
     const role: AgentRole = "planner";
+    const reviewRequest = this.options.codeReviews ? reviewRequestIn(task.description) : null;
+    if (reviewRequest?.direct) {
+      await this.assignReview(reviewRequest);
+      return;
+    }
+    this.reviewRequest = reviewRequest;
+    this.reviewRequestChallenged = false;
     this.setPhase(undefined, "planning", 0);
     hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", text: "Planning: reading the request and the repository to decide which sub-agents to create" });
     let status: AgentStatus = "done";
@@ -381,18 +393,7 @@ export class WorkflowEngine {
         plannedAt: nowIso(),
       };
       task.stages = plan.stages.map((kind) => ({ kind, status: "pending", rounds: [], nextCommentNumber: 1 }));
-      const flow = task.review ? `Code review of ${reviewedChange(task.review.target)}` : plan.stages.map((kind) => STAGE_LABELS[kind]).join(" → ");
-      hooks.emit({ type: "info", role, text: `Manager's plan: ${flow}. ${plan.rationale}`, data: { plan: task.plan } });
-      hooks.comm({ from: role, to: "manager", kind: "plan", text: `Plan: ${flow} - ${truncate(plan.rationale, 240)}` });
-      // The resolver and the fixer only start when a review requests changes or a test run fails.
-      const team = task.review ? [...CODE_REVIEW_ROLES] : rolesForStages(plan.stages);
-      const onDemand: AgentRole[] = team.filter((candidate) => candidate === "resolver" || candidate === "fixer");
-      hooks.comm({
-        from: "manager",
-        to: "manager",
-        kind: "lifecycle",
-        text: `Creating sub-agents: ${team.filter((candidate) => !onDemand.includes(candidate)).map((candidate) => ROLE_LABELS[candidate]).join(", ")}${onDemand.length ? `; on demand: ${onDemand.map((candidate) => ROLE_LABELS[candidate]).join(", ")}` : ""}`,
-      });
+      this.announcePlan(role);
     } catch (error) {
       status = hooks.signal.aborted || error instanceof CancelledError ? "cancelled" : "failed";
       throw error;
@@ -400,6 +401,61 @@ export class WorkflowEngine {
       await this.releaseAgent(role, status);
       hooks.update();
     }
+  }
+
+  /**
+   * The request names a pull request or branch to review and asks for nothing else: no planning is needed. The
+   * manager fetches the change and assigns the lead and the peer reviewer; the task becomes that code review.
+   */
+  private async assignReview(request: { target: string; base?: string }): Promise<void> {
+    const { hooks } = this.options;
+    const task = this.task;
+    this.setPhase(undefined, "planning", 0);
+    hooks.comm({
+      from: "manager",
+      to: "manager",
+      kind: "lifecycle",
+      text: `The request asks to review ${request.target}: fetching it and assigning the code review team (no planning needed)`,
+    });
+    const review: PlannedReview = { target: request.target, ...(request.base ? { base: request.base } : {}) };
+    let resolved: ResolvedReviewTarget;
+    try {
+      resolved = await this.resolvePlannedReview(review);
+    } catch (error) {
+      throw new Error(`The request asks to review ${request.target}, but the hub cannot find it: ${errorMessage(error)}`);
+    }
+    this.throwIfAborted();
+    this.options.workspace = await this.options.codeReviews!.adopt(resolved);
+    task.plan = {
+      stages: [],
+      rationale: `The request asks to review ${reviewedChange(resolved.target)}, so the manager assigned the code review team directly: a lead and a peer reviewer review the change independently, discuss each other's findings and agree on the final review for you to curate and publish.`,
+      instructions: {},
+      review,
+      direct: true,
+      plannedAt: nowIso(),
+    };
+    task.stages = [];
+    this.announcePlan("manager");
+    hooks.update();
+  }
+
+  /** Reports the plan: the timeline, the manager's log and the sub-agents it creates. */
+  private announcePlan(from: AgentRole | "manager"): void {
+    const { hooks } = this.options;
+    const task = this.task;
+    const plan = task.plan!;
+    const flow = task.review ? `Code review of ${reviewedChange(task.review.target)}` : plan.stages.map((kind) => STAGE_LABELS[kind]).join(" → ");
+    hooks.emit({ type: "info", ...(from === "manager" ? {} : { role: from }), text: `Manager's plan: ${flow}. ${plan.rationale}`, data: { plan } });
+    hooks.comm({ from, to: "manager", kind: "plan", text: `Plan: ${flow} - ${truncate(plan.rationale, 240)}` });
+    // The resolver and the fixer only start when a review requests changes or a test run fails.
+    const team = task.review ? [...CODE_REVIEW_ROLES] : rolesForStages(plan.stages);
+    const onDemand: AgentRole[] = team.filter((candidate) => candidate === "resolver" || candidate === "fixer");
+    hooks.comm({
+      from: "manager",
+      to: "manager",
+      kind: "lifecycle",
+      text: `Creating sub-agents: ${team.filter((candidate) => !onDemand.includes(candidate)).map((candidate) => ROLE_LABELS[candidate]).join(", ")}${onDemand.length ? `; on demand: ${onDemand.map((candidate) => ROLE_LABELS[candidate]).join(", ")}` : ""}`,
+    });
   }
 
   private stage(kind: StageKind): Stage {
@@ -1143,6 +1199,14 @@ export class WorkflowEngine {
    */
   private async acceptPlan(input: PlanSubmissionInput): Promise<void> {
     const plan = normalizePlan(input);
+    // A request that reads as a review goes to the review team unless the planner, told so, confirms otherwise.
+    const request = this.reviewRequest;
+    if (request && !plan.review && !this.reviewRequestChallenged) {
+      this.reviewRequestChallenged = true;
+      throw new Error(
+        `The request reads as a request to review ${request.target}, an existing change. A code review goes to the review team: call submit_plan with stages ["review"], review_target "${request.target}" and the reviewers' focus in instructions.review - the reviewers read the change and comment on it; they do not change code or run tests. If the request really asks for changes rather than a review, call submit_plan again with your plan unchanged.`,
+      );
+    }
     let resolved: ResolvedReviewTarget | null = null;
     if (plan.review) {
       try {

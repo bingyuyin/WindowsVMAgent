@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { Bus, TaskMessage } from "../bus.ts";
+import type { BuildInfo } from "../build.ts";
 import type { CopilotService, LoginProvider } from "../copilot/service.ts";
 import { docForViewer, escapeHtml } from "../docs.ts";
 import type { RepoService } from "../repos.ts";
@@ -19,14 +20,15 @@ export interface ApiDeps {
   copilot: CopilotService;
   runner: TaskRunner;
   repos: RepoService;
-  version: string;
+  /** The hub's version, commit and UI fingerprint (pages compare it with the one they were loaded with). */
+  build: BuildInfo;
 }
 
 export function createApiRouter(deps: ApiDeps): Router {
-  const { store, bus, copilot, runner, repos } = deps;
+  const { store, bus, copilot, runner, repos, build } = deps;
   const router = new Router();
 
-  router.get("/api/health", () => ({ ok: true, version: deps.version }));
+  router.get("/api/health", () => ({ ok: true, ...build }));
 
   // ---- Authentication & models -------------------------------------------------------------
   router.get("/api/auth", () => copilot.getState());
@@ -220,7 +222,7 @@ export function createApiRouter(deps: ApiDeps): Router {
     "/api/stream",
     ({ req, res }) => {
       const sse = openSse(req, res);
-      sse.send({ type: "hello", auth: copilot.getState(), settings: store.settings });
+      sse.send({ type: "hello", auth: copilot.getState(), settings: store.settings, build });
       sse.onClose(bus.onGlobal((message) => sse.send(message)));
     },
     { raw: true },

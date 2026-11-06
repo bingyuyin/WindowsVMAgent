@@ -1,4 +1,4 @@
-import { get } from "./lib/api.js";
+import { get, setUiBuild } from "./lib/api.js";
 import { clear, h, setContent, spinner } from "./lib/dom.js";
 import { mergeComm, needsModels, notify, state, subscribe } from "./lib/store.js";
 import { agentsView } from "./views/agents.js";
@@ -107,6 +107,8 @@ function connect() {
       case "hello":
         state.auth = data.auth;
         state.settings = data.settings;
+        // The hub restarted with other UI files (it was updated): this page still runs the previous version.
+        if (data.build?.ui && state.build?.ui && data.build.ui !== state.build.ui) showUpdateBanner(data.build);
         // After a reconnect, re-sync everything that may have changed while we were offline.
         if (hellos++ > 0) refreshData().catch(() => undefined);
         notify("auth");
@@ -155,12 +157,37 @@ subscribe((kind) => {
   if (kind === "auth" || kind === "settings") route();
 });
 
+const describeBuild = (build) => (build ? `v${build.version}${build.commit ? ` (${build.commit})` : ""}` : "");
+
+/** The hub now serves newer UI files than this page runs: everything this page shows or sends may be out of date. */
+function showUpdateBanner(build) {
+  if (document.getElementById("update-banner")) return;
+  const from = describeBuild(state.build);
+  const to = describeBuild(build);
+  document.body.prepend(
+    h(
+      "div",
+      { id: "update-banner", class: "update-banner", role: "alert" },
+      h("strong", {}, "Agent Hub was updated."),
+      h(
+        "span",
+        {},
+        ` This page still runs the previous version${from && to && from !== to ? ` (${from}; the hub now runs ${to})` : ""}, so new features are missing and results may show wrongly. Reload to use the new version.`,
+      ),
+      h("button", { class: "btn btn-sm btn-primary", onclick: () => location.reload() }, "Reload now"),
+    ),
+  );
+}
+
 async function boot() {
   route();
   try {
-    const [auth, settings] = await Promise.all([get("/api/auth"), get("/api/settings")]);
+    const [auth, settings, build] = await Promise.all([get("/api/auth"), get("/api/settings"), get("/api/health")]);
     state.auth = auth;
     state.settings = settings;
+    state.build = build;
+    setUiBuild(build.ui, () => showUpdateBanner(null));
+    document.querySelector(".brand")?.setAttribute("title", `Copilot Agent Hub ${describeBuild(build)}`);
     await refreshData();
   } catch (error) {
     setContent(app, h("div", { class: "callout callout-danger" }, `Could not reach the hub: ${error.message}`));

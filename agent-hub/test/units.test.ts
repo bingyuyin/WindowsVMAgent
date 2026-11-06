@@ -8,6 +8,7 @@ import { evaluatePermission, parseGitCommand, splitCommandText } from "../src/ag
 import { describeTool } from "../src/agents/copilotDriver.ts";
 import { recoveryPrompt, restartNote, systemPromptFor, unitTestFailurePrompt } from "../src/agents/prompts.ts";
 import { buildSubmitTools } from "../src/agents/tools.ts";
+import { describeBuild, fingerprint, readBuildInfo } from "../src/build.ts";
 import { loadHubSkills, ROLE_SKILLS, skillsForRole, techSkillsFor } from "../src/context.ts";
 import { docForPrompt, docForViewer, documentProblem, formatOfPath, isDocumentPath, loadDocTemplates, renderDocTemplate } from "../src/docs.ts";
 import { numstatBetween } from "../src/git.ts";
@@ -31,6 +32,7 @@ import {
   normalizeTestRun,
   normalizeUnitTests,
   normalizeWork,
+  reviewRequestIn,
   reviewTargetIn,
 } from "../src/workflow/submissions.ts";
 
@@ -252,21 +254,36 @@ describe("manager plans", () => {
     assert.throws(() => normalizePlan({ ...review, stages: ["review"], review_base: "main branch" }), /`review_base` must be a branch name/);
 
     // The keyword fallback: review requests name what to review; addressing review feedback is coding.
-    assert.deepEqual(heuristicPlan("Review pull request #7 for error handling").review, { target: "#7", instructions: "Review pull request #7 for error handling" });
+    assert.deepEqual(heuristicPlan("Review pull request #7 for error handling").review, { target: "#7" });
     assert.deepEqual(heuristicPlan("Review pull request #7 for error handling").stages, []);
     assert.equal(heuristicPlan("Can you do a code review of https://github.com/acme/calc/pull/42?").review?.target, "https://github.com/acme/calc/pull/42");
     assert.equal(heuristicPlan("Please review PR 15, which should fix the login bug").review?.target, "#15");
     assert.equal(heuristicPlan("Review !5 before we merge").review?.target, "!5");
-    assert.deepEqual(heuristicPlan("Review the branch feature/login against develop").review, {
-      target: "feature/login",
-      base: "develop",
-      instructions: "Review the branch feature/login against develop",
-    });
+    assert.deepEqual(heuristicPlan("Review the branch feature/login against develop").review, { target: "feature/login", base: "develop" });
     assert.equal(heuristicPlan("Address the review comments on PR #12").review, undefined);
     assert.deepEqual(heuristicPlan("Address the review comments on PR #12").stages, ["coding"]);
     assert.equal(heuristicPlan("Implement retries; the code review module needs them").review, undefined);
     assert.throws(() => heuristicPlan("Please review my changes"), /asks for a code review but names no pull request or branch/);
     assert.deepEqual(reviewTargetIn("see #3 and https://github.com/a/b/pull/9."), { target: "https://github.com/a/b/pull/9" });
+  });
+
+  test("a request that names the change to review and asks for nothing else skips planning", () => {
+    // Direct: the manager assigns the two reviewers without its planner.
+    assert.deepEqual(reviewRequestIn("Review PR #7"), { target: "#7", direct: true });
+    assert.deepEqual(reviewRequestIn("Please review https://github.com/acme/calc/pull/42 and check the error handling"), {
+      target: "https://github.com/acme/calc/pull/42",
+      direct: true,
+    });
+    assert.deepEqual(reviewRequestIn("Code review of branch feature/login against develop, focusing on security"), { target: "feature/login", base: "develop", direct: true });
+    assert.deepEqual(reviewRequestIn("Please review PR 15, which fixes the login bug, and leave comments"), { target: "#15", direct: true });
+    // The planner decides, told that the request reads as a review: it also asks for changes.
+    assert.deepEqual(reviewRequestIn("Review PR #7 and fix anything risky"), { target: "#7", direct: false });
+    assert.deepEqual(reviewRequestIn("Review the README on branch docs and update the install steps"), { target: "docs", direct: false });
+    // Not a review of a named change: the planner plans as usual.
+    assert.equal(reviewRequestIn("Address the review comments on PR #12"), null);
+    assert.equal(reviewRequestIn("Please review my changes"), null);
+    assert.equal(reviewRequestIn("Add retries to the uploader (see #12)"), null);
+    assert.equal(reviewRequestIn("Implement the code review module"), null);
   });
 
   test("roles follow the plan; the planner and executor work in pinned checkouts", () => {
@@ -696,6 +713,34 @@ describe("remotes and pull requests", () => {
   test("automatic pushes can be turned off in the settings", () => {
     assert.deepEqual(parseSettingsPatch({ pushOnComplete: false }), { pushOnComplete: false });
     assert.throws(() => parseSettingsPatch({ pushOnComplete: "no" }), /pushOnComplete/);
+  });
+});
+
+describe("hub build", () => {
+  test("the UI fingerprint changes with any served file; the commit is the hub checkout's", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-hub-build-"));
+    try {
+      fs.mkdirSync(path.join(dir, "views"));
+      fs.writeFileSync(path.join(dir, "app.js"), "a");
+      fs.writeFileSync(path.join(dir, "views", "task.js"), "b");
+      const first = fingerprint(dir);
+      assert.match(first, /^[0-9a-f]{12}$/);
+      assert.equal(fingerprint(dir), first);
+      fs.writeFileSync(path.join(dir, "views", "task.js"), "c");
+      assert.notEqual(fingerprint(dir), first);
+      fs.renameSync(path.join(dir, "app.js"), path.join(dir, "main.js"));
+      fs.writeFileSync(path.join(dir, "views", "task.js"), "b");
+      assert.notEqual(fingerprint(dir), first, "renaming a file changes it too");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    const root = path.join(import.meta.dirname, "..");
+    const build = readBuildInfo(root, path.join(root, "public"));
+    assert.equal(build.version, JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version);
+    assert.match(build.commit ?? "", /^[0-9a-f]{7,}(\+changes)?$/);
+    assert.equal(build.ui, fingerprint(path.join(root, "public")));
+    assert.equal(describeBuild({ version: "0.1.0", commit: "ea2113d" }), "v0.1.0 (ea2113d)");
+    assert.equal(describeBuild({ version: "0.1.0", commit: null }), "v0.1.0");
   });
 });
 

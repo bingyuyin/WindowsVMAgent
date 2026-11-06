@@ -146,6 +146,25 @@ p {
 
 /* ---- layout ------------------------------------------------------------------------- */
 
+/* Shown when the hub was updated while this page stayed open. */
+.update-banner {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 24px;
+  background: var(--warning-muted);
+  border-bottom: 1px solid var(--warning);
+  color: var(--text);
+  font-size: 13.5px;
+}
+.update-banner strong {
+  color: var(--warning);
+}
+
 .topbar {
   position: sticky;
   top: 0;

@@ -54,6 +54,22 @@ npm start            # http://localhost:4600
    repository, base branch and description, and optionally per-task models and the maximum number of
    review rounds / test runs.
 
+### Updating the hub
+
+```powershell
+git pull             # in the WindowsVMAgent checkout
+cd agent-hub
+npm install          # only needed when package.json changed; harmless otherwise
+npm start            # stop the running hub first (Ctrl+C)
+```
+
+Then **reload the browser page** (Ctrl+F5). A page left open keeps running the previous UI after the hub
+restarts, so the hub notices: the page shows an **Agent Hub was updated** banner with a **Reload now**
+button, and the hub refuses changes (new tasks, settings, review edits) from it until it is reloaded.
+**Settings → About** shows the hub's version and git commit (`+changes` when its files differ from the
+commit), the console prints them at startup, and every task's timeline records the version it started on
+(*Started (attempt 1) on hub v0.1.0 (…)*).
+
 ## How a task runs
 
 ```mermaid
@@ -81,7 +97,8 @@ flowchart LR
    and a **briefing** on the repository (relevant modules and files, conventions, verified build/test
    commands, pitfalls). The hub creates the corresponding sub-agents and gives each the briefing and its
    assignment, so no agent has to rediscover the repository. A request to review an existing change
-   gets the `review` team instead, on its own (see [Code review](#code-review-two-reviewers-then-you-publish)).
+   gets the `review` team instead, on its own, and goes there directly (without planning) when it names
+   the pull request or branch and asks for nothing else (see [Code review](#code-review-two-reviewers-then-you-publish)).
    If the planner does not submit a plan, the hub derives the stages from keywords in the request (a
    request to review a named pull request or branch becomes a code review).
 1. **Context**: at the task's base commit the hub looks for instruction files (`AGENTS.md`,
@@ -182,12 +199,20 @@ The review covers `merge-base(target, head)..head`, the same change the pull req
 keeps the reviewed head on a local branch `agent-hub/<task>-<title>` (never pushed). The optional focus
 tells the reviewers what to look at.
 
-You can also just ask an **Auto** task, for example *"Review PR #42, focusing on error handling"*: the
-manager assigns the `review` team (never the test executor or a coder), names the pull request or branch
-to review (the hub fetches it right away and sends a wrong one back to the manager to correct), and gives
-the reviewers its briefing and what to focus on. The task then runs exactly like a Code review task; its
-plan card shows *Code review* with the reviewed pull request. Requests to *address* review comments are
-coding, not review.
+You can also just ask an **Auto** task, for example *"Review PR #42, focusing on error handling"*:
+
+- When the request names the pull request or branch to review and asks for nothing else, the manager
+  assigns the lead and the peer reviewer **directly**, without its planner: the hub fetches the change and
+  the task becomes that code review (the plan card says *assigned directly*). A pull request it cannot fetch
+  fails the task with the reason; fix it and Retry.
+- Otherwise (the request also asks for changes, or names no change), the planner decides. It can assign the
+  `review` team (never the test executor or a coder) and names the pull request or branch to review; the
+  hub fetches it right away and sends a wrong one back to the planner to correct. If the request reads as
+  a review and the planner picks another team, the hub sends the plan back once, explaining; a planner that
+  then submits the same plan again keeps it. The reviewers get the planner's briefing and what to focus on.
+
+Either way the task runs exactly like a Code review task. Requests to *address* review comments are coding,
+not review.
 
 1. **Independent reviews** (round 1, both reviewers in parallel, each in its own read-only worktree at the
    head): each one reads the change, its context and the repository's guidance and calls
@@ -520,6 +545,7 @@ deletes the task branch.
 
 | Method & path | Purpose |
 | --- | --- |
+| `GET /api/health` | The hub's `version`, git `commit` and `ui` fingerprint of the browser files it serves |
 | `GET /api/auth` · `POST /api/auth/login` · `POST /api/auth/login/:flow/input` · `POST /api/auth/login/:flow/cancel` · `POST /api/auth/token` · `POST /api/auth/logout` | Sign-in state and flows |
 | `GET /api/models` | Models available to the signed-in account |
 | `GET/PUT /api/settings` · `GET /api/storage` | Settings and where data is stored |
@@ -538,7 +564,9 @@ deletes the task branch.
 | `GET /api/agents/overview?taskId=&limit=` | Manager state and its recent messages with sub-agents |
 | `GET /api/stream` · `GET /api/tasks/:id/stream?after=<seq>` | Server-Sent Events (global incl. manager messages / per task) |
 
-Mutating requests must send `Content-Type: application/json`.
+Mutating requests must send `Content-Type: application/json`. Requests from a browser page (they carry an
+`Origin`) must also send `X-Hub-UI` with the `ui` fingerprint the page was loaded with; otherwise the hub
+answers `409` with `reload: true` (the page is out of date). Scripts that send no `Origin` are unaffected.
 
 ## Development
 
@@ -556,6 +584,7 @@ src/
   workflow/               runner (manager: queue, workspaces, monitoring, resume, review curation), engine (planning, sub-agent loops, unit-test gate, code review discussion, stuck-agent recovery), validation
   review/                 code review: targets (pull requests, branches), the reviewers' discussion rules, publishing (diff anchoring, GitHub CLI)
   http/                   dependency-free router, SSE, API routes, sandboxed document viewer
+  build.ts                the hub's version, git commit and UI fingerprint (outdated pages are detected)
   context.ts              repository context discovery and hub skills
   docs.ts                 HTML document templates, validation and viewer preparation
   git.ts                  task/agent workspaces: branches, worktrees, fast-forward, diffs

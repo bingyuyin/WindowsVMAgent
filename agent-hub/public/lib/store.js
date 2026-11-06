@@ -2,6 +2,8 @@
 export const state = {
   auth: null,
   settings: null,
+  /** The hub's version, commit and UI fingerprint when this page was loaded (GET /api/health). */
+  build: null,
   repos: [],
   tasks: new Map(),
   /** Recent manager <-> sub-agent messages (oldest first). */

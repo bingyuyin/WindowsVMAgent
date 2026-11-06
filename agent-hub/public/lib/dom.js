@@ -186,7 +186,8 @@ export const isCodeReviewTask = (task) => task.kind === "review" || Boolean(task
 /** Sub-agents of a task: for Auto tasks the manager's planner plus the team it planned (stages, or the two reviewers). */
 export function rolesForTask(task) {
   if (task.kind !== "auto") return rolesFor(task.kind);
-  if (isCodeReviewTask(task)) return ["planner", "lead-reviewer", "peer-reviewer"];
+  // A request that named the change to review went to the reviewers directly, without the planner.
+  if (isCodeReviewTask(task)) return task.plan?.direct ? ["lead-reviewer", "peer-reviewer"] : ["planner", "lead-reviewer", "peer-reviewer"];
   const stages = task.plan?.stages ?? task.stages?.map((stage) => stage.kind) ?? [];
   return ["planner", ...rolesForStages(stages)];
 }

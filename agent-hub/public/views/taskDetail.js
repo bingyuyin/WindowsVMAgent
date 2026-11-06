@@ -331,6 +331,7 @@ export function taskDetailView(root, { params }) {
           { class: "plan-head" },
           h("span", { class: "plan-badge", "aria-hidden": "true" }, "◆"),
           h("strong", {}, "Manager's plan"),
+          plan.direct ? chip("assigned directly", "info", "The request names the change to review, so the manager assigned the reviewers without planning") : null,
           plan.fallback ? chip("derived from keywords", "warning", "The planner did not submit a plan; the hub chose from the request") : null,
           h("span", { class: "spacer" }),
           h("span", { class: "muted small" }, plan.plannedAt ? `planned ${clock(plan.plannedAt)}` : ""),
