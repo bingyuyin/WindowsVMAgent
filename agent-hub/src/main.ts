@@ -12,6 +12,7 @@ import { GhPullRequestCreator } from "./remote.ts";
 import { RepoService } from "./repos.ts";
 import { GhReviewHost } from "./review/github.ts";
 import { Store } from "./store.ts";
+import { TodoService } from "./todos.ts";
 import { errorMessage } from "./util.ts";
 import { TaskRunner } from "./workflow/runner.ts";
 
@@ -44,6 +45,7 @@ const runner = new TaskRunner({
   hubBuild: describeBuild(build),
 });
 const repos = new RepoService(store, bus, config.reposDir);
+const todos = new TodoService(store, bus, runner);
 runner.init();
 
 copilot.onChange((auth) => {
@@ -55,7 +57,7 @@ const server = createHttpServer({
   host: config.host,
   port: config.port,
   publicDir: config.publicDir,
-  router: createApiRouter({ store, bus, copilot, runner, repos, build }),
+  router: createApiRouter({ store, bus, copilot, runner, repos, todos, build }),
   vendor: config.vendorFiles,
   uiBuild: build.ui,
 });

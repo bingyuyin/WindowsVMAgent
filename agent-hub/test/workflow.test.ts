@@ -13,6 +13,7 @@ import { createHttpServer } from "../src/http/server.ts";
 import type { PullRequestCreator, PullRequestRequest } from "../src/remote.ts";
 import type { RepoService } from "../src/repos.ts";
 import { runShellCommand, type CommandRunner } from "../src/shell.ts";
+import { TodoService } from "../src/todos.ts";
 import { pullRequestBody } from "../src/workflow/runner.ts";
 import { summarizeTask } from "../src/workflow/summary.ts";
 import {
@@ -982,6 +983,7 @@ describe("HTML documents", () => {
         runner: h.runner,
         copilot: {} as CopilotService,
         repos: {} as RepoService,
+        todos: new TodoService(h.store, h.bus, h.runner),
         build: { version: "test", commit: null, ui: "test" },
       }),
     });

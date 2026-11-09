@@ -21,6 +21,8 @@ export interface TaskSummary {
   kind: TaskKind;
   repoId: string;
   repoName: string;
+  /** The to-do the task was created from. */
+  todoId?: string;
   baseRef: string;
   branch?: string;
   status: TaskStatus;
@@ -79,6 +81,7 @@ export function summarizeTask(task: Task): TaskSummary {
     kind: task.kind,
     repoId: task.repoId,
     repoName: task.repoName,
+    todoId: task.todoId,
     baseRef: task.baseRef,
     branch: task.branch,
     status: task.status,

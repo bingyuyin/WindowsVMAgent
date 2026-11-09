@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import type { Activity, AgentRole, CommEntry, Repo, Settings, Task, TaskEvent } from "./types.ts";
+import type { Activity, AgentRole, CommEntry, Repo, Settings, Task, TaskEvent, Todo } from "./types.ts";
 import type { AuthState } from "./copilot/service.ts";
 import type { TaskSummary } from "./workflow/summary.ts";
 
@@ -8,6 +8,7 @@ export type GlobalMessage =
   | { type: "task-removed"; id: string }
   | { type: "auth"; auth: AuthState }
   | { type: "repos"; repos: readonly Repo[] }
+  | { type: "todos"; todos: readonly Todo[] }
   | { type: "settings"; settings: Settings }
   | { type: "comm"; entry: CommEntry }
   | { type: "manager"; lastCheckAt: string | null };

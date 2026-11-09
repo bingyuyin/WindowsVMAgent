@@ -145,7 +145,7 @@ export function settingsView(root) {
       const info = await get("/api/storage");
       setContent(
         storage,
-        h("p", { class: "muted small" }, `Everything the hub knows is saved on this machine under ${info.dataDir}: ${info.repos} repositories, ${info.tasks} tasks and ${info.commEntries} manager messages. Tasks keep their last state across restarts.`),
+        h("p", { class: "muted small" }, `Everything the hub knows is saved on this machine under ${info.dataDir}: ${info.repos} repositories, ${info.tasks} tasks, ${info.todos ?? 0} to-dos and ${info.commEntries} manager messages. Tasks keep their last state across restarts.`),
         h(
           "dl",
           { class: "storage-list" },

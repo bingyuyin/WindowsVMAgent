@@ -28,9 +28,11 @@ hub's best-practice skills for its role and for the technologies the repository 
 You sign in with GitHub in the browser, choose the LLMs, register repositories or folders, submit tasks,
 and watch each one live: which agent is working, what it is doing right now (planning, coding, reviewing,
 running tests, fixing failures), its latest message, streaming output and tool calls; when it finishes,
-the result. The **Agents** page shows the same work from the agents' side: a live hierarchy (or pipeline)
+the result. The **To-do** page keeps the work you note down for the agents until it is ready; **Send to
+manager** hands a to-do (or several) to the manager agent, which plans and runs each as an Auto task. The
+**Agents** page shows the same work from the agents' side: a live hierarchy (or pipeline)
 of the manager, the tasks and their sub-agents, and the manager's conversation with them. Everything
-(settings, repositories, each task's last state and history) is saved on local disk and survives restarts.
+(settings, repositories, to-dos, each task's last state and history) is saved on local disk and survives restarts.
 
 ## Quick start
 
@@ -52,7 +54,8 @@ npm start            # http://localhost:4600
    and opt in to "initialize git" (git init + an initial commit of its current files).
 4. **New task**: keep **Auto** to let the manager decide which agents to create, or choose a type; pick the
    repository, base branch and description, and optionally per-task models and the maximum number of
-   review rounds / test runs.
+   review rounds / test runs. Or collect work on the **To-do** page and send it to the manager when it is
+   ready (see [To-do list](#to-do-list-send-work-to-the-manager)).
 
 ### Updating the hub
 
@@ -65,7 +68,7 @@ npm start            # stop the running hub first (Ctrl+C)
 
 Then **reload the browser page** (Ctrl+F5). A page left open keeps running the previous UI after the hub
 restarts, so the hub notices: the page shows an **Agent Hub was updated** banner with a **Reload now**
-button, and the hub refuses changes (new tasks, settings, review edits) from it until it is reloaded.
+button, and the hub refuses changes (new tasks, to-dos, settings, review edits) from it until it is reloaded.
 **Settings → About** shows the hub's version and git commit (`+changes` when its files differ from the
 commit), the console prints them at startup, and every task's timeline records the version it started on
 (*Started (attempt 1) on hub v0.1.0 (…)*).
@@ -161,6 +164,26 @@ last message (a test run without structured results counts as *blocked*, never a
 asks a question (`ask_user`), the task shows **Needs your input**; answer in the UI, or after the
 configured timeout the agent proceeds on its own judgment. Agents that get stuck are recovered by the
 manager (see [Monitoring and recovering stuck agents](#monitoring-and-recovering-stuck-agents)).
+
+## To-do list: send work to the manager
+
+The **To-do** page is a list of work you note down for the agents before handing it over; its link in
+the top bar shows how many to-dos are waiting.
+
+- **Add** a to-do: a description (what the manager agent gets; Markdown is rendered), an optional title
+  (defaults to the first line), and the repository and base branch. The repository can be chosen later,
+  before sending; without a base branch the task starts from the branch checked out when it is sent.
+- **✎ Edit** an open to-do in place (Ctrl+Enter saves, Esc cancels) or **delete** it.
+- **▶ Send to manager** hands a to-do to the manager agent as an **Auto** task with the models from
+  Settings: the manager reads it and the repository, decides which sub-agents to create and runs it (a
+  request to review a pull request or branch goes straight to the two reviewers). **Send all to manager**,
+  or **Send selected** after ticking some, sends several after a confirmation, oldest first; up to the
+  parallel-task limit run at the same time and the others wait in the queue.
+- A sent to-do links to its task and shows the task's live status (filters: **To do**, **With the
+  manager**, **Finished**, **All**), and the task says *from to-do TD-001*. Sent to-dos are read-only:
+  once the task is no longer queued or running (finished, failed, cancelled or deleted), **↺ Reopen** puts
+  the to-do back on the list to change it and send it again as a new task (it remembers where it was last
+  sent). Deleting a to-do keeps its task.
 
 ## Requesting changes after a task finishes
 
@@ -517,9 +540,10 @@ a temp file, then renamed), so a crash never leaves a half-written file.
 
 ```text
 data/
-  hub.json                   storage format version and task counter
+  hub.json                   storage format version, task and to-do counters
   settings.json              settings
   repos.json                 registered repositories
+  todos.json                 the to-do list (open to-dos, and sent ones with their task)
   manager-log.jsonl          manager <-> sub-agent messages (Agents view; rotated at 8 MB)
   tasks/<id>/task.json       last known state of the task (stages, rounds, comments, agents, result, change requests, push, pull request; for code reviews the target, the discussion, the final review, your edits and what was published)
   tasks/<id>/events.jsonl    timeline (append-only)
@@ -550,6 +574,8 @@ deletes the task branch.
 | `GET /api/models` | Models available to the signed-in account |
 | `GET/PUT /api/settings` · `GET /api/storage` | Settings and where data is stored |
 | `GET/POST /api/repos` · `DELETE /api/repos/:id` · `GET /api/repos/:id/branches` | Repository registry |
+| `GET/POST /api/todos` · `PATCH/DELETE /api/todos/:id` | To-do list (`description`, optional `title`, `repoId`, `baseRef`; `null` or `""` clears an optional field; sent to-dos can't be changed: `409`) |
+| `POST /api/todos/:id/send` · `POST /api/todos/:id/reopen` | Send a to-do to the manager (creates an Auto task; returns `{ todo, task }`) / put a sent to-do back on the list once its task is not queued or running |
 | `GET/POST /api/tasks` · `GET/DELETE /api/tasks/:id` | Tasks (`kind`: `auto`, `coding`, `testing`, `design`, `document`, `design-coding`, `review`; optional `managerModel` for Auto; `reviewTarget` (pull request number/URL or branch) and optional `peerReviewerModel` for Code review) |
 | `POST /api/tasks/:id/cancel` · `POST /api/tasks/:id/retry` · `POST /api/tasks/:id/input` | Control and answers |
 | `POST /api/tasks/:id/change-request` | Request further changes to a finished task (`request`, optional `stage` and `rounds`) |
@@ -571,7 +597,7 @@ answers `409` with `reload: true` (the page is out of date). Scripts that send n
 ## Development
 
 ```powershell
-npm test             # node:test – workflow engine (scripted agents + real git), planning, unit-test gate, test execution, code review (discussion, curation, publishing), documents, concurrency and isolation between tasks, manager log, stuck-agent recovery, skills, storage, policy
+npm test             # node:test – workflow engine (scripted agents + real git), planning, unit-test gate, test execution, code review (discussion, curation, publishing), documents, to-do list, concurrency and isolation between tasks, manager log, stuck-agent recovery, skills, storage, policy
 npm run typecheck    # tsc for src and tests
 npm run dev          # restart on file changes
 ```

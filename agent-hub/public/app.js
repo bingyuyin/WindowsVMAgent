@@ -9,10 +9,12 @@ import { reposView } from "./views/repos.js";
 import { settingsView } from "./views/settings.js";
 import { taskDetailView } from "./views/taskDetail.js";
 import { tasksView } from "./views/tasks.js";
+import { todosView } from "./views/todos.js";
 
 const app = document.getElementById("app");
 const nav = document.getElementById("nav");
 const account = document.getElementById("account");
+const todoCount = document.getElementById("todo-count");
 
 const ROUTES = [
   { pattern: /^#\/login$/, view: loginView, public: true },
@@ -20,6 +22,7 @@ const ROUTES = [
   { pattern: /^#\/tasks\/new$/, view: newTaskView, nav: "tasks" },
   { pattern: /^#\/tasks\/([\w-]+)$/, view: taskDetailView, nav: "tasks" },
   { pattern: /^#\/tasks$/, view: tasksView, nav: "tasks" },
+  { pattern: /^#\/todos$/, view: todosView, nav: "todos" },
   { pattern: /^#\/agents$/, view: agentsView, nav: "agents", wide: true },
   { pattern: /^#\/repos$/, view: reposView, nav: "repos" },
   { pattern: /^#\/settings$/, view: settingsView, nav: "settings" },
@@ -78,16 +81,26 @@ function renderAccount() {
 }
 
 async function refreshData() {
-  const [tasks, repos, overview] = await Promise.all([get("/api/tasks"), get("/api/repos"), get("/api/agents/overview?limit=400")]);
+  const [tasks, repos, overview, todos] = await Promise.all([get("/api/tasks"), get("/api/repos"), get("/api/agents/overview?limit=400"), get("/api/todos")]);
   state.tasks = new Map(tasks.map((task) => [task.id, task]));
   state.repos = repos;
+  state.todos = todos;
   state.comm = [];
   mergeComm(overview.comm);
   state.manager = { monitorIntervalSec: overview.monitorIntervalSec, lastCheckAt: overview.lastCheckAt, startedAt: overview.startedAt };
   notify("tasks");
   notify("repos");
+  notify("todos");
   notify("comm");
   notify("manager");
+}
+
+/** The number of open to-dos next to the To-do link. */
+function renderTodoCount() {
+  const open = state.todos.filter((todo) => todo.status === "open").length;
+  todoCount.hidden = open === 0;
+  todoCount.textContent = String(open);
+  todoCount.title = `${open} to-do${open === 1 ? "" : "s"} not sent to the manager yet`;
 }
 
 function connect() {
@@ -141,6 +154,10 @@ function connect() {
         state.repos = data.repos;
         notify("repos");
         break;
+      case "todos":
+        state.todos = data.todos;
+        notify("todos");
+        break;
       case "comm":
         if (mergeComm([data.entry]).length) notify("comm", data.entry);
         break;
@@ -155,6 +172,7 @@ function connect() {
 subscribe((kind) => {
   if (kind === "auth" || kind === "settings" || kind === "connection") renderAccount();
   if (kind === "auth" || kind === "settings") route();
+  if (kind === "todos") renderTodoCount();
 });
 
 const describeBuild = (build) => (build ? `v${build.version}${build.commit ? ` (${build.commit})` : ""}` : "");

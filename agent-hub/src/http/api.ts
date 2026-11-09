@@ -5,6 +5,7 @@ import type { CopilotService, LoginProvider } from "../copilot/service.ts";
 import { docForViewer, escapeHtml } from "../docs.ts";
 import type { RepoService } from "../repos.ts";
 import type { Store } from "../store.ts";
+import type { TodoService } from "../todos.ts";
 import { DOC_FORMATS, ISOLATION_MODES, MAX_PARALLEL_TASKS, type DocFormat, type IsolationMode, type Settings, type TaskKind } from "../types.ts";
 import { HttpError } from "../util.ts";
 import type { TaskRunner } from "../workflow/runner.ts";
@@ -20,12 +21,13 @@ export interface ApiDeps {
   copilot: CopilotService;
   runner: TaskRunner;
   repos: RepoService;
+  todos: TodoService;
   /** The hub's version, commit and UI fingerprint (pages compare it with the one they were loaded with). */
   build: BuildInfo;
 }
 
 export function createApiRouter(deps: ApiDeps): Router {
-  const { store, bus, copilot, runner, repos, build } = deps;
+  const { store, bus, copilot, runner, repos, todos, build } = deps;
   const router = new Router();
 
   router.get("/api/health", () => ({ ok: true, ...build }));
@@ -110,6 +112,20 @@ export function createApiRouter(deps: ApiDeps): Router {
     return { ok: true };
   });
   router.get("/api/repos/:id/branches", ({ params }) => repos.branches(params.id!));
+
+  // ---- To-do list: noted work, sent to the manager agent when the user says so ------------
+  router.get("/api/todos", () => todos.list());
+  router.post("/api/todos", ({ body }) => todos.create(body));
+  router.patch("/api/todos/:id", ({ params, body }) => todos.update(params.id!, body));
+  router.delete("/api/todos/:id", ({ params }) => {
+    todos.remove(params.id!);
+    return { ok: true };
+  });
+  router.post("/api/todos/:id/send", async ({ params }) => {
+    const { todo, task } = await todos.send(params.id!);
+    return { todo, task: summarizeTask(task) };
+  });
+  router.post("/api/todos/:id/reopen", ({ params }) => todos.reopen(params.id!));
 
   // ---- Tasks -----------------------------------------------------------------------------
   router.get("/api/tasks", () =>

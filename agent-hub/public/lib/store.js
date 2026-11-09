@@ -6,6 +6,8 @@ export const state = {
   build: null,
   repos: [],
   tasks: new Map(),
+  /** The to-do list (GET /api/todos), kept current by the global stream. */
+  todos: [],
   /** Recent manager <-> sub-agent messages (oldest first). */
   comm: [],
   /** Manager monitoring info: { monitorIntervalSec, lastCheckAt, startedAt }. */
@@ -41,3 +43,15 @@ export function mergeComm(entries) {
 }
 
 export const needsModels = () => !state.settings?.authorModel || !state.settings?.reviewerModel;
+
+/** Puts a to-do the hub returned into the list (adding or replacing it). */
+export function upsertTodo(todo) {
+  const index = state.todos.findIndex((candidate) => candidate.id === todo.id);
+  state.todos = index >= 0 ? state.todos.map((candidate, i) => (i === index ? todo : candidate)) : [...state.todos, todo];
+  notify("todos");
+}
+
+export function dropTodo(id) {
+  state.todos = state.todos.filter((todo) => todo.id !== id);
+  notify("todos");
+}

@@ -70,6 +70,8 @@ export interface SubmitTaskInput {
   /** Code review tasks: the pull request (number or URL) or the branch, tag or commit to review. */
   reviewTarget?: string;
   maxRounds?: number;
+  /** The to-do the task is created from (sent to the manager from the to-do list). */
+  todoId?: string;
 }
 
 /** The subset of the Copilot service the runner depends on. */
@@ -309,6 +311,7 @@ export class TaskRunner {
       updatedAt: now,
       lastSeq: 0,
       ...(review ? { review } : {}),
+      ...(input.todoId ? { todoId: input.todoId } : {}),
     };
     if (review) {
       // The reviewed head gets a branch right away, so the fetched commits stay referenced while the task waits.
@@ -327,12 +330,15 @@ export class TaskRunner {
     const where = review
       ? `${review.target.pullRequest ? `pull request #${review.target.pullRequest.number}` : review.target.headRef} (${review.target.headSha.slice(0, 10)}) against ${baseRef}`
       : `${repo.name} @ ${baseRef} (${baseSha.slice(0, 10)})`;
-    this.emit(task, { type: "status", text: `Queued ${KIND_LABELS[task.kind]} task ${review ? `of ${where} on ${repo.name}` : `on ${where}`}` });
+    const fromTodo = input.todoId ? ` (from to-do ${input.todoId})` : "";
+    this.emit(task, { type: "status", text: `Queued ${KIND_LABELS[task.kind]} task ${review ? `of ${where} on ${repo.name}` : `on ${where}`}${fromTodo}` });
     this.comm(task, {
       from: "user",
       to: "manager",
       kind: "lifecycle",
-      text: review ? `New code review of ${where} on ${repo.name}` : `New ${KIND_LABELS[task.kind]} task on ${repo.name} @ ${baseRef}: ${truncate(firstLine(description), 140)}`,
+      text: review
+        ? `New code review of ${where} on ${repo.name}${fromTodo}`
+        : `New ${KIND_LABELS[task.kind]} task on ${repo.name} @ ${baseRef}${fromTodo}: ${truncate(firstLine(description), 140)}`,
     });
     this.publish(task);
     this.pump();

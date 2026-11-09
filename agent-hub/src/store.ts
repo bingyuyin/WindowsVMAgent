@@ -1,12 +1,14 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { MAX_PARALLEL_TASKS, type CommEntry, type NewTaskEvent, type Repo, type Settings, type Task, type TaskEvent } from "./types.ts";
+import { MAX_PARALLEL_TASKS, type CommEntry, type NewTaskEvent, type Repo, type Settings, type Task, type TaskEvent, type Todo } from "./types.ts";
 import { nowIso } from "./util.ts";
 
 interface HubMeta {
   version: 2;
   nextTaskNumber: number;
+  /** Next to-do number (TD-001, ...); absent in data folders from before the to-do list. */
+  nextTodoNumber?: number;
   createdAt: string;
   migratedFrom?: string;
 }
@@ -44,6 +46,7 @@ export interface StorageInfo {
   files: Array<{ label: string; path: string; description: string }>;
   repos: number;
   tasks: number;
+  todos: number;
   commEntries: number;
 }
 
@@ -54,10 +57,11 @@ const COMM_ROTATE_BYTES = 8 * 1024 * 1024;
 const TASK_SAVE_DELAY_MS = 250;
 const ARTIFACT_NAME = /^[\w.-]+$/;
 const TASK_ID = /^[\w.-]+$/;
+const TODO_ID = /^TD-\d+$/;
 
 /**
  * Local-disk persistence in the data folder:
- * - `hub.json` (format version, task counter), `settings.json`, `repos.json`
+ * - `hub.json` (format version, task and to-do counters), `settings.json`, `repos.json`, `todos.json`
  * - `tasks/<id>/task.json` (last known state of each task), `events.jsonl` (timeline) and artifacts
  *   (document snapshots per review round)
  * - `manager-log.jsonl` (manager <-> sub-agent communication)
@@ -66,10 +70,11 @@ const TASK_ID = /^[\w.-]+$/;
  */
 export class Store {
   readonly dataDir: string;
-  private meta: HubMeta = { version: 2, nextTaskNumber: 1, createdAt: nowIso() };
+  private meta: HubMeta = { version: 2, nextTaskNumber: 1, nextTodoNumber: 1, createdAt: nowIso() };
   private settingsValue: Settings = { ...DEFAULT_SETTINGS };
   private repoList: Repo[] = [];
   private taskList: Task[] = [];
+  private todoList: Todo[] = [];
   private readonly dirtyTasks = new Set<string>();
   private taskTimer: NodeJS.Timeout | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
@@ -89,6 +94,7 @@ export class Store {
       hub: path.join(this.dataDir, "hub.json"),
       settings: path.join(this.dataDir, "settings.json"),
       repos: path.join(this.dataDir, "repos.json"),
+      todos: path.join(this.dataDir, "todos.json"),
       tasks: path.join(this.dataDir, "tasks"),
       managerLog: path.join(this.dataDir, "manager-log.jsonl"),
       legacyState: path.join(this.dataDir, "state.json"),
@@ -102,14 +108,18 @@ export class Store {
     this.settingsValue = { ...DEFAULT_SETTINGS, ...(isObject(settings) ? settings : {}) };
     const repos = readJson<Repo[]>(this.paths.repos);
     this.repoList = Array.isArray(repos) ? repos : [];
+    const todos = readJson<Todo[]>(this.paths.todos);
+    this.todoList = Array.isArray(todos) ? todos.filter((todo) => isObject(todo) && TODO_ID.test(String(todo.id))) : [];
     this.taskList = this.loadTasks();
     const meta = readJson<Partial<HubMeta>>(this.paths.hub);
     const highest = Math.max(0, ...this.taskList.map((task) => taskNumber(task.id)));
+    const highestTodo = Math.max(0, ...this.todoList.map((todo) => Number(todo.id.slice(3))));
     this.meta = {
       ...(isObject(meta) ? meta : {}),
       version: 2,
       createdAt: meta?.createdAt ?? nowIso(),
       nextTaskNumber: Math.max(Number(meta?.nextTaskNumber) || 1, highest + 1),
+      nextTodoNumber: Math.max(Number(meta?.nextTodoNumber) || 1, highestTodo + 1),
     };
     this.writeMeta();
     this.loadCommTail();
@@ -145,6 +155,39 @@ export class Store {
   removeRepo(id: string): void {
     this.repoList = this.repoList.filter((repo) => repo.id !== id);
     writeJsonAtomic(this.paths.repos, this.repoList);
+  }
+
+  // ---- To-do list -----------------------------------------------------------------------
+
+  get todos(): readonly Todo[] {
+    return this.todoList;
+  }
+
+  getTodo(id: string): Todo | undefined {
+    return this.todoList.find((todo) => todo.id === id);
+  }
+
+  addTodo(todo: Todo): void {
+    if (!TODO_ID.test(todo.id)) throw new Error(`Invalid to-do id: ${todo.id}`);
+    this.todoList.push(todo);
+    this.saveTodos();
+  }
+
+  removeTodo(id: string): void {
+    this.todoList = this.todoList.filter((todo) => todo.id !== id);
+    this.saveTodos();
+  }
+
+  /** Writes the to-do list (after a to-do was changed in place). */
+  saveTodos(): void {
+    writeJsonAtomic(this.paths.todos, this.todoList);
+  }
+
+  allocateTodoId(): string {
+    const n = this.meta.nextTodoNumber ?? 1;
+    this.meta.nextTodoNumber = n + 1;
+    this.writeMeta();
+    return `TD-${String(n).padStart(3, "0")}`;
   }
 
   // ---- Tasks ----------------------------------------------------------------------------
@@ -283,12 +326,14 @@ export class Store {
       files: [
         { label: "Settings", path: paths.settings, description: "Models, rounds, concurrency, isolation and document options" },
         { label: "Repositories", path: paths.repos, description: "Registered repositories" },
+        { label: "To-do list", path: paths.todos, description: "To-do tasks, kept until they are sent to the manager agent" },
         { label: "Tasks", path: paths.tasks, description: "Per task: task.json (last state), events.jsonl (timeline), document snapshots" },
         { label: "Manager log", path: paths.managerLog, description: "Manager <-> sub-agent communication" },
-        { label: "Hub", path: paths.hub, description: "Storage format version and task counter" },
+        { label: "Hub", path: paths.hub, description: "Storage format version, task and to-do counters" },
       ],
       repos: this.repoList.length,
       tasks: this.taskList.length,
+      todos: this.todoList.length,
       commEntries: this.commSeq,
     };
   }

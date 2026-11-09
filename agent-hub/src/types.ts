@@ -581,6 +581,30 @@ export interface PullRequestInfo {
   createdAt: string;
 }
 
+// ---- To-do list ----------------------------------------------------------------------------------
+
+export type TodoStatus = "open" | "sent";
+
+/** Work the user wants done, kept on the to-do list until it is sent to the manager agent (as an Auto task). */
+export interface Todo {
+  /** TD-001, TD-002, ... */
+  id: string;
+  /** Optional: the list shows the first line of the description when it is empty. */
+  title: string;
+  /** The request the manager agent gets. */
+  description: string;
+  /** Repository the work is for; needed to send the to-do. */
+  repoId?: string;
+  /** Branch to start from; the repository's checked-out branch when empty. */
+  baseRef?: string;
+  status: TodoStatus;
+  /** The task created the last time the to-do was sent (kept when it is reopened). */
+  taskId?: string;
+  sentAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -588,6 +612,8 @@ export interface Task {
   kind: TaskKind;
   repoId: string;
   repoName: string;
+  /** The to-do the task was created from (sent to the manager from the to-do list). */
+  todoId?: string;
   baseRef: string;
   baseSha?: string;
   /** Final task branch; the hub fast-forwards it to each author round's commit. */

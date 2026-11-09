@@ -407,7 +407,14 @@ export function taskDetailView(root, { params }) {
       h(
         "div",
         { class: "grow" },
-        h("div", { class: "task-card-top" }, chip(status.label, status.cls), h("span", { class: "task-id mono" }, task.id), chip(KIND_LABELS[task.kind], "outline")),
+        h(
+          "div",
+          { class: "task-card-top" },
+          chip(status.label, status.cls),
+          h("span", { class: "task-id mono" }, task.id),
+          chip(KIND_LABELS[task.kind], "outline"),
+          task.todoId ? h("a", { class: "chip chip-info-soft", href: "#/todos", title: "This task was sent from the to-do list" }, `from to-do ${task.todoId}`) : null,
+        ),
         h("h1", { class: "detail-title" }, task.title),
       ),
       h("div", { class: "detail-actions" }, actions),

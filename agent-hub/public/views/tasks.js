@@ -181,7 +181,7 @@ function taskCard(task) {
         { class: "task-card-top" },
         chip(status.label, status.cls),
         h("span", { class: "task-id mono" }, task.id),
-        h("span", { class: "muted" }, `${KIND_LABELS[task.kind]} · ${task.repoName}`),
+        h("span", { class: "muted" }, `${KIND_LABELS[task.kind]} · ${task.repoName}${task.todoId ? ` · from to-do ${task.todoId}` : ""}`),
       ),
       h("div", { class: "task-title" }, task.title),
       pipelineMini(task),
