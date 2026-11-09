@@ -13,7 +13,6 @@ export interface TodoInput {
 }
 
 const MAX_TITLE = 200;
-const MAX_DESCRIPTION = 50_000;
 
 /**
  * The to-do list: work the user notes down for the agents, kept (and editable) until it is sent to the manager
@@ -44,7 +43,8 @@ export class TodoService {
   }
 
   create(input: TodoInput): Todo {
-    const description = text(input.description, "description", MAX_DESCRIPTION);
+    // Like task descriptions, a to-do's description has no length limit.
+    const description = text(input.description, "description", Infinity);
     if (!description) throw new HttpError(400, "Describe the work: the description is what the manager agent gets");
     const title = text(input.title, "title", MAX_TITLE);
     const location = this.location(optional(input.repoId, "repoId"), optional(input.baseRef, "baseRef"));
@@ -60,7 +60,7 @@ export class TodoService {
     const todo = this.open(id, "change it");
     let description = todo.description;
     if (input.description !== undefined) {
-      description = text(input.description, "description", MAX_DESCRIPTION);
+      description = text(input.description, "description", Infinity);
       if (!description) throw new HttpError(400, "The description cannot be empty; delete the to-do instead");
     }
     const title = input.title !== undefined ? text(input.title, "title", MAX_TITLE) : todo.title;

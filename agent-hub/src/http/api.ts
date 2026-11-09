@@ -15,6 +15,13 @@ import { openSse, Router } from "./server.ts";
 /** Scripts injected into HTML documents shown in the sandboxed viewer (Mermaid + diagram rendering). */
 export const DOC_VIEWER_SCRIPTS = ["/vendor/mermaid.min.js", "/lib/doc-viewer.js"];
 
+/**
+ * Task and to-do descriptions have no length limit, so the requests that carry one may be far larger than others.
+ * The cap only guards against runaway uploads: it is well beyond any model's context window.
+ */
+export const DESCRIPTION_BODY_BYTES = 64 * 1024 * 1024;
+const withDescription = { maxBodyBytes: DESCRIPTION_BODY_BYTES };
+
 export interface ApiDeps {
   store: Store;
   bus: Bus;
@@ -115,8 +122,8 @@ export function createApiRouter(deps: ApiDeps): Router {
 
   // ---- To-do list: noted work, sent to the manager agent when the user says so ------------
   router.get("/api/todos", () => todos.list());
-  router.post("/api/todos", ({ body }) => todos.create(body));
-  router.patch("/api/todos/:id", ({ params, body }) => todos.update(params.id!, body));
+  router.post("/api/todos", ({ body }) => todos.create(body), withDescription);
+  router.patch("/api/todos/:id", ({ params, body }) => todos.update(params.id!, body), withDescription);
   router.delete("/api/todos/:id", ({ params }) => {
     todos.remove(params.id!);
     return { ok: true };
@@ -132,25 +139,29 @@ export function createApiRouter(deps: ApiDeps): Router {
     [...store.tasks].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map(summarizeTask),
   );
 
-  router.post("/api/tasks", async ({ body }) => {
-    const maxRounds = body.maxRounds === undefined || body.maxRounds === "" ? undefined : Number(body.maxRounds);
-    const kind = requireString(body, "kind", 40) as TaskKind;
-    return runner.submit({
-      title: optionalString(body, "title", 200),
-      // A code review's focus is optional.
-      description: kind === "review" ? (optionalString(body, "description", 50_000) ?? "") : requireString(body, "description", 50_000),
-      kind,
-      repoId: requireString(body, "repoId", 200),
-      baseRef: optionalString(body, "baseRef", 300),
-      authorModel: optionalString(body, "authorModel", 200),
-      reviewerModel: optionalString(body, "reviewerModel", 200),
-      resolverModel: optionalString(body, "resolverModel", 200),
-      managerModel: optionalString(body, "managerModel", 200),
-      peerReviewerModel: optionalString(body, "peerReviewerModel", 200),
-      reviewTarget: optionalString(body, "reviewTarget", 1000),
-      maxRounds,
-    });
-  });
+  router.post(
+    "/api/tasks",
+    async ({ body }) => {
+      const maxRounds = body.maxRounds === undefined || body.maxRounds === "" ? undefined : Number(body.maxRounds);
+      const kind = requireString(body, "kind", 40) as TaskKind;
+      return runner.submit({
+        title: optionalString(body, "title", 200),
+        // A code review's focus is optional. Descriptions have no length limit.
+        description: kind === "review" ? (optionalString(body, "description", Infinity) ?? "") : requireString(body, "description", Infinity),
+        kind,
+        repoId: requireString(body, "repoId", 200),
+        baseRef: optionalString(body, "baseRef", 300),
+        authorModel: optionalString(body, "authorModel", 200),
+        reviewerModel: optionalString(body, "reviewerModel", 200),
+        resolverModel: optionalString(body, "resolverModel", 200),
+        managerModel: optionalString(body, "managerModel", 200),
+        peerReviewerModel: optionalString(body, "peerReviewerModel", 200),
+        reviewTarget: optionalString(body, "reviewTarget", 1000),
+        maxRounds,
+      });
+    },
+    withDescription,
+  );
 
   router.get("/api/tasks/:id", async ({ params }) => {
     const task = runner.get(params.id!);

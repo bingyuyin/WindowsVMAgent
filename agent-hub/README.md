@@ -590,7 +590,9 @@ deletes the task branch.
 | `GET /api/agents/overview?taskId=&limit=` | Manager state and its recent messages with sub-agents |
 | `GET /api/stream` · `GET /api/tasks/:id/stream?after=<seq>` | Server-Sent Events (global incl. manager messages / per task) |
 
-Mutating requests must send `Content-Type: application/json`. Requests from a browser page (they carry an
+Mutating requests must send `Content-Type: application/json`. Task and to-do descriptions have no length
+limit: the requests that carry one (`POST /api/tasks`, `POST /api/todos`, `PATCH /api/todos/:id`) may be up to
+64 MB, other requests up to 1 MB. Requests from a browser page (they carry an
 `Origin`) must also send `X-Hub-UI` with the `ui` fingerprint the page was loaded with; otherwise the hub
 answers `409` with `reload: true` (the page is out of date). Scripts that send no `Origin` are unaffected.
 

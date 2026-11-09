@@ -4,7 +4,7 @@ import net from "node:net";
 import path from "node:path";
 import { describe, test } from "node:test";
 import type { CopilotService } from "../src/copilot/service.ts";
-import { createApiRouter } from "../src/http/api.ts";
+import { createApiRouter, DESCRIPTION_BODY_BYTES } from "../src/http/api.ts";
 import { createHttpServer } from "../src/http/server.ts";
 import type { RepoService } from "../src/repos.ts";
 import { Store } from "../src/store.ts";
@@ -13,7 +13,7 @@ import type { Task, Todo } from "../src/types.ts";
 import { HttpError } from "../src/util.ts";
 import type { SubmitTaskInput } from "../src/workflow/runner.ts";
 import { summarizeTask } from "../src/workflow/summary.ts";
-import { createHarness, steps, submitPlan, submitReview, submitWork, writeFile } from "./helpers.ts";
+import { createHarness, steps, submitPlan, submitReview, submitWork, writeFile, type Harness } from "./helpers.ts";
 
 /** Matches an HttpError with this status and message. */
 const httpError =
@@ -27,6 +27,35 @@ const httpError =
 
 /** The fields the user controls (without timestamps). */
 const fields = ({ createdAt: _created, updatedAt: _updated, ...rest }: Todo) => rest;
+
+/** The hub's HTTP API for the harness, on a free local port. */
+async function serveApi(h: Harness) {
+  const port = await new Promise<number>((resolve) => {
+    const probe = net.createServer().listen(0, "127.0.0.1", () => {
+      const { port: free } = probe.address() as net.AddressInfo;
+      probe.close(() => resolve(free));
+    });
+  });
+  const router = createApiRouter({
+    store: h.store,
+    bus: h.bus,
+    runner: h.runner,
+    copilot: {} as CopilotService,
+    repos: {} as RepoService,
+    todos: new TodoService(h.store, h.bus, h.runner),
+    build: { version: "test", commit: null, ui: "test" },
+  });
+  const server = createHttpServer({ host: "127.0.0.1", port, publicDir: path.join(import.meta.dirname, "..", "public"), router });
+  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  const call = async (method: string, url: string, body: unknown = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}${url}`, {
+      method,
+      ...(method === "GET" ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+    });
+    return { status: response.status, json: (await response.json()) as any };
+  };
+  return { router, call, close: () => server.close() };
+}
 
 describe("to-do list", () => {
   test("to-dos get ids that are never reused, and are validated, edited, deleted and kept across restarts", () => {
@@ -240,35 +269,8 @@ describe("to-do list", () => {
 
   test("HTTP: list, add, edit, send, reopen and delete to-dos", async () => {
     const h = createHarness({}, { ready: false });
-    const port = await new Promise<number>((resolve) => {
-      const probe = net.createServer().listen(0, "127.0.0.1", () => {
-        const { port: free } = probe.address() as net.AddressInfo;
-        probe.close(() => resolve(free));
-      });
-    });
-    const server = createHttpServer({
-      host: "127.0.0.1",
-      port,
-      publicDir: path.join(import.meta.dirname, "..", "public"),
-      router: createApiRouter({
-        store: h.store,
-        bus: h.bus,
-        runner: h.runner,
-        copilot: {} as CopilotService,
-        repos: {} as RepoService,
-        todos: new TodoService(h.store, h.bus, h.runner),
-        build: { version: "test", commit: null, ui: "test" },
-      }),
-    });
-    const call = async (method: string, url: string, body: unknown = {}) => {
-      const response = await fetch(`http://127.0.0.1:${port}${url}`, {
-        method,
-        ...(method === "GET" ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
-      });
-      return { status: response.status, json: (await response.json()) as any };
-    };
+    const { call, close } = await serveApi(h);
     try {
-      await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
       assert.deepEqual(await call("GET", "/api/todos"), { status: 200, json: [] });
       const invalid = await call("POST", "/api/todos", { title: "No description" });
       assert.deepEqual([invalid.status, invalid.json.error], [400, "Describe the work: the description is what the manager agent gets"]);
@@ -300,7 +302,47 @@ describe("to-do list", () => {
       assert.deepEqual(await call("GET", "/api/todos"), { status: 200, json: [] });
       assert.ok(h.store.getTask(sent.json.task.id), "the task stays");
     } finally {
-      server.close();
+      close();
+      h.cleanup();
+    }
+  });
+
+  test("task and to-do descriptions have no length limit", async () => {
+    const h = createHarness({}, { ready: false });
+    const api = await serveApi(h);
+    try {
+      // Megabytes of text: far past the former 50,000-character limit and the 1 MiB cap on other requests.
+      const log = "2026-11-09T08:00:00Z [INFO] uploader: retrying chunk 17 of 40 after a timeout\n".repeat(40_000);
+      const description = `Fix the flaky upload test; the full log follows.\n\n${log}`.trim();
+      assert.ok(description.length > 3_000_000);
+
+      const created = await api.call("POST", "/api/tasks", { kind: "coding", repoId: "sample", description });
+      assert.equal(created.status, 200, created.json.error);
+      assert.equal(created.json.title, "Fix the flaky upload test; the full log follows.");
+      assert.equal(h.store.getTask(created.json.id)?.description, description);
+
+      const todo = await api.call("POST", "/api/todos", { description, repoId: "sample" });
+      assert.equal(todo.status, 200, todo.json.error);
+      const longer = `${description}\n\nAlso check the retry limit.`;
+      const edited = await api.call("PATCH", `/api/todos/${todo.json.id}`, { description: longer });
+      assert.equal(edited.status, 200, edited.json.error);
+      const sent = await api.call("POST", `/api/todos/${todo.json.id}/send`);
+      assert.equal(sent.status, 200, sent.json.error);
+      assert.equal(h.store.getTask(sent.json.task.id)?.description, longer, "the manager gets the whole description");
+
+      // Only the requests that carry a description accept large bodies; the others keep the 1 MiB guard.
+      const bodyLimit = (method: string, url: string) => {
+        const match = api.router.match(method, url);
+        assert.ok(match && match !== "method-not-allowed", `${method} ${url}`);
+        return match.route.maxBodyBytes;
+      };
+      assert.deepEqual(
+        [bodyLimit("POST", "/api/tasks"), bodyLimit("POST", "/api/todos"), bodyLimit("PATCH", "/api/todos/TD-001")],
+        [DESCRIPTION_BODY_BYTES, DESCRIPTION_BODY_BYTES, DESCRIPTION_BODY_BYTES],
+      );
+      assert.deepEqual([bodyLimit("PUT", "/api/settings"), bodyLimit("POST", "/api/tasks/T-001/change-request")], [1024 * 1024, 1024 * 1024]);
+    } finally {
+      api.close();
       h.cleanup();
     }
   });

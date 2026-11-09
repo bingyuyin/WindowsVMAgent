@@ -450,7 +450,8 @@ export function reviewTargetIn(description: string): { target: string; base?: st
   const candidates = [
     ...[...description.matchAll(/https?:\/\/[^\s<>()'"`]+/gi)].map((match) => match[0].replace(/[.,;:!?]+$/, "")),
     ...[...description.matchAll(/(?:^|[\s(,:])([#!]\d{1,9})\b/g)].map((match) => match[1]!),
-    ...[...description.matchAll(/\b(?:pull request|merge request|PR|MR)\s*[#!:]?\s*(\d{1,9})\b/gi)].map((match) => `#${match[1]}`),
+    // `(?:\s*[#!:])?\s*` rather than `\s*[#!:]?\s*`: the same matches, but linear in a long run of spaces (requests have no length limit).
+    ...[...description.matchAll(/\b(?:pull request|merge request|PR|MR)(?:\s*[#!:])?\s*(\d{1,9})\b/gi)].map((match) => `#${match[1]}`),
   ];
   const pr = candidates.find((candidate) => {
     try {

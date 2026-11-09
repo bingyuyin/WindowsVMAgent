@@ -20,6 +20,14 @@ interface Route {
   handler: Handler;
   /** Raw handlers write the response themselves (used for Server-Sent Events). */
   raw: boolean;
+  maxBodyBytes: number;
+}
+
+export interface RouteOptions {
+  /** The handler writes the response itself (used for Server-Sent Events). */
+  raw?: boolean;
+  /** The largest request body the route accepts (default 1 MiB, a guard against runaway uploads). */
+  maxBodyBytes?: number;
 }
 
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -43,29 +51,36 @@ const SECURITY_HEADERS: Record<string, string> = {
 export class Router {
   private readonly routes: Route[] = [];
 
-  add(method: string, pattern: string, handler: Handler, options: { raw?: boolean } = {}): void {
+  add(method: string, pattern: string, handler: Handler, options: RouteOptions = {}): void {
     const keys: string[] = [];
     const source = pattern.replace(/:(\w+)/g, (_match, key: string) => {
       keys.push(key);
       return "([^/]+)";
     });
-    this.routes.push({ method, regex: new RegExp(`^${source}$`), keys, handler, raw: options.raw ?? false });
+    this.routes.push({
+      method,
+      regex: new RegExp(`^${source}$`),
+      keys,
+      handler,
+      raw: options.raw ?? false,
+      maxBodyBytes: options.maxBodyBytes ?? MAX_BODY_BYTES,
+    });
   }
 
-  get(pattern: string, handler: Handler, options?: { raw?: boolean }): void {
+  get(pattern: string, handler: Handler, options?: RouteOptions): void {
     this.add("GET", pattern, handler, options);
   }
-  post(pattern: string, handler: Handler): void {
-    this.add("POST", pattern, handler);
+  post(pattern: string, handler: Handler, options?: RouteOptions): void {
+    this.add("POST", pattern, handler, options);
   }
-  put(pattern: string, handler: Handler): void {
-    this.add("PUT", pattern, handler);
+  put(pattern: string, handler: Handler, options?: RouteOptions): void {
+    this.add("PUT", pattern, handler, options);
   }
-  patch(pattern: string, handler: Handler): void {
-    this.add("PATCH", pattern, handler);
+  patch(pattern: string, handler: Handler, options?: RouteOptions): void {
+    this.add("PATCH", pattern, handler, options);
   }
-  delete(pattern: string, handler: Handler): void {
-    this.add("DELETE", pattern, handler);
+  delete(pattern: string, handler: Handler, options?: RouteOptions): void {
+    this.add("DELETE", pattern, handler, options);
   }
 
   match(method: string, pathname: string): { route: Route; params: Record<string, string> } | "method-not-allowed" | null {
@@ -162,7 +177,7 @@ export function createHttpServer(options: ServerOptions): http.Server {
       return;
     }
     try {
-      const body = method === "GET" || method === "HEAD" ? {} : await readJsonBody(req);
+      const body = method === "GET" || method === "HEAD" ? {} : await readJsonBody(req, matched.route.maxBodyBytes);
       const result = await matched.route.handler({ req, res, url, params: matched.params, body });
       if (!matched.route.raw && !res.headersSent) sendJson(res, 200, result ?? { ok: true });
     } catch (error) {
@@ -180,12 +195,12 @@ export function sendJson(res: http.ServerResponse, status: number, payload: unkn
   res.end(json);
 }
 
-async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+async function readJsonBody(req: http.IncomingMessage, maxBytes: number): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > MAX_BODY_BYTES) throw new HttpError(413, "Request body too large");
+    if (size > maxBytes) throw new HttpError(413, "Request body too large");
     chunks.push(chunk as Buffer);
   }
   const text = Buffer.concat(chunks).toString("utf8").trim();

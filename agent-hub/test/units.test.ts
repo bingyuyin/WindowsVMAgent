@@ -286,6 +286,20 @@ describe("manager plans", () => {
     assert.equal(reviewRequestIn("Implement the code review module"), null);
   });
 
+  test("requests of any length are scanned for the change to review in linear time", () => {
+    for (const spelling of ["PR # 12", "PR: 12", "PR :12", "PR#12", "PR 12", "pull request 12", "merge request: 12"]) {
+      assert.deepEqual(reviewRequestIn(`Review ${spelling}`), { target: "#12", direct: true }, spelling);
+    }
+    for (const spelling of ["PR ## 12", "PR #: 12", "PR x 12"]) assert.equal(reviewTargetIn(`Review ${spelling}`), null, spelling);
+    // A long run of spaces after "PR" used to take time quadratic in its length (minutes for a megabyte).
+    const long = `Please review PR${" ".repeat(200_000)}and the log below\n${"x ".repeat(500_000)}`;
+    const started = performance.now();
+    assert.equal(reviewTargetIn(long), null);
+    assert.equal(reviewRequestIn(long), null);
+    assert.deepEqual(heuristicPlan(`Fix the crash in the uploader${" ".repeat(200_000)}PR${" ".repeat(200_000)}\n`).stages, ["coding"]);
+    assert.ok(performance.now() - started < 1000, `took ${Math.round(performance.now() - started)} ms`);
+  });
+
   test("roles follow the plan; the planner and executor work in pinned checkouts", () => {
     assert.deepEqual(rolesFor("auto"), ["planner"]);
     assert.deepEqual(rolesFor("testing"), ["executor", "fixer"]);

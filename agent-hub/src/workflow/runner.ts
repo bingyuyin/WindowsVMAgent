@@ -234,7 +234,6 @@ export class TaskRunner {
     const isReview = input.kind === "review";
     const description = (typeof input.description === "string" ? input.description.trim() : "") || (isReview ? DEFAULT_REVIEW_FOCUS : "");
     if (!description) throw new HttpError(400, "A task description is required");
-    if (description.length > 50_000) throw new HttpError(400, "The description is too long (max 50,000 characters)");
     if (!TASK_KINDS.includes(input.kind)) throw new HttpError(400, `Task type must be one of: ${TASK_KINDS.join(", ")}`);
     const repo = store.getRepo(String(input.repoId ?? ""));
     if (!repo) throw new HttpError(400, "Select a registered repository");
