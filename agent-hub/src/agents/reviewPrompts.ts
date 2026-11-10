@@ -71,6 +71,12 @@ function requestBlock(task: Task): string {
     if (pr?.body?.trim()) lines.push("", "Pull request description:", "", quote(truncate(pr.body, 6000)));
   }
   lines.push("", task.kind === "review" ? "## The user's focus" : "## The request", "", task.description.trim());
+  // Requests the user added before an Auto task was planned as this review.
+  const requests = task.changeRequests ?? [];
+  if (requests.length) {
+    lines.push("", "## More from the user (they amend the request above, in order)", "");
+    for (const request of requests) lines.push(`- [${request.id}] ${truncate(request.text.trim(), 4000).replace(/\n/g, "\n  ")}`);
+  }
   return lines.join("\n");
 }
 

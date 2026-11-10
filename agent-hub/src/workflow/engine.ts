@@ -17,6 +17,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import {
   authorPrompt,
+  changePlannerPrompt,
   executionPrompt,
   MAX_INLINE_DIFF,
   NUDGE_PLAN,
@@ -93,6 +94,16 @@ import {
 } from "../types.ts";
 import { runShellCommand, type CommandRunner } from "../shell.ts";
 import { CancelledError, errorMessage, firstLine, nowIso, settledWithin, slugify, truncate } from "../util.ts";
+import {
+  applyChangePlan,
+  defaultChangeStage,
+  describeChange,
+  foldIntoPlan,
+  normalizeChangePlan,
+  pendingChangeRequests,
+  STAGE_TITLES,
+  type ChangeDecision,
+} from "./changes.ts";
 import {
   fallbackReview,
   fallbackTestRun,
@@ -255,6 +266,9 @@ export class WorkflowEngine {
   /** The request reads as a review of a named change, but also asks for more: the planner must confirm a non-review plan. */
   private reviewRequest: { target: string; base?: string } | null = null;
   private reviewRequestChallenged = false;
+  /** While the manager re-plans the task for change requests: its validated decision once the planner submits. */
+  private replanning = false;
+  private pendingChange: ChangeDecision | null = null;
 
   constructor(task: Task, options: EngineOptions) {
     this.task = task;
@@ -263,6 +277,7 @@ export class WorkflowEngine {
 
   async run(): Promise<void> {
     if (this.task.kind === "auto" && !this.task.plan) await this.plan();
+    else if (pendingChangeRequests(this.task).length) await this.replan();
     // A Code review task, or an Auto task the manager planned as a code review: the two reviewers, no stages.
     if (isCodeReview(this.task)) {
       await this.runCodeReview();
@@ -319,7 +334,8 @@ export class WorkflowEngine {
     const task = this.task;
     const role: AgentRole = "planner";
     const reviewRequest = this.options.codeReviews ? reviewRequestIn(task.description) : null;
-    if (reviewRequest?.direct) {
+    // With change requests waiting, the planner reads them all before anything is decided.
+    if (reviewRequest?.direct && !pendingChangeRequests(task).length) {
       await this.assignReview(reviewRequest);
       return;
     }
@@ -394,6 +410,8 @@ export class WorkflowEngine {
       };
       task.stages = plan.stages.map((kind) => ({ kind, status: "pending", rounds: [], nextCommentNumber: 1 }));
       this.announcePlan(role);
+      const early = pendingChangeRequests(task);
+      if (early.length) foldIntoPlan(task, early, nowIso());
     } catch (error) {
       status = hooks.signal.aborted || error instanceof CancelledError ? "cancelled" : "failed";
       throw error;
@@ -436,6 +454,8 @@ export class WorkflowEngine {
     };
     task.stages = [];
     this.announcePlan("manager");
+    const early = pendingChangeRequests(task);
+    if (early.length) foldIntoPlan(task, early, nowIso());
     hooks.update();
   }
 
@@ -462,6 +482,101 @@ export class WorkflowEngine {
     const stage = this.task.stages.find((candidate) => candidate.kind === kind);
     if (!stage) throw new Error(`Stage ${kind} missing`);
     return stage;
+  }
+
+  /**
+   * The manager re-evaluates the task for the user's change requests: its planner reads where the task stands and the
+   * requests, then decides which teams handle them - the stage that revises its work, new stages (e.g. coding for a
+   * finished design), unfinished stages the requests make unnecessary - and the task type follows its stages. When it
+   * cannot (the planner fails or never submits), the requests go to the latest stage that has work.
+   */
+  private async replan(): Promise<void> {
+    const { hooks, workspace } = this.options;
+    const task = this.task;
+    const requests = pendingChangeRequests(task);
+    const ids = requests.map((request) => request.id).join(", ");
+    const role: AgentRole = "planner";
+    this.setPhase(undefined, "planning", 0);
+    hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", text: `Re-evaluating the task for change request ${ids}: which teams handle it` });
+    let status: AgentStatus = "done";
+    let problem = "";
+    this.pendingChange = null;
+    try {
+      const head = await workspace.taskHead();
+      const ws = await workspace.prepareReviewer(role, head);
+      const agent = await this.agentFor(role, undefined, ws.path);
+      hooks.agent(role, (info) => {
+        info.status = "working";
+        info.workspace = ws.path;
+        info.workspaceRemoved = false;
+        info.branch = null;
+        info.assignment = `Re-evaluating the task for change request ${ids}`;
+      });
+      hooks.comm({ from: "manager", to: role, kind: "assign", text: `Re-plan the task for change request ${ids}: decide which teams handle it and write their assignments` });
+      const prompt = changePlannerPrompt(task, requests, task.context, {
+        head,
+        commits: await workspace.commitCount(workspace.baseSha, head),
+        shortStat: await workspace.shortStat(workspace.baseSha, head),
+      });
+      this.replanning = true;
+      let result: TurnResult = {};
+      try {
+        result = await this.send(agent, prompt, async () => prompt);
+        for (let nudge = 0; !this.submittedChange() && nudge < MAX_SUBMIT_NUDGES; nudge++) {
+          this.throwIfAborted();
+          hooks.emit({ type: "warning", role, text: "Planner ended its turn without calling submit_plan; asking it to submit." });
+          hooks.comm({ from: "manager", to: role, kind: "nudge", text: "Your turn ended without submit_plan - submit the plan" });
+          result = await this.send(agent, NUDGE_PLAN);
+        }
+      } catch (error) {
+        // The manager can still route the requests without its planner: to the latest stage.
+        if (!(error instanceof AgentUnrecoverableError)) throw error;
+        problem = `the planner could not be recovered: ${error.reason}`;
+        status = "failed";
+      }
+      this.throwIfAborted();
+      if (!this.submittedChange() && !problem) problem = `the planner never called submit_plan; last message: ${truncate(firstLine(result.lastMessage ?? ""), 200) || "none"}`;
+    } catch (error) {
+      status = hooks.signal.aborted || error instanceof CancelledError ? "cancelled" : "failed";
+      throw error;
+    } finally {
+      this.replanning = false;
+      await this.releaseAgent(role, status);
+    }
+
+    let decision = this.submittedChange();
+    if (!decision) {
+      const target = defaultChangeStage(task);
+      decision = {
+        stages: stageKindsOf(task),
+        ...(target ? { changeStage: target } : {}),
+        instructions: {},
+        rationale: `The manager could not re-plan the task (${problem}), so the change goes to the ${target ? `${STAGE_TITLES[target]} stage` : "remaining stages"}.`,
+        routing: "manager",
+        fallback: true,
+      };
+      hooks.emit({ type: "warning", text: decision.rationale });
+    }
+    const applied = applyChangePlan(task, requests, decision, nowIso());
+    const flow = describeChange(applied);
+    hooks.emit({
+      type: "info",
+      ...(decision.fallback ? {} : { role }),
+      text: `Manager's re-plan for ${ids}: ${flow}. ${decision.fallback ? "" : decision.rationale}`.trim(),
+      data: { changePlan: requests[0]?.plan },
+    });
+    hooks.comm({ from: decision.fallback ? "manager" : role, to: "manager", kind: "plan", text: `Re-plan for ${ids}: ${flow} - ${truncate(decision.rationale, 240)}` });
+    if (applied.added.length) {
+      const team = rolesForStages(applied.added);
+      const onDemand: AgentRole[] = team.filter((candidate) => candidate === "resolver" || candidate === "fixer");
+      hooks.comm({
+        from: "manager",
+        to: "manager",
+        kind: "lifecycle",
+        text: `Creating sub-agents: ${team.filter((candidate) => !onDemand.includes(candidate)).map((candidate) => ROLE_LABELS[candidate]).join(", ")}${onDemand.length ? `; on demand: ${onDemand.map((candidate) => ROLE_LABELS[candidate]).join(", ")}` : ""}`,
+      });
+    }
+    hooks.update();
   }
 
   // ---- Code review tasks -------------------------------------------------------------------------
@@ -844,8 +959,15 @@ export class WorkflowEngine {
     let reviewOnly: Round | null = last?.author && !last.review ? last : null;
     let lastReview = reviewOnly ? undefined : last?.review;
     let open = lastReview?.verdict === "request_changes" ? lastReview.comments.filter((comment) => comment.status === "open") : [];
-    // An earlier stage changed for a change request: run the tests again before fixing anything.
-    if (testing && stage.rerun && !reviewOnly) {
+    if (lastReview?.by === "user") {
+      // The user's request came after review comments nobody resolved yet (the task stopped): they are resolved too.
+      const reviewed = [...stage.rounds].reverse().find((round) => round !== last && round.review && round.review.by !== "user");
+      const unresolved = reviewed?.review?.verdict === "request_changes" ? reviewed.review.comments.filter((comment) => comment.status === "open") : [];
+      open = [...unresolved, ...open];
+    }
+    // An earlier stage changed for a change request: run the tests again before fixing anything (a request round
+    // waiting in this stage is handled first: its fixer's round is re-run and verified anyway).
+    if (testing && stage.rerun && !reviewOnly && lastReview?.by !== "user") {
       lastReview = undefined;
       open = [];
     }
@@ -1198,6 +1320,10 @@ export class WorkflowEngine {
    * now: a wrong pull request or branch goes back to the planner to fix.
    */
   private async acceptPlan(input: PlanSubmissionInput): Promise<void> {
+    if (this.replanning) {
+      this.pendingChange = normalizeChangePlan(input, this.task);
+      return;
+    }
     const plan = normalizePlan(input);
     // A request that reads as a review goes to the review team unless the planner, told so, confirms otherwise.
     const request = this.reviewRequest;
@@ -1561,6 +1687,10 @@ export class WorkflowEngine {
     return this.pendingTest;
   }
 
+  private submittedChange(): ChangeDecision | null {
+    return this.pendingChange;
+  }
+
   private submittedPlan(): PlanSubmissionInput | null {
     return this.pendingPlan;
   }
@@ -1781,7 +1911,12 @@ export class WorkflowEngine {
   ): Promise<string> {
     const { workspace } = this.options;
     const fix = round.author;
-    const fixDiff = fix?.commit ? await workspace.diff(fix.prevCommit ?? workspace.baseSha, headSha, MAX_ROUND_DIFF_BYTES) : undefined;
+    const previousRun = stage.rounds.find((candidate) => candidate.n === round.n - 1)?.review;
+    // After a user's request round, the fixer's changes are checked since the last test run, including any work the
+    // task stopped before it was verified.
+    const verified = previousRun?.by === "user" ? this.lastReviewBefore(stage, round.n - 1) : undefined;
+    const fixBase = verified?.review?.reviewedSha ?? fix?.prevCommit ?? workspace.baseSha;
+    const fixDiff = fix?.commit ? await workspace.diff(fixBase, headSha, MAX_ROUND_DIFF_BYTES) : undefined;
     return executionPrompt({
       task: this.task,
       round: round.n,
@@ -1793,7 +1928,7 @@ export class WorkflowEngine {
       totalStat: await workspace.diffStat(workspace.baseSha, headSha),
       fix,
       fixDiff,
-      previousRun: stage.rounds.find((candidate) => candidate.n === round.n - 1)?.review,
+      previousRun,
     });
   }
 
@@ -1806,7 +1941,16 @@ export class WorkflowEngine {
   ): Promise<string> {
     const { workspace, hooks } = this.options;
     const submission = round.author!;
-    const prevSha = submission.prevCommit ?? workspace.baseSha;
+    const previousReview = stage.rounds.find((candidate) => candidate.n === round.n - 1)?.review;
+    const previousComments = previousReview?.comments ?? [];
+    // After a user's request round, the reviewer sees everything since its own last review - including work the task
+    // stopped before it was reviewed - and its own comments from that review with the author's responses.
+    const sinceReview = previousReview?.by === "user" ? this.lastReviewBefore(stage, round.n - 1) : undefined;
+    const reviewerComments = sinceReview?.review?.verdict === "request_changes" ? sinceReview.review.comments : [];
+    const prevSha =
+      previousReview?.by === "user"
+        ? (sinceReview?.review?.reviewedSha ?? sinceReview?.author?.commit ?? stage.rounds.find((candidate) => candidate.author?.prevCommit)?.author?.prevCommit ?? workspace.baseSha)
+        : (submission.prevCommit ?? workspace.baseSha);
     const totalStat = await workspace.diffStat(workspace.baseSha, headSha);
     let docContent: string | undefined;
     let roundDiff: { text: string; truncated: boolean } | undefined;
@@ -1824,8 +1968,6 @@ export class WorkflowEngine {
     } else {
       roundDiff = await workspace.diff(prevSha, headSha, MAX_ROUND_DIFF_BYTES);
     }
-    const previousReview = stage.rounds.find((candidate) => candidate.n === round.n - 1)?.review;
-    const previousComments = previousReview?.comments ?? [];
     return reviewPrompt({
       task: this.task,
       role: reviewerRoleFor(stage.kind),
@@ -1847,7 +1989,13 @@ export class WorkflowEngine {
       roundDiff,
       previousComments,
       userRequests: previousReview?.by === "user",
+      reviewerComments,
     });
+  }
+
+  /** The latest round before round `n` that a reviewer (or the test executor) checked: what its next check starts from. */
+  private lastReviewBefore(stage: Stage, n: number): Round | undefined {
+    return [...stage.rounds].reverse().find((candidate) => candidate.n < n && candidate.review && candidate.review.by !== "user");
   }
 
   private docPathFor(kind: StageKind, format: "html" | "markdown"): string {
@@ -1872,7 +2020,8 @@ export class WorkflowEngine {
   }
 
   private async designContext(): Promise<DesignContext | undefined> {
-    const designStage = this.task.stages.find((stage) => stage.kind === "design");
+    // A design the manager dropped (for a change request) is not what the code follows.
+    const designStage = this.task.stages.find((stage) => stage.kind === "design" && stage.status !== "skipped");
     if (!designStage?.docPath) return undefined;
     let content = await this.options.workspace.readAt(await this.options.workspace.taskHead(), designStage.docPath);
     if (!content) {
@@ -1899,10 +2048,11 @@ export class WorkflowEngine {
     this.setPhase(lastStage.kind, "finalizing", task.currentRound);
     const head = await workspace.taskHead();
     const lastReview = [...lastStage.rounds].reverse().find((round) => round.review)?.review;
-    const docStage = task.stages.find((stage) => isDocStage(stage.kind));
-    const testStage = task.stages.find((stage) => stage.kind === "testing");
-    const codingStage = task.stages.find((stage) => stage.kind === "coding");
     const stages = kinds.map((kind) => this.stage(kind));
+    // Stages the manager dropped for a change request no longer count (their history stays on the task).
+    const docStage = stages.find((stage) => isDocStage(stage.kind));
+    const testStage = stages.find((stage) => stage.kind === "testing");
+    const codingStage = stages.find((stage) => stage.kind === "coding");
     const summary =
       stages.length > 1
         ? stages
@@ -1918,7 +2068,7 @@ export class WorkflowEngine {
       diffStat: await workspace.diffStat(workspace.baseSha, head),
       shortStat: await workspace.shortStat(workspace.baseSha, head),
       commits: await workspace.commitCount(workspace.baseSha, head),
-      designDocPath: task.stages.find((stage) => stage.kind === "design")?.docPath,
+      designDocPath: stages.find((stage) => stage.kind === "design")?.docPath,
       docPath: docStage?.docPath,
       docFormat: docStage?.docFormat,
       tests: testStage ? [...testStage.rounds].reverse().find((round) => round.review?.testRun)?.review?.testRun : undefined,

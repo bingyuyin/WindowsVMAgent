@@ -159,6 +159,7 @@ const STAGE_ROLES = {
   testing: ["executor", "fixer"],
   document: ["writer", "doc-reviewer"],
 };
+const STAGE_ORDER = ["design", "coding", "testing", "document"];
 
 const KIND_STAGES = {
   auto: [],
@@ -183,13 +184,17 @@ export function rolesFor(kind) {
 /** A code review of an existing change: a Code review task, or an Auto task the manager planned as one (full tasks and summaries). */
 export const isCodeReviewTask = (task) => task.kind === "review" || Boolean(task.review) || Boolean(task.plan?.review);
 
-/** Sub-agents of a task: for Auto tasks the manager's planner plus the team it planned (stages, or the two reviewers). */
+/** Sub-agents of a task: the team of its stages (as the manager planned or re-planned them), with the manager's planner when it worked on the task. */
 export function rolesForTask(task) {
-  if (task.kind !== "auto") return rolesFor(task.kind);
+  if (task.kind === "review") return rolesFor("review");
   // A request that named the change to review went to the reviewers directly, without the planner.
   if (isCodeReviewTask(task)) return task.plan?.direct ? ["lead-reviewer", "peer-reviewer"] : ["planner", "lead-reviewer", "peer-reviewer"];
-  const stages = task.plan?.stages ?? task.stages?.map((stage) => stage.kind) ?? [];
-  return ["planner", ...rolesForStages(stages)];
+  const planned = task.plan?.stages ?? (task.kind === "auto" ? (task.stages ?? []).map((stage) => stage.kind) : (KIND_STAGES[task.kind] ?? ["coding"]));
+  // Stages the manager dropped for a change request keep their agents' history.
+  const dropped = (task.stages ?? []).filter((stage) => stage.status === "skipped").map((stage) => stage.kind);
+  const stages = STAGE_ORDER.filter((kind) => planned.includes(kind) || dropped.includes(kind));
+  const planner = task.kind === "auto" || (task.agents ?? []).some((agent) => agent.role === "planner");
+  return [...(planner ? ["planner"] : []), ...rolesForStages(stages)];
 }
 
 /** Stage a role works in (null for the planner and the code review reviewers, which work outside stages). */

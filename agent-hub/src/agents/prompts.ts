@@ -5,13 +5,16 @@ import {
   isDocStage,
   isReviewerRole,
   ROLE_LABELS,
+  stageKindsOf,
   worksDetached,
   type AgentRole,
   type AuthorSubmission,
+  type ChangeRequest,
   type DocFormat,
   type RepoContext,
   type ReviewComment,
   type ReviewSubmission,
+  type Stage,
   type StageKind,
   type Task,
   type UnitTestCheck,
@@ -109,11 +112,11 @@ export interface SystemPromptOptions {
   docFormat?: DocFormat;
 }
 
-/** Rules for change requests the user makes after a task finished (comment IDs U1, U2, ...). */
+/** Rules for change requests the user makes after a task ran (comment IDs U1, U2, ...). */
 const USER_REQUESTS_AUTHOR =
   "- Change requests from the user (IDs U1, U2, ...) take priority over earlier review preferences: carry them out as asked, declining only when a request is impossible or harmful (explain why).";
 const USER_REQUESTS_REVIEWER =
-  "- Change requests the user made after the task finished (IDs U1, U2, ...) must be carried out as asked: verify each one, and accept a decline only when the request is impossible or harmful and the author explains why.";
+  "- Change requests the user made after the task ran (IDs U1, U2, ...) must be carried out as asked: verify each one, and accept a decline only when the request is impossible or harmful and the author explains why.";
 
 /** How coding agents finish a round: their unit tests must pass, and the manager re-runs them before the review. */
 const UNIT_TEST_GATE =
@@ -201,7 +204,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
     case "resolver":
       return [
         ...header(
-          "ROLE: COMMENT-RESOLUTION AGENT. Another agent implemented the change; a reviewer (or the user, after the task finished) requested changes. Resolve every open comment in the code.",
+          "ROLE: COMMENT-RESOLUTION AGENT. Another agent implemented the change; a reviewer (or the user, after the task ran) requested changes. Resolve every open comment in the code.",
         ),
         "- Start by understanding the change so far: read the diff against the base commit and the files the comments refer to.",
         ...skillsLine(skills),
@@ -239,7 +242,7 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
         "- Suspected flaky test: re-run just that test up to two times; report it as flaky only if the result changes.",
         `- Failures the requested change has nothing to do with - they fail without it too, or they are flaky, in code and tests the change does not touch (compare with git diff ${short(env.baseSha)}..HEAD) - go in \`unrelated_failures\` with the reason, not in \`failures\`: they are reported to the user and left for their owners, so the fixer does not change unrelated code. When the request itself is to run and fix the tests, every failure in the requested tests is related.`,
         "- After a fix round, inspect the fixer's diff: report an `integrity` failure for any change that makes tests pass without fixing the cause (deleted or skipped tests, weakened or removed assertions, swallowed exceptions, hard-coded results, expectations changed to match a bug) unless the fixer's justification is convincing.",
-        "- When the user requested changes after the task finished (IDs U1, U2, ...), verify they were carried out; changes the user explicitly asked for are not integrity problems.",
+        "- When the user requested changes after the task ran (IDs U1, U2, ...), verify they were carried out; changes the user explicitly asked for are not integrity problems.",
         "- status: passed when everything requested ran and no failure related to the request and no integrity problem remains (unrelated failures may be listed); blocked when the automation cannot run at all (say exactly what is missing); failed otherwise.",
         ...skillsLine(skills),
         "- Finish EVERY run by calling the `submit_test_results` tool exactly once. Never end your turn without calling it.",
@@ -288,7 +291,16 @@ export function systemPromptFor(role: AgentRole, env: AgentEnvironment, skills: 
 }
 
 function requestBlock(task: Task): string {
-  return [`# Task ${task.id}: ${task.title}`, "", "## Request", "", task.description.trim()].join("\n");
+  const lines = [`# Task ${task.id}: ${task.title}`, "", "## Request", "", task.description.trim()];
+  const requests = task.changeRequests ?? [];
+  if (requests.length) {
+    lines.push("", "## Change requests the user made afterwards", "", "They amend the request above, in order: a later one wins where they differ. The ones marked (current) are what this run works on.", "");
+    for (const request of requests) {
+      const current = request.attempt === task.attempt;
+      lines.push(`- [${request.id}]${current ? " (current)" : ""} ${truncate(request.text.trim(), current ? 20_000 : 2000).replace(/\n/g, "\n  ")}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 /** The two reviewers of a code review task: independent reviews, a discussion of each other's findings, a final review and a sign-off. */
@@ -466,13 +478,19 @@ export function authorPrompt(input: AuthorPromptInput): string {
   const docStage = isDocStage(input.stage);
   const noun = input.stage === "design" ? "design document" : "document";
   if (input.review?.by === "user" && input.openComments.length) {
+    // Review comments (or test failures) still open from before the user's request are resolved in the same round.
+    const requests = input.openComments.filter((comment) => /^U\d+$/.test(comment.id));
+    const unresolved = input.openComments.filter((comment) => !/^U\d+$/.test(comment.id));
     parts.push(
       `## Round ${input.round}: make the changes the user requested`,
       "",
-      "This task was finished earlier. The user reviewed the result and asked for the changes below. They take priority over earlier review preferences; keep the rest of the work intact.",
+      "The user asked for the changes below. They take priority over earlier review preferences; keep the rest of the work intact.",
       "",
       "Change requests:",
-      formatRequests(input.openComments),
+      formatRequests(requests),
+      ...(unresolved.length
+        ? ["", input.stage === "testing" ? "Failures from the last test run, still to fix as well:" : "Review comments still open from the last review, to resolve as well:", formatComments(unresolved)]
+        : []),
       "",
       input.stage === "testing"
         ? "Make the changes, then run the test automation (at least the affected tests) to confirm it passes."
@@ -555,6 +573,8 @@ export interface ReviewPromptInput {
   previousComments: ReviewComment[];
   /** The previous comments are the user's change requests (not this reviewer's own comments). */
   userRequests?: boolean;
+  /** With the user's requests: the reviewer's own comments from its last review, with the author's responses. */
+  reviewerComments?: ReviewComment[];
 }
 
 export function reviewPrompt(input: ReviewPromptInput): string {
@@ -579,9 +599,10 @@ export function reviewPrompt(input: ReviewPromptInput): string {
   if (input.previousComments.length && input.userRequests) {
     parts.push(
       "",
-      "After the task was finished, the user asked for the changes below. Verify each one was carried out as asked (accept a decline only when the request is impossible or harmful and the author explains why), then review this round's changes as usual:",
+      "The user later asked for the changes below. Verify each one was carried out as asked (accept a decline only when the request is impossible or harmful and the author explains why), then review this round's changes as usual:",
       formatResponses(input.previousComments, true),
     );
+    if (input.reviewerComments?.length) parts.push("", "Your comments from your last review and the author's responses:", formatResponses(input.reviewerComments));
   } else if (input.previousComments.length) {
     parts.push("", "Your previous comments and the author's responses:", formatResponses(input.previousComments));
   }
@@ -768,6 +789,108 @@ export function plannerPrompt(task: Task, context: RepoContext | undefined): str
     'If the request is to review an existing change (a pull request or a branch), call it with stages ["review"], `review_target` and the reviewers\' focus in `instructions.review` instead.',
   ].join("\n");
 }
+
+/** The task branch as the manager's planner finds it when it re-plans. */
+export interface TaskHeadInfo {
+  head: string;
+  commits: number;
+  shortStat: string;
+}
+
+const STAGE_NAMES: Record<StageKind, string> = { design: "Design", coding: "Coding", testing: "Execute & verify", document: "Document" };
+
+/** One stage's state in words, for the manager re-planning the task. */
+function stageState(task: Task, stage: Stage): string {
+  const rounds = stage.rounds.filter((round) => round.review?.by !== "user");
+  const last = rounds.at(-1)?.n ?? 0;
+  const lastReview = [...stage.rounds].reverse().find((round) => round.review && round.review.by !== "user")?.review;
+  const open = lastReview?.verdict === "request_changes" ? lastReview.comments.filter((comment) => comment.status === "open").length : 0;
+  const testing = stage.kind === "testing";
+  let text: string;
+  switch (stage.status) {
+    case "approved":
+      text = testing ? `all tests pass (run ${last})` : `approved in round ${last}`;
+      break;
+    case "not-approved":
+      text = testing ? `tests still failing after run ${last} (${open} failure(s))` : `finished without approval after round ${last} (${open} comment(s) open)`;
+      break;
+    case "skipped":
+      text = `dropped for ${stage.skippedFor ?? "an earlier change request"} (its work stays on the branch)`;
+      break;
+    case "failed":
+      text = rounds.length ? `failed in round ${last}` : "failed before its first round finished";
+      break;
+    case "cancelled":
+      text = rounds.length ? `stopped in round ${last}` : "stopped before its first round finished";
+      break;
+    default:
+      text = rounds.length ? `in progress at round ${last}` : "not started";
+  }
+  const deliverable = stage.docPath && rounds.some((round) => round.author) ? `; deliverable \`${stage.docPath}\`` : "";
+  const run = testing ? lastReview?.testRun : undefined;
+  const tests = run ? `; last run: ${run.status}${run.total !== undefined ? `, ${run.passed ?? run.total - (run.failed ?? 0)}/${run.total} passed` : ""}${run.commands.length ? ` (${run.commands.map((command) => `\`${command}\``).join(", ")})` : ""}` : "";
+  const assignment = task.plan?.instructions[stage.kind]?.trim();
+  return `- ${STAGE_NAMES[stage.kind]} stage: ${text}${deliverable}${tests}.${assignment ? ` Current assignment: ${truncate(assignment.replace(/\s+/g, " "), 600)}` : ""}`;
+}
+
+/**
+ * The manager re-plans the task for the user's change requests: where the task stands, what was asked, and which
+ * teams (stages) to keep, add or drop.
+ */
+export function changePlannerPrompt(task: Task, requests: readonly ChangeRequest[], context: RepoContext | undefined, branch: TaskHeadInfo): string {
+  const ids = requests.map((request) => request.id).join(", ");
+  const from = requests[0]?.from;
+  const failure = requests.find((request) => request.failure)?.failure;
+  const before =
+    from === "completed"
+      ? "it had finished"
+      : from === "failed"
+        ? `it had failed${failure ? `: ${truncate(failure, 600)}` : ""}`
+        : from === "cancelled"
+          ? "it had been cancelled"
+          : from === "interrupted"
+            ? "it had been interrupted by a hub restart"
+            : from === "queued"
+              ? "it had not started yet"
+              : "it had stopped";
+  const kinds = stageKindsOf(task);
+  const lines = [
+    requestBlock(task),
+    contextBlock(context, "planner"),
+    briefingBlock(task),
+    "",
+    "## Where the task stands",
+    "",
+    `- Type: ${TASK_KIND_NAMES[task.kind]}; stages: ${kinds.map((kind) => STAGE_NAMES[kind]).join(" → ") || "none"}. When the user asked for ${ids}, ${before}.`,
+    ...task.stages.map((stage) => stageState(task, stage)),
+    task.branch && task.baseSha
+      ? `- Task branch \`${task.branch}\` at ${branch.head.slice(0, 10)}: ${branch.commits} commit(s)${branch.shortStat ? ` (${branch.shortStat})` : ""} since the base \`${task.baseRef}\` (${task.baseSha.slice(0, 10)}). Your worktree is checked out there.`
+      : "",
+    "",
+    `## Re-plan the task for change request ${ids}`,
+    "",
+    `Decide which sub-agent teams handle ${requests.length === 1 ? "the request" : "the requests"} marked (current) above, then call \`submit_plan\`:`,
+    "- `stages`: every stage the task has from now on (design, coding, testing, document; they run in that order).",
+    "  - Keep the stages whose work is finished (approved, or out of review rounds): their work stays on the task branch, and they do not run again unless one is the `change_stage`.",
+    "  - Add the stages the request needs that the task does not have yet: coding to implement a finished design or to change code, testing to run and verify the tests, document for documentation, design before a large or unclear change.",
+    "  - Drop a stage that has not finished (failed, stopped or not started) only when the request makes it unnecessary, e.g. \"skip the design and implement it directly\".",
+    "- `change_stage`: the existing stage whose agents revise their work for the request - the designer or the technical writer revises the document, the comment resolver changes the code, the test fixer changes the tests - and whose reviewer (or the test executor) verifies it; later stages with work then bring theirs in line. Omit it when the request only needs new stages, or dropped ones.",
+    "- `instructions`: the assignment for each added stage (required) and, when it helps, for the change stage: what to do for the request, scope, acceptance criteria; for testing the exact commands to run. An assignment you give replaces the stage's current one.",
+    "- `rationale`: why this fits the request, in 1-3 sentences. `briefing`: only when what the agents should know about the repository changed.",
+    "A change request never turns the task into a code review. Be quick: the state above and a short look at the repository are enough.",
+  ];
+  return lines.filter((line, index) => line !== "" || lines[index - 1] !== "").join("\n");
+}
+
+const TASK_KIND_NAMES: Record<Task["kind"], string> = {
+  auto: "Auto (planned by you)",
+  coding: "Coding",
+  design: "Design",
+  document: "Document",
+  testing: "Execute & verify",
+  "design-coding": "Design → Coding",
+  review: "Code review",
+};
 
 /** The manager re-ran the author's unit tests before the review and they failed: hand them back to be fixed. */
 export function unitTestFailurePrompt(failure: { command: string; problem: string; output: string }, attempt: number, maxAttempts: number): string {

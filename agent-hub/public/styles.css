@@ -3342,3 +3342,34 @@ details > summary {
   margin: 10px 0 4px;
   font-size: 13px;
 }
+/* ---- change requests re-planned by the manager --------------------------------------------------- */
+
+.stage.stage-skipped {
+  opacity: 0.65;
+  border-style: dashed;
+}
+.pm-stage.pm-skipped {
+  opacity: 0.6;
+}
+.pm-stage.pm-skipped .pm-label {
+  text-decoration: line-through;
+}
+.plan-replans {
+  margin: 10px 0 4px;
+  padding: 8px 12px;
+  border-left: 3px solid color-mix(in srgb, var(--attention) 60%, var(--border));
+  border-radius: 6px;
+  background: var(--bg-elev-2);
+}
+.plan-replan {
+  margin-top: 4px;
+}
+.change-plan {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--bg-elev-2);
+}
+.hero-actions {
+  margin-top: 10px;
+}

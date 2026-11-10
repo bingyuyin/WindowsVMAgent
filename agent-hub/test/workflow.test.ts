@@ -29,6 +29,7 @@ import {
   PASSING_UNIT_TESTS,
   steps,
   submitReview,
+  submitChangePlan,
   submitPlan,
   submitTests,
   submitWork,
@@ -1670,9 +1671,9 @@ describe("change requests", () => {
       "code-reviewer": [
         submitReview("approve"),
         steps((spec, prompt) => {
-          assert.match(prompt, /After the task was finished, the user asked for the changes below/);
+          assert.match(prompt, /The user later asked for the changes below/);
           assert.match(prompt, /- \[U1\] \(change request\) Rename hello\(\) to greet\(\)\n  and keep it exported\n  -> addressed: Renamed and still exported/);
-          assert.match(spec.systemPrompt, /Change requests the user made after the task finished/);
+          assert.match(spec.systemPrompt, /Change requests the user made after the task ran/);
         }, submitReview("approve")),
       ],
     });
@@ -1686,16 +1687,19 @@ describe("change requests", () => {
       assert.throws(() => h.runner.requestChanges(task.id, { request: "  " }), /Describe the changes you want/);
       assert.throws(() => h.runner.requestChanges(task.id, { request: "x", stage: "design" }), /Stage must be one of: coding/);
       assert.throws(() => h.runner.requestChanges(task.id, { request: "x", rounds: 11 }), /Rounds must be an integer between 1 and 10/);
-      h.runner.requestChanges(task.id, { request: "Rename hello() to greet()\nand keep it exported", rounds: 2 });
+      // Handed to the coding stage directly (without one, the manager re-plans the task for it).
+      h.runner.requestChanges(task.id, { request: "Rename hello() to greet()\nand keep it exported", stage: "coding", rounds: 2 });
       assert.match(task.status, /^(queued|running)$/);
       assert.equal(task.roundsBudget, 2);
-      assert.throws(() => h.runner.requestChanges(task.id, { request: "More" }), /once the task has finished/);
+      assert.throws(() => h.runner.requestChanges(task.id, { request: "More" }), /The task is running: cancel it or let it finish, then request the changes/);
       await h.runner.idle();
 
       assert.equal(task.status, "completed");
       assert.equal(task.result?.approved, true);
       assert.equal(task.attempt, 2);
-      assert.deepEqual(task.changeRequests?.map((request) => [request.id, request.stage, request.round, request.attempt, request.rounds]), [["U1", "coding", 2, 2, 2]]);
+      assert.deepEqual(task.changeRequests?.map((request) => [request.id, request.stage, request.round, request.attempt, request.rounds, request.routing, request.from]), [
+        ["U1", "coding", 2, 2, 2, "user", "completed"],
+      ]);
       const [first, request, change] = task.stages[0]!.rounds;
       assert.equal(first!.review?.verdict, "approve");
       assert.equal(request!.author, undefined);
@@ -1773,7 +1777,18 @@ describe("change requests", () => {
 
   test("changed code is re-tested, and a change request on the tests goes to the fixer and the executor", async () => {
     const h = createHarness({
-      planner: [submitPlan(["coding", "testing"], { coding: "Add mul()", testing: "Run the tests" })],
+      planner: [
+        submitPlan(["coding", "testing"], { coding: "Add mul()", testing: "Run the tests" }),
+        // U2 has no stage: the manager re-plans and hands it to the testing team.
+        steps((spec, prompt) => {
+          assert.equal(spec.submit.kind, "plan");
+          assert.match(prompt, /## Re-plan the task for change request U2\n/);
+          assert.match(prompt, /- \[U2\] \(current\) Also test negative numbers/);
+          assert.match(prompt, /- Type: Auto \(planned by you\); stages: Coding → Execute & verify\. When the user asked for U2, it had finished\./);
+          assert.match(prompt, /- Coding stage: approved in round 3\. Current assignment: Add mul\(\)/);
+          assert.match(prompt, /- Execute & verify stage: all tests pass \(run 2\); last run: passed, 3\/3 passed \(`npm test`\)\./);
+        }, submitChangePlan(["coding", "testing"], "testing", {}, "Only the tests change: the fixer adds the test and the executor verifies")),
+      ],
       coder: [steps(writeFile("calc.js", "export const mul = (a, b) => a * b;\n"), submitWork("Added mul()"))],
       "code-reviewer": [submitReview("approve"), submitReview("approve")],
       resolver: [
@@ -1820,18 +1835,28 @@ describe("change requests", () => {
       ]);
       assert.ok(h.store.recentComm({ taskId: task.id }).some((entry) => entry.text === "After U1: re-run the tests"));
 
-      // Without a stage, the request goes to the last stage.
+      // Without a stage, the manager re-plans the task for the request (here: the testing team handles it).
       h.runner.requestChanges(task.id, { request: "Also test negative numbers" });
       await h.runner.idle();
       assert.equal(task.status, "completed");
       assert.equal(task.result?.approved, true);
       assert.equal(task.result?.tests?.total, 4);
-      assert.deepEqual(task.changeRequests?.map((request) => [request.id, request.stage, request.round]), [
-        ["U1", "coding", 2],
-        ["U2", "testing", 3],
+      assert.deepEqual(task.changeRequests?.map((request) => [request.id, request.stage, request.round, request.routing]), [
+        ["U1", "coding", 2, "user"],
+        ["U2", "testing", 3, "manager"],
       ]);
+      assert.deepEqual(task.changeRequests?.[1]?.plan && { ...task.changeRequests[1].plan, plannedAt: "" }, {
+        previous: ["coding", "testing"],
+        stages: ["coding", "testing"],
+        added: [],
+        dropped: [],
+        rationale: "Only the tests change: the fixer adds the test and the executor verifies",
+        plannedAt: "",
+      });
+      assert.equal(task.kind, "auto");
       assert.equal(testing.rounds[3]?.author?.role, "fixer");
       assert.equal(h.driver.prompts.coder?.length, 1, "the coder was not asked to start over");
+      assert.ok(h.store.recentComm({ taskId: task.id }).some((entry) => entry.from === "planner" && entry.kind === "plan" && entry.text.startsWith("Re-plan for U2: the Execute & verify team revises its work - Only the tests change")));
     } finally {
       h.cleanup();
     }

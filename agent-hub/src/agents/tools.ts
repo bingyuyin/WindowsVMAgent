@@ -189,6 +189,12 @@ export const submitPlanSchema = {
       description:
         "With the review stage only, optional: the branch the change is compared with. Omit it for a pull request (the hub reads its target branch) and for a branch that merges into the default branch.",
     },
+    change_stage: {
+      type: "string",
+      enum: ["design", "coding", "testing", "document"],
+      description:
+        "When you re-plan a task for the user's change request only: the existing stage whose agents revise their work for it (its reviewer verifies; later stages bring their work in line). Omit it when the request only needs new or dropped stages.",
+    },
     briefing: {
       type: "string",
       description:

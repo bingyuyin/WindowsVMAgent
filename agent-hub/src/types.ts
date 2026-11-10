@@ -35,7 +35,7 @@ export type Phase =
 export type Severity = "blocker" | "major" | "minor" | "nit";
 export type Verdict = "approve" | "request_changes";
 export type CommentStatus = "open" | "addressed" | "declined";
-export type StageStatus = "pending" | "running" | "approved" | "not-approved" | "failed" | "cancelled";
+export type StageStatus = "pending" | "running" | "approved" | "not-approved" | "failed" | "cancelled" | "skipped";
 export type AgentStatus = "idle" | "working" | "done" | "failed" | "cancelled";
 /** Outcome of one test-automation run reported by the test executor. */
 export type TestStatus = "passed" | "failed" | "blocked";
@@ -147,7 +147,7 @@ export interface ReviewSubmission {
   /** Testing stage only: the executor's run (commands, counts); failures are the comments. */
   testRun?: TestRunInfo;
   fallback?: boolean;
-  /** "user": changes the user requested after the task finished (a round of its own, without an author turn). */
+  /** "user": changes the user requested after the task ran (a round of its own, without an author turn). */
   by?: "user";
   at: string;
 }
@@ -212,6 +212,8 @@ export interface Stage {
   nextCommentNumber: number;
   /** Testing stage: run the automation again before fixing (an earlier stage changed for a change request). */
   rerun?: boolean;
+  /** Status "skipped": the change request for which the manager dropped the stage (its work stays on the task branch). */
+  skippedFor?: string;
   startedAt?: string;
   finishedAt?: string;
 }
@@ -420,15 +422,46 @@ export interface ChangeRequest {
   /** Comment ID the agents respond to and reviewers verify, e.g. "U1". */
   id: string;
   text: string;
-  /** Stage whose agents make the change; later stages then bring their work in line with it. */
-  stage: StageKind;
-  /** Round of that stage that holds the request. */
-  round: number;
+  /**
+   * Stage whose agents make the change; later stages then bring their work in line with it. Absent while the manager
+   * is re-planning the task for the request.
+   */
+  stage?: StageKind;
+  /** Round of that stage that holds the request; absent when the stage starts (again) from scratch with it. */
+  round?: number;
   /** Task attempt that works on the request. */
   attempt: number;
   /** Review rounds (or test runs) allowed per stage. */
   rounds: number;
   requestedAt: string;
+  /** "manager": the manager re-evaluated the task for it; "user": the user chose the stage (also requests from before re-planning). */
+  routing?: "manager" | "user";
+  /** The manager re-plans the task for it when the task next runs. */
+  pending?: boolean;
+  /** Status of the task when the request was made. */
+  from?: TaskStatus;
+  /** Why the task had failed, when it had (shown to the manager when it re-plans). */
+  failure?: string;
+  /** What the manager decided: the teams (stages) before and after, the task type, and why. */
+  plan?: ChangePlan;
+}
+
+/** How the manager re-planned a task for a change request. */
+export interface ChangePlan {
+  /** The task's stages before and after. */
+  previous: StageKind[];
+  stages: StageKind[];
+  /** New teams, and stages dropped before they finished (their work stays on the task branch). */
+  added: StageKind[];
+  dropped: StageKind[];
+  /** The task type before and after, when it changed. */
+  kind?: { from: TaskKind; to: TaskKind };
+  rationale: string;
+  /** The manager could not re-plan (its planner failed or never submitted): the change went to the latest stage. */
+  fallback?: boolean;
+  /** The request arrived before the manager first planned the task, and the plan covers it. */
+  initial?: boolean;
+  plannedAt: string;
 }
 
 export interface PendingInput {
@@ -658,7 +691,7 @@ export interface Task {
   /** Pushing the task branch to the remote (after completion, or on request). */
   push?: PushInfo;
   pullRequest?: PullRequestInfo;
-  /** Changes the user requested after the task finished, oldest first. */
+  /** Changes the user requested after the task ran (or while it waited to start), oldest first. */
   changeRequests?: ChangeRequest[];
   usage: Usage;
   attempt: number;
@@ -765,6 +798,13 @@ export function stagesFor(kind: TaskKind): StageKind[] {
 /** Stages a task runs: the manager's plan for Auto tasks, otherwise fixed by the task kind. */
 export function stageKindsOf(task: Pick<Task, "kind" | "plan">): StageKind[] {
   return task.plan?.stages ?? stagesFor(task.kind);
+}
+
+/** The fixed task kind that runs exactly these stages, if there is one (otherwise the manager plans: Auto). */
+export function kindForStages(stages: readonly StageKind[]): TaskKind | null {
+  const key = [...stages].sort((a, b) => STAGE_ORDER.indexOf(a) - STAGE_ORDER.indexOf(b)).join("+");
+  const kinds: Partial<Record<string, TaskKind>> = { design: "design", coding: "coding", testing: "testing", document: "document", "design+coding": "design-coding" };
+  return kinds[key] ?? null;
 }
 
 /** A code review of an existing change: a Code review task, or an Auto task the manager planned as one. */

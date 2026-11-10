@@ -33,6 +33,7 @@ import {
   TASK_KINDS,
   type AgentInfo,
   type AgentRole,
+  type ChangeRequest,
   type CodeReview,
   type CommEntry,
   type CuratedComment,
@@ -53,6 +54,7 @@ import {
 } from "../types.ts";
 import { CancelledError, errorMessage, firstLine, HttpError, KeyedMutex, nowIso, randomId, slugify, truncate } from "../util.ts";
 import { modelFor, reviewedChange, WorkflowEngine, type EngineHooks } from "./engine.ts";
+import { applyChangePlan, pendingChangeRequests } from "./changes.ts";
 import { summarizeTask } from "./summary.ts";
 
 export interface SubmitTaskInput {
@@ -404,75 +406,82 @@ export class TaskRunner {
   }
 
   /**
-   * Asks for further changes to a finished task, approved or not. The request becomes comment U<n> in a new
-   * round of the chosen stage (the last one by default): that stage's author - the comment resolver for code,
-   * the test fixer for tests - makes the change on its own branch and the stage's reviewer (or the test
-   * executor) verifies it, round by round. Later stages then bring their work in line with it (the test
-   * executor re-runs the tests), and the task completes and is pushed again.
+   * Asks for further changes to a task in any state but running: finished (approved or not), failed, cancelled,
+   * interrupted or still queued. The request becomes U<n>. By default the manager re-evaluates the task for it when the
+   * task next runs: which teams handle it - the stage that revises its work, new stages (e.g. coding for a finished
+   * design), stages the request makes unnecessary - and the task type follows. With `stage`, the user hands it to that
+   * stage directly: its author (the comment resolver for code, the test fixer for tests) makes the change and its
+   * reviewer (or the test executor) verifies it, round by round; later stages then bring their work in line.
    */
   requestChanges(id: string, input: { request: string; stage?: string; rounds?: number }): Task {
     const task = this.get(id);
     if (isCodeReview(task)) throw new HttpError(409, "Code review tasks do not change code: edit, keep or drop the review's comments instead");
-    if (this.running.has(id) || task.status !== "completed") throw new HttpError(409, "Changes can be requested once the task has finished");
+    if (this.running.has(id) || task.status === "running" || task.status === "needs-input") {
+      throw new HttpError(409, "The task is running: cancel it or let it finish, then request the changes");
+    }
     const text = (input.request ?? "").trim();
     if (!text) throw new HttpError(400, "Describe the changes you want");
     if (text.length > 20_000) throw new HttpError(400, "The change request is too long (max 20,000 characters)");
     const kinds = stageKindsOf(task);
-    const target = (input.stage || kinds.at(-1)) as StageKind | undefined;
-    const index = target ? kinds.indexOf(target) : -1;
-    if (!target || index < 0) throw new HttpError(400, kinds.length ? `Stage must be one of: ${kinds.join(", ")}` : "This task has no stages to change");
+    const target = (input.stage || undefined) as StageKind | undefined;
+    if (target && !kinds.includes(target)) {
+      throw new HttpError(400, kinds.length ? `Stage must be one of: ${kinds.join(", ")}` : "This task has no stages yet: leave the request to the manager");
+    }
+    const pending = pendingChangeRequests(task);
+    if (target && pending.length) {
+      throw new HttpError(409, `The manager has yet to re-plan the task for ${pending.map((request) => request.id).join(", ")}: leave this request to the manager too`);
+    }
     const rounds = input.rounds ?? task.maxRounds;
     if (!Number.isInteger(rounds) || rounds < 1 || rounds > 10) throw new HttpError(400, "Rounds must be an integer between 1 and 10");
 
     const requestId = `U${(task.changeRequests?.length ?? 0) + 1}`;
+    const from = task.status;
+    const failure = task.status === "failed" ? truncate(task.error ?? "", 1000) : undefined;
     this.resumeQueue.delete(id);
     task.autoResumes = 0;
-    this.requeue(task, rounds, `Change request ${requestId}`);
+    // A queued task has not started: it takes the request when it does.
+    if (task.status === "queued") task.roundsBudget = clampInt(rounds, 1, 10);
+    else this.requeue(task, rounds, `Change request ${requestId}`);
     const now = nowIso();
-    const stageOf = (kind: StageKind): Stage => {
-      let stage = task.stages.find((candidate) => candidate.kind === kind);
-      if (!stage) task.stages.push((stage = { kind, status: "pending", rounds: [], nextCommentNumber: 1 }));
-      return stage;
+    const request: ChangeRequest = {
+      id: requestId,
+      text,
+      attempt: task.attempt,
+      rounds: task.roundsBudget ?? rounds,
+      requestedAt: now,
+      routing: target ? "user" : "manager",
+      from,
+      ...(failure ? { failure } : {}),
     };
-    // The request is a round of its own: a "review" by the user whose comment the stage's agents must address.
-    const addRequestRound = (stage: Stage, body: string, summary: string): Round => {
-      const round: Round = {
-        n: stage.rounds.length + 1,
-        attempt: task.attempt,
-        startedAt: now,
-        review: { verdict: "request_changes", by: "user", summary, comments: [{ id: requestId, severity: "major", body, status: "open" }], at: now },
-      };
-      stage.rounds.push(round);
-      stage.status = "pending";
-      return round;
-    };
-    const round = addRequestRound(stageOf(target), text, `Change request ${requestId} from the user`);
-    const later = kinds.slice(index + 1);
-    for (const kind of later) {
-      const stage = stageOf(kind);
-      if (kind === "testing") {
-        stage.rerun = true;
-        stage.status = "pending";
-      } else {
-        addRequestRound(stage, cascadeRequest(target, kind, requestId, text), `Bring this stage in line with change request ${requestId}`);
-      }
-    }
-    (task.changeRequests ??= []).push({ id: requestId, text, stage: target, round: round.n, attempt: task.attempt, rounds: task.roundsBudget ?? rounds, requestedAt: now });
-    this.emit(task, {
-      type: "info",
-      stage: target,
-      round: round.n,
-      text: `Change request ${requestId} from the user (${STAGE_TITLES[target]} stage): ${truncate(text, 2000)}`,
-      data: { changeRequest: requestId },
-    });
-    this.comm(task, { from: "user", to: "manager", kind: "lifecycle", stage: target, round: round.n, text: `Change request ${requestId} for the ${STAGE_TITLES[target]} stage: ${truncate(firstLine(text), 160)}` });
-    if (later.length) {
-      this.comm(task, {
-        from: "manager",
-        to: "manager",
-        kind: "lifecycle",
-        text: `After ${requestId}: ${later.map((kind) => (kind === "testing" ? "re-run the tests" : `update the ${STAGE_TITLES[kind]} stage to match`)).join(", then ")}`,
+    (task.changeRequests ??= []).push(request);
+    if (target) {
+      const applied = applyChangePlan(task, [request], { stages: kinds, changeStage: target, instructions: {}, rationale: "", routing: "user" }, now);
+      this.emit(task, {
+        type: "info",
+        stage: target,
+        round: applied.round,
+        text: `Change request ${requestId} from the user (${STAGE_TITLES[target]} stage): ${truncate(text, 2000)}`,
+        data: { changeRequest: requestId },
       });
+      this.comm(task, { from: "user", to: "manager", kind: "lifecycle", stage: target, round: applied.round, text: `Change request ${requestId} for the ${STAGE_TITLES[target]} stage: ${truncate(firstLine(text), 160)}` });
+      if (applied.later.length) {
+        this.comm(task, {
+          from: "manager",
+          to: "manager",
+          kind: "lifecycle",
+          text: `After ${requestId}: ${applied.later.map((kind) => (kind === "testing" ? "re-run the tests" : `update the ${STAGE_TITLES[kind]} stage to match`)).join(", then ")}`,
+        });
+      }
+    } else {
+      request.pending = true;
+      // The manager's planner re-plans with the manager model (the author model unless one is set).
+      task.managerModel ??= this.deps.store.settings.managerModel || task.authorModel;
+      this.emit(task, {
+        type: "info",
+        text: `Change request ${requestId} from the user: ${truncate(text, 2000)}. The manager re-evaluates the task for it before the agents continue.`,
+        data: { changeRequest: requestId },
+      });
+      this.comm(task, { from: "user", to: "manager", kind: "lifecycle", text: `Change request ${requestId}: ${truncate(firstLine(text), 160)} - the manager re-evaluates the task for it` });
     }
     this.publish(task);
     this.pump();
@@ -480,7 +489,14 @@ export class TaskRunner {
   }
 
   private requeue(task: Task, rounds: number, verb: string): void {
+    // Change requests the stopped (or unapproved) attempt was working on are still what the next attempt works on;
+    // those of an attempt that finished are done.
+    const unfinished = task.status !== "completed" || task.result?.approved === false;
+    const previous = task.attempt;
     task.attempt += 1;
+    if (unfinished) {
+      for (const request of task.changeRequests ?? []) if (request.attempt === previous) request.attempt = task.attempt;
+    }
     task.roundsBudget = clampInt(rounds, 1, 10);
     task.status = "queued";
     task.phase = "queued";
@@ -1398,20 +1414,3 @@ export function pullRequestBody(task: Task): string {
 }
 
 const STAGE_TITLES: Record<StageKind, string> = { design: "Design", coding: "Coding", testing: "Execute & verify", document: "Document" };
-
-const CHANGED_ARTIFACT: Record<StageKind, string> = { design: "design document", coding: "code", testing: "code and tests", document: "document" };
-
-/** What a later stage is asked to do after an earlier stage changed for a change request. */
-function cascadeRequest(changed: StageKind, stage: StageKind, id: string, request: string): string {
-  const action =
-    stage === "coding"
-      ? "Bring the implementation (and its tests) in line with it"
-      : stage === "design"
-        ? "Update the design document to match"
-        : "Update the document to match";
-  const quoted = truncate(request, 4000)
-    .split(/\r?\n/)
-    .map((line) => `> ${line}`)
-    .join("\n");
-  return `The ${CHANGED_ARTIFACT[changed]} changed in the ${STAGE_TITLES[changed]} stage for the user's change request ${id} (quoted below). ${action}; decline with the reason if nothing here needs to change.\n\n${quoted}`;
-}

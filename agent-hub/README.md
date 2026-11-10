@@ -156,8 +156,9 @@ flowchart LR
    every document version (v1, v2, … final).
 8. **Push & pull request**: the hub pushes the task branch to the repository's remote and the task gets a
    **Create pull request** button (see [Pushing branches and pull requests](#pushing-branches-and-pull-requests)).
-9. **Request changes**: once finished (approved or not) you can ask for further changes or adjustments,
-   as often as you like (see [Requesting changes after a task finishes](#requesting-changes-after-a-task-finishes)).
+9. **Request changes**: whenever the task is not running (finished, failed, cancelled, interrupted or still
+   queued) you can ask for further changes or adjustments, as often as you like; the manager re-evaluates
+   the task for each request (see [Requesting changes](#requesting-changes-the-manager-re-plans-the-task)).
 
 Each agent keeps one Copilot session per stage, so it remembers earlier rounds; a comment resolver or test
 fixer that starts fresh gets the request, the previous summary and the diff so far. If an agent ends a turn
@@ -187,23 +188,46 @@ the top bar shows how many to-dos are waiting.
   the to-do back on the list to change it and send it again as a new task (it remembers where it was last
   sent). Deleting a to-do keeps its task.
 
-## Requesting changes after a task finishes
+## Requesting changes: the manager re-plans the task
 
-Every finished task, approved or not, has a **✎ Request changes** button (title bar, result card and
-Result tab). Describe what should change, optionally pick the stage it applies to (default: the last one)
-and the round budget:
+Every task that is not running - finished (approved or not), failed, cancelled, interrupted or still
+queued - has a **✎ Request changes** button (title bar, status card and Result tab; code reviews excepted:
+curate their comments instead). Describe what should change, choose who handles it and the round budget:
 
-- The request becomes change request **U1** (then U2, …): a round of its own, shown as *Your change
-  request* in the Rounds tab and the pipelines. The stage's author makes the change on its own branch,
-  on top of the latest result: the comment resolver for code, the designer or technical writer for
-  documents, the test fixer for tests. It must answer U1 with *addressed* or *declined* (with a reason).
-- The stage's reviewer verifies that the request was carried out (a decline is accepted only when the
-  request is impossible or harmful), or the test executor re-runs the tests. They iterate as usual until
-  approved or the rounds run out. Your requests take priority over earlier review preferences.
-- Later stages are brought in line: after a design change the code is updated to match, and after a code
-  change the test executor re-runs the tests. Earlier stages are left as they are.
+- **The manager decides** (default). The request becomes change request **U1** (then U2, …), and before
+  the agents continue, the manager's planner reads where the task stands (each stage's state, the task
+  branch, why it failed) and the request, then decides which teams handle it:
+  - the team whose work must change revises it (the *change stage*): the comment resolver changes the code,
+    the designer or technical writer revises the document, the test fixer changes the tests;
+  - new teams the request needs: e.g. a finished **Design** task asked to "now implement it" gets a coding
+    team that builds the approved design, a coding task gets a testing team to run the tests, or a
+    documentation team;
+  - fewer teams: a stage that has not finished (failed, stopped or never started) can be dropped when the
+    request makes it unnecessary ("skip the design and implement it directly"). It is marked *Dropped for
+    U1*; its work stays on the task branch. Finished stages are always kept.
+
+  The task type follows its teams (Design → *Design → Coding*, Design → Coding without the design →
+  *Coding*, other combinations → *Auto*), new teams get the manager's assignment, and the plan card shows
+  every re-plan with its reason. If the manager cannot re-plan (its planner fails or never submits), the
+  request goes to the latest stage that has work. A queued Auto task that has not been planned yet simply
+  plans with its requests.
+- **One stage only**: the request goes straight to that stage, without re-planning.
+
+How the teams work on it:
+
+- On a stage with work, the request is a round of its own, shown as *Your change request* in the Rounds tab
+  and the pipelines. The stage's author makes the change on its own branch, on top of the latest result,
+  and must answer U1 with *addressed* or *declined* (with a reason). The stage's reviewer verifies it (a
+  decline is accepted only when the request is impossible or harmful), or the test executor re-runs the
+  tests, round by round until approved or the rounds run out. Your requests take priority over earlier
+  review preferences.
+- A new stage, or one without work yet, starts afresh; its agents get the request, all your change
+  requests and the manager's assignment.
+- Later stages with work are brought in line: after a design change the code is updated to match, and after
+  a code change the test executor re-runs the tests. Earlier finished stages are left as they are.
+- A failed, cancelled or interrupted task continues from where it stopped, with the change.
 - The task then completes again and its branch is pushed, so an open pull request picks up the change.
-  The Result tab lists every change request with its status and the agent's response.
+  The Result tab lists every change request with its status, the manager's decision and the agent's response.
 
 ## Code review: two reviewers, then you publish
 
@@ -619,7 +643,7 @@ test output. Use a private repository.
 | `GET /api/sync/preview?repoId=&name=` · `POST /api/sync/load` | What loading a data branch would do / load it (`repoId`, `name`, `mode`: `merge` or `replace`, optional `sha` from the preview: refused with `409` when the branch changed since) |
 | `GET/POST /api/tasks` · `GET/DELETE /api/tasks/:id` | Tasks (`kind`: `auto`, `coding`, `testing`, `design`, `document`, `design-coding`, `review`; optional `managerModel` for Auto; `reviewTarget` (pull request number/URL or branch) and optional `peerReviewerModel` for Code review) |
 | `POST /api/tasks/:id/cancel` · `POST /api/tasks/:id/retry` · `POST /api/tasks/:id/input` | Control and answers |
-| `POST /api/tasks/:id/change-request` | Request further changes to a finished task (`request`, optional `stage` and `rounds`) |
+| `POST /api/tasks/:id/change-request` | Request changes to a task that is not running (`request`, optional `rounds`; optional `stage` hands it to that stage directly, otherwise the manager re-plans the task for it) |
 | `GET /api/tasks/:id/diff?from=&to=` | Changes |
 | `POST /api/tasks/:id/push` | Push the task branch to the remote now (retry, or with automatic pushes off) |
 | `GET /api/tasks/:id/pull-request` · `POST /api/tasks/:id/pull-request` | What the remote supports / open the pull request (returns it, or the host's `createUrl`) |

@@ -127,6 +127,14 @@ export const submitPlan =
     await spec.submit.onSubmit({ stages, rationale, instructions, briefing } as unknown as PlanSubmissionInput);
   };
 
+/** The manager's plan for a change request: the stages from now on, the stage that revises its work, assignments. */
+export const submitChangePlan =
+  (stages: string[], changeStage: string | undefined, instructions: Record<string, string> = {}, rationale = "Fits the change request"): Step =>
+  async (spec) => {
+    if (spec.submit.kind !== "plan") throw new Error(`${spec.role} cannot submit a plan`);
+    await spec.submit.onSubmit({ stages, rationale, instructions, ...(changeStage ? { change_stage: changeStage } : {}) } as unknown as PlanSubmissionInput);
+  };
+
 /** A turn that never finishes on its own (until the manager aborts it). */
 export const hang: Step = () => new Promise<void>(() => {});
 

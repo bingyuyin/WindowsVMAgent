@@ -45,6 +45,7 @@ const STAGE_STATUS = {
   "not-approved": ["Not approved", "warning"],
   failed: ["Failed", "danger"],
   cancelled: ["Cancelled", "neutral"],
+  skipped: ["Dropped", "neutral"],
 };
 const SEVERITY_CLASS = { blocker: "danger", major: "warning", minor: "info", nit: "neutral" };
 /** Who makes and who verifies a change request in each stage. */
@@ -65,7 +66,25 @@ const stageStatus = (stage) =>
     ? ["Tests pass", "success"]
     : stage.kind === "testing" && stage.status === "not-approved"
       ? ["Tests failing", "warning"]
-      : (STAGE_STATUS[stage.status] ?? [stage.status, "neutral"]);
+      : stage.status === "skipped"
+        ? [`Dropped${stage.skippedFor ? ` for ${stage.skippedFor}` : ""}`, "neutral"]
+        : (STAGE_STATUS[stage.status] ?? [stage.status, "neutral"]);
+/** Tasks that are running cannot take change requests until they stop. */
+const RUNNING = ["running", "needs-input"];
+
+/** What the manager decided for a change request, in words: "adds Coding; the task became Design → Coding". */
+function describeChangePlan(request) {
+  const plan = request.plan;
+  if (!plan) return null;
+  if (plan.initial) return "covered by the manager's first plan";
+  const parts = [];
+  if (request.round && request.stage) parts.push(`the ${STAGE_LABELS[request.stage]} team revises its work`);
+  else if (request.stage && !plan.added.includes(request.stage)) parts.push(`the ${STAGE_LABELS[request.stage]} team takes it on`);
+  if (plan.added.length) parts.push(`adds ${plan.added.map((kind) => STAGE_LABELS[kind]).join(", ")}`);
+  if (plan.dropped.length) parts.push(`drops ${plan.dropped.map((kind) => STAGE_LABELS[kind]).join(", ")}`);
+  if (plan.kind) parts.push(`the task became ${KIND_LABELS[plan.kind.to]}`);
+  return parts.join("; ") || "the remaining stages continue";
+}
 const roundsTabLabel = (task) => (task.stages.length && task.stages.every((stage) => stage.kind === "testing") ? "Test runs" : "Rounds");
 const EVENT_ICONS = {
   status: "●",
@@ -293,12 +312,13 @@ export function taskDetailView(root, { params }) {
     renderActiveTab(false);
   }
 
-  /** Auto tasks: what the manager decided - which stages (sub-agent teams) to run and each team's assignment. */
+  /** What the manager decided (Auto tasks, and tasks it re-planned for a change request): which stages run and each team's assignment. */
   function renderPlan() {
-    const signature = JSON.stringify([task.kind, task.plan, task.status, task.phase, task.review?.target]);
+    const replans = (task.changeRequests ?? []).filter((request) => request.plan && !request.plan.initial);
+    const signature = JSON.stringify([task.kind, task.plan, task.status, task.phase, task.review?.target, replans.map((request) => [request.id, request.plan])]);
     if (signatures.plan === signature) return;
     signatures.plan = signature;
-    if (task.kind !== "auto") {
+    if (task.kind !== "auto" && !task.plan) {
       setContent(planBox);
       return;
     }
@@ -356,7 +376,25 @@ export function taskDetailView(root, { params }) {
                 ),
               ]),
         ),
-        h("p", { class: "plan-rationale" }, plan.rationale),
+        replans.some((request) => request.plan.rationale === plan.rationale) ? null : h("p", { class: "plan-rationale" }, plan.rationale),
+        replans.length
+          ? h(
+              "div",
+              { class: "plan-replans" },
+              h("div", { class: "label" }, "Re-planned for your change requests"),
+              replans.map((request) =>
+                h(
+                  "div",
+                  { class: "plan-replan small" },
+                  h("span", { class: "mono comment-id" }, request.id),
+                  " ",
+                  request.plan.fallback ? h("span", { class: "muted" }, "The manager could not re-plan; ") : null,
+                  describeChangePlan(request),
+                  !request.plan.fallback && request.plan.rationale ? h("span", { class: "muted" }, ` — ${request.plan.rationale}`) : null,
+                ),
+              ),
+            )
+          : null,
         plannedReview
           ? h(
               "p",
@@ -400,7 +438,9 @@ export function taskDetailView(root, { params }) {
     if (!review && task.status === "completed" && task.result && !task.result.approved) {
       actions.push(h("button", { class: "btn btn-primary", onclick: () => retryTask(true) }, task.stages.at(-1)?.kind === "testing" ? "Continue fixing" : "Continue review loop"));
     }
-    if (!review && task.status === "completed" && task.result) actions.push(h("button", { class: "btn", onclick: requestChanges }, "✎ Request changes"));
+    if (!review && !RUNNING.includes(task.status)) {
+      actions.push(h("button", { class: "btn", title: "Ask for changes: the manager re-evaluates the task and assigns the teams to handle them", onclick: requestChanges }, "✎ Request changes"));
+    }
     if (!ACTIVE.includes(task.status)) actions.push(h("button", { class: "btn btn-ghost-danger", onclick: deleteTask }, "Delete"));
     setContent(
       titleBox,
@@ -445,7 +485,7 @@ export function taskDetailView(root, { params }) {
       return;
     }
     const resolver = task.kind === "coding" || task.kind === "design-coding" || task.kind === "testing" || task.kind === "auto" ? (task.resolverModel && task.resolverModel !== task.authorModel ? ` · resolver/fixer ${task.resolverModel}` : "") : "";
-    const manager = task.kind === "auto" && task.managerModel && task.managerModel !== task.authorModel ? `manager ${task.managerModel} · ` : "";
+    const manager = (task.kind === "auto" || task.plan) && task.managerModel && task.managerModel !== task.authorModel ? `manager ${task.managerModel} · ` : "";
     setContent(
       metaBox,
       meta("Repository", task.repoName),
@@ -495,7 +535,7 @@ export function taskDetailView(root, { params }) {
           "div",
           { class: "hero-request" },
           h("span", { class: "mono comment-id" }, activeRequest.id),
-          h("span", { class: "muted" }, ` Your change request (${STAGE_LABELS[activeRequest.stage]} stage): `),
+          h("span", { class: "muted" }, ` Your change request (${activeRequest.stage && !activeRequest.pending ? `${STAGE_LABELS[activeRequest.stage]} stage` : "the manager decides who handles it"}): `),
           `“${excerpt(activeRequest.text, 240)}”`,
         )
       : null;
@@ -542,7 +582,9 @@ export function taskDetailView(root, { params }) {
                 status === "needs-input"
                   ? `${ROLE_LABELS[task.pendingInput?.role] ?? "An agent"} is waiting for your answer`
                   : role === "planner"
-                    ? "Manager is planning: deciding which sub-agents to create and what each should do"
+                    ? (task.changeRequests ?? []).some((request) => request.pending) && task.stages.length
+                      ? "Manager is re-evaluating the task for your change request: which teams handle it"
+                      : "Manager is planning: deciding which sub-agents to create and what each should do"
                     : together.length > 1
                       ? `${together.map((agent) => ROLE_LABELS[agent.role]).join(" and ")} are working in parallel: ${phaseLabel(task.currentStage, task.phase).toLowerCase()}`
                       : role
@@ -624,14 +666,34 @@ export function taskDetailView(root, { params }) {
       return;
     }
     if (status === "failed") {
-      setContent(heroBox, h("div", { class: "callout callout-danger" }, h("strong", {}, "Failed: "), task.error ?? "unknown error", h("div", { class: "muted small" }, "Retry resumes from the last completed step; the agents' branches and worktrees are kept.")));
+      setContent(
+        heroBox,
+        h(
+          "div",
+          { class: "callout callout-danger" },
+          h("strong", {}, "Failed: "),
+          task.error ?? "unknown error",
+          h("div", { class: "muted small" }, "Retry resumes from the last completed step; the agents' branches and worktrees are kept. Or request changes: the manager re-evaluates the task for them."),
+          stoppedActions(),
+        ),
+      );
     } else if (status === "interrupted") {
-      setContent(heroBox, h("div", { class: "callout callout-warning" }, "The hub stopped while this task was running. Retry resumes from the last completed step."));
+      setContent(heroBox, h("div", { class: "callout callout-warning" }, "The hub stopped while this task was running. Retry resumes from the last completed step.", stoppedActions()));
     } else if (status === "cancelled") {
-      setContent(heroBox, h("div", { class: "callout" }, "Cancelled. Work committed so far stays on the task branch; Retry resumes from the last completed step."));
+      setContent(heroBox, h("div", { class: "callout" }, "Cancelled. Work committed so far stays on the task branch; Retry resumes from the last completed step.", stoppedActions()));
     } else {
       setContent(heroBox);
     }
+  }
+
+  /** Retry, or ask for changes, on a task that stopped before it finished. */
+  function stoppedActions() {
+    return h(
+      "div",
+      { class: "row wrap hero-actions" },
+      h("button", { class: "btn btn-sm btn-primary", onclick: () => retryTask(false) }, "Retry"),
+      isCodeReviewTask(task) ? null : h("button", { class: "btn btn-sm", title: "The manager re-evaluates the task and assigns the teams to handle your changes", onclick: requestChanges }, "✎ Request changes"),
+    );
   }
 
   /** A finished code review: what changed, how many comments, whether the reviewers agree, and where it was published. */
@@ -2301,12 +2363,27 @@ export function taskDetailView(root, { params }) {
   }
 
   function renderResult(force) {
-    const signature = JSON.stringify([task.status, task.result, task.changeRequests?.length]);
+    const signature = JSON.stringify([task.status, task.result, task.changeRequests]);
     if (!force && signatures.result === signature) return;
     signatures.result = signature;
     const result = task.result;
     if (!result) {
-      setContent(tabBody, h("div", { class: "empty card muted" }, ACTIVE.includes(task.status) ? "The result appears here when the workflow finishes." : "This task has no result."));
+      const canRequest = !RUNNING.includes(task.status) && !isCodeReviewTask(task);
+      setContent(
+        tabBody,
+        h("div", { class: "empty card muted" }, ACTIVE.includes(task.status) ? "The result appears here when the workflow finishes." : "This task has no result."),
+        task.changeRequests?.length || canRequest
+          ? h(
+              "div",
+              { class: "card" },
+              h("h3", {}, "Change requests"),
+              task.changeRequests?.length
+                ? h("div", { class: "change-requests" }, [...task.changeRequests].reverse().map(changeRequestRow))
+                : h("p", { class: "muted small" }, "Want the task to go differently? Request changes: the manager re-evaluates the task and assigns the teams to handle them."),
+              canRequest ? h("div", { class: "row" }, h("button", { class: "btn btn-sm", onclick: requestChanges }, "✎ Request changes")) : null,
+            )
+          : null,
+      );
       return;
     }
     const repo = state.repos.find((candidate) => candidate.id === task.repoId);
@@ -2360,7 +2437,7 @@ export function taskDetailView(root, { params }) {
         h("h3", {}, "Change requests"),
         task.changeRequests?.length
           ? h("div", { class: "change-requests" }, [...task.changeRequests].reverse().map(changeRequestRow))
-          : h("p", { class: "muted small" }, "Want something adjusted? Request changes: the agents rework the result and review it again, round by round."),
+          : h("p", { class: "muted small" }, "Want something adjusted? Request changes: the manager re-evaluates the task and assigns the teams to rework, extend or verify the result."),
         h("div", { class: "row" }, h("button", { class: "btn btn-sm", onclick: requestChanges }, "✎ Request changes")),
         h("h3", {}, "Remote & pull request"),
         deliveryResult,
@@ -2372,19 +2449,29 @@ export function taskDetailView(root, { params }) {
     renderDelivery();
   }
 
-  /** One change request: what the user asked for, its state and the agent's response. */
+  /** One change request: what the user asked for, who handles it (the manager's decision), its state and the agent's response. */
   function changeRequestRow(request) {
-    const stage = task.stages.find((candidate) => candidate.kind === request.stage);
-    const comment = stage?.rounds.find((round) => round.n === request.round)?.review?.comments.find((candidate) => candidate.id === request.id);
-    const working = ACTIVE.includes(task.status) && task.attempt === request.attempt;
-    const [label, cls] = working
-      ? ["In progress", "running"]
-      : comment?.status === "addressed"
-        ? ["Done", "success"]
-        : comment?.status === "declined"
-          ? ["Declined", "warning"]
-          : ["Open", "neutral"];
-    const responder = stage?.rounds.find((round) => round.n === request.round + 1)?.author?.role;
+    const stage = request.stage ? task.stages.find((candidate) => candidate.kind === request.stage) : undefined;
+    const comment = request.round ? stage?.rounds.find((round) => round.n === request.round)?.review?.comments.find((candidate) => candidate.id === request.id) : undefined;
+    const active = ACTIVE.includes(task.status);
+    const working = active && task.attempt === request.attempt;
+    const [label, cls] = request.pending
+      ? active
+        ? ["Manager re-planning", "running"]
+        : ["Waiting for the manager", "neutral"]
+      : working
+        ? ["In progress", "running"]
+        : comment?.status === "addressed"
+          ? ["Done", "success"]
+          : comment?.status === "declined"
+            ? ["Declined", "warning"]
+            : !comment && stage?.status === "approved"
+              ? ["Done", "success"]
+              : !comment && stage?.status === "not-approved"
+                ? ["Not approved", "warning"]
+                : ["Open", "neutral"];
+    const responder = request.round ? stage?.rounds.find((round) => round.n === request.round + 1)?.author?.role : undefined;
+    const plan = request.plan;
     return h(
       "div",
       { class: "comment comment-user" },
@@ -2392,48 +2479,72 @@ export function taskDetailView(root, { params }) {
         "div",
         { class: "comment-head" },
         h("span", { class: "mono comment-id" }, request.id),
-        chip(`${STAGE_LABELS[request.stage]} stage`, "outline"),
-        h("span", { class: "muted small" }, `requested ${relTime(request.requestedAt)}`),
+        request.stage && !request.pending ? chip(`${STAGE_LABELS[request.stage]} stage`, "outline") : chip("the manager decides", "outline"),
+        h("span", { class: "muted small" }, `requested ${relTime(request.requestedAt)}${request.from && request.from !== "completed" ? ` (the task was ${request.from === "queued" ? "waiting to start" : request.from})` : ""}`),
         h("span", { class: "spacer" }),
         chip(label, cls),
       ),
       renderMarkdown(request.text),
+      plan
+        ? h(
+            "div",
+            { class: "change-plan small" },
+            h("span", { class: "muted" }, plan.fallback ? "The manager could not re-plan: " : "Manager: "),
+            plan.fallback && request.stage ? `the ${STAGE_LABELS[request.stage]} team revises its work` : describeChangePlan(request),
+            !plan.fallback && !plan.initial && plan.rationale ? h("div", { class: "muted" }, plan.rationale) : null,
+          )
+        : null,
       comment?.response ? h("div", { class: "comment-response" }, h("span", { class: "muted" }, `↳ ${responder ? ROLE_LABELS[responder] : "Agent"}: `), comment.response) : null,
     );
   }
 
   // ---- actions ---------------------------------------------------------------------------
 
-  /** Asks the agents for further changes to the finished task (approved or not). */
+  /**
+   * Asks for changes to the task in any state but running. By default the manager re-evaluates the task for the request
+   * and decides which teams handle it (and so the task type); the user may also hand it to one stage directly.
+   */
   async function requestChanges() {
-    if (!task || task.status !== "completed") return;
-    const kinds = task.stages.map((stage) => stage.kind);
-    const lastKind = kinds.at(-1);
+    if (!task || RUNNING.includes(task.status) || isCodeReviewTask(task)) return;
+    const kinds = task.plan?.stages ?? task.stages.filter((stage) => stage.status !== "skipped").map((stage) => stage.kind);
+    // A stage chosen directly would bypass the manager's re-plan an earlier request is waiting for.
+    const waiting = (task.changeRequests ?? []).filter((request) => request.pending).map((request) => request.id);
     const nextId = `U${(task.changeRequests?.length ?? 0) + 1}`;
     const text = h("textarea", {
       class: "input",
       rows: "7",
       value: requestDraft,
-      placeholder: "Describe the changes or adjustments you want, e.g. “Rename hello() to greet(), accept a name parameter and add a unit test for an empty name.”",
+      placeholder:
+        "Describe what you want changed, e.g. “Rename hello() to greet() and add a unit test for an empty name”, “Now implement the design”, “Skip the design and code it directly” or “Also run the e2e tests”.",
     });
-    const stageSelect =
-      kinds.length > 1
-        ? h(
-            "select",
-            { class: "input" },
-            kinds.map((kind) => h("option", { value: kind, selected: kind === lastKind }, `${STAGE_LABELS[kind]} stage`)),
-          )
-        : null;
+    const handler = h(
+      "select",
+      { class: "input" },
+      h("option", { value: "" }, "The manager decides (re-evaluates the task)"),
+      waiting.length ? null : kinds.map((kind) => h("option", { value: kind }, `The ${STAGE_LABELS[kind]} stage only`)),
+    );
     const teamNote = h("small", { class: "muted" });
     const updateNote = () => {
-      const kind = stageSelect?.value ?? lastKind;
+      const kind = handler.value;
+      if (!kind) {
+        teamNote.textContent =
+          "The manager reads where the task stands and your request, then decides which teams handle it: the team that revises its work, new teams (e.g. coding to implement a finished design, testing to run the tests) or fewer (a stage your request makes unnecessary). The task type follows its teams." +
+          (waiting.length ? ` It also re-plans for ${waiting.join(", ")}, which is still waiting for it.` : "");
+        return;
+      }
       const later = kinds.slice(kinds.indexOf(kind) + 1);
       teamNote.textContent =
         `${STAGE_LABELS[kind]} stage: ${CHANGE_TEAMS[kind] ?? "its agents make and verify the change"}.` +
         (later.length ? ` Then ${later.map((other) => (other === "testing" ? "the tests run again" : `the ${STAGE_LABELS[other]} stage updates to match`)).join(", then ")}.` : "");
     };
-    stageSelect?.addEventListener("change", updateNote);
+    handler.addEventListener("change", updateNote);
     updateNote();
+    const situation = {
+      failed: " The task failed: the agents continue from where it stopped.",
+      cancelled: " The task was cancelled: the agents continue from where it stopped.",
+      interrupted: " The task was interrupted: the agents continue from where it stopped.",
+      queued: " The task has not started yet: it starts with your request.",
+    };
     const rounds = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(task.maxRounds) });
     const pending = confirmDialog({
       title: `Request changes · ${task.id}`,
@@ -2443,10 +2554,10 @@ export function taskDetailView(root, { params }) {
         h(
           "p",
           { class: "muted small" },
-          `This becomes change request ${nextId}. The agents make the change on their own branches and the reviewer verifies it, round by round, until it is approved or the rounds run out; then the task branch is pushed again.`,
+          `This becomes change request ${nextId}.${situation[task.status] ?? ""} The agents make the change on their own branches and reviewers verify it, round by round; then the task branch is pushed again.`,
         ),
         h("label", { class: "field" }, h("span", { class: "field-label" }, "What should change?"), text),
-        stageSelect ? h("label", { class: "field" }, h("span", { class: "field-label" }, "Apply to"), stageSelect, teamNote) : teamNote,
+        h("label", { class: "field" }, h("span", { class: "field-label" }, "Who handles it"), handler, teamNote),
         h("label", { class: "field" }, h("span", { class: "field-label" }, "Rounds (review rounds or test runs per stage)"), rounds),
       ),
       confirmText: "Request changes",
@@ -2463,11 +2574,11 @@ export function taskDetailView(root, { params }) {
     try {
       await post(`/api/tasks/${encodeURIComponent(task.id)}/change-request`, {
         request: text.value,
-        stage: stageSelect?.value,
+        stage: handler.value || undefined,
         rounds: Number(rounds.value) || undefined,
       });
       requestDraft = "";
-      toast(`Change request ${nextId} queued`, "success");
+      toast(handler.value ? `Change request ${nextId} queued for the ${STAGE_LABELS[handler.value]} stage` : `Change request ${nextId} sent to the manager`, "success");
       selectTab("conversation", false);
     } catch (error) {
       toast(error.message, "error");

@@ -362,7 +362,7 @@ export function normalizePlan(input: unknown): PlanSubmissionInput {
   if (names.some(isReviewStage)) return normalizeReviewPlan(raw, names);
   const chosen = new Set<StageKind>();
   for (const [index, name] of names.entries()) {
-    const stage = STAGE_ALIASES[name];
+    const stage = stageNamed(name);
     if (!stage) throw new Error(`Unknown stage '${String(raw.stages[index])}'. Use: ${STAGE_ORDER.join(", ")}, or review.`);
     chosen.add(stage);
   }
@@ -385,8 +385,13 @@ export function normalizePlan(input: unknown): PlanSubmissionInput {
   return { stages, rationale: truncate(rationale, 2000), instructions, briefing: truncate(briefing, 6000) };
 }
 
+/** The stage a planner means by a name ("code", "tests", "docs"...), if any. */
+export function stageNamed(name: string): StageKind | undefined {
+  return Object.hasOwn(STAGE_ALIASES, name) ? STAGE_ALIASES[name] : undefined;
+}
+
 /** Names a planner may use for the code review team. */
-function isReviewStage(name: string): boolean {
+export function isReviewStage(name: string): boolean {
   return /^(?:(?:code|pr|pull request|merge request|mr)[\s_-]*)?review(?:ing)?$/.test(name.replace(/[\s_-]+/g, " "));
 }
 
