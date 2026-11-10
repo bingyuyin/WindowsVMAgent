@@ -4,6 +4,7 @@ import net from "node:net";
 import path from "node:path";
 import { describe, test } from "node:test";
 import type { CopilotService } from "../src/copilot/service.ts";
+import { DataSync } from "../src/datasync.ts";
 import { createApiRouter, DESCRIPTION_BODY_BYTES } from "../src/http/api.ts";
 import { createHttpServer } from "../src/http/server.ts";
 import type { RepoService } from "../src/repos.ts";
@@ -36,13 +37,15 @@ async function serveApi(h: Harness) {
       probe.close(() => resolve(free));
     });
   });
+  const todos = new TodoService(h.store, h.bus, h.runner);
   const router = createApiRouter({
     store: h.store,
     bus: h.bus,
     runner: h.runner,
     copilot: {} as CopilotService,
     repos: {} as RepoService,
-    todos: new TodoService(h.store, h.bus, h.runner),
+    todos,
+    sync: new DataSync({ store: h.store, bus: h.bus, runner: h.runner, todos, build: { version: "test", commit: null } }),
     build: { version: "test", commit: null, ui: "test" },
   });
   const server = createHttpServer({ host: "127.0.0.1", port, publicDir: path.join(import.meta.dirname, "..", "public"), router });

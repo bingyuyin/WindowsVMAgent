@@ -11,7 +11,9 @@ export type GlobalMessage =
   | { type: "todos"; todos: readonly Todo[] }
   | { type: "settings"; settings: Settings }
   | { type: "comm"; entry: CommEntry }
-  | { type: "manager"; lastCheckAt: string | null };
+  | { type: "manager"; lastCheckAt: string | null }
+  /** Tasks, to-dos and the manager log were loaded from a data branch: pages reload everything they show. */
+  | { type: "data-loaded"; text: string };
 
 export type TaskMessage =
   | { type: "task"; task: Task }

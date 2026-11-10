@@ -97,6 +97,10 @@ export class Store {
       todos: path.join(this.dataDir, "todos.json"),
       tasks: path.join(this.dataDir, "tasks"),
       managerLog: path.join(this.dataDir, "manager-log.jsonl"),
+      /** The manager log's previous part (it is rotated when it grows large). */
+      managerLogRotated: path.join(this.dataDir, "manager-log.1.jsonl"),
+      /** Data set aside when a data branch replaced it (Settings → Data sync). */
+      backups: path.join(this.dataDir, "backups"),
       legacyState: path.join(this.dataDir, "state.json"),
     };
   }
@@ -190,6 +194,24 @@ export class Store {
     return `TD-${String(n).padStart(3, "0")}`;
   }
 
+  /** Replaces the whole to-do list. */
+  setTodos(todos: Todo[]): void {
+    this.todoList = todos.filter((todo) => TODO_ID.test(todo.id));
+    this.saveTodos();
+  }
+
+  /** The numbers the next task and to-do get. */
+  get counters(): { nextTaskNumber: number; nextTodoNumber: number } {
+    return { nextTaskNumber: this.meta.nextTaskNumber, nextTodoNumber: this.meta.nextTodoNumber ?? 1 };
+  }
+
+  /** Makes sure new tasks and to-dos are numbered from at least these numbers (ids are never reused). */
+  reserveNumbers(numbers: { nextTaskNumber?: number; nextTodoNumber?: number }): void {
+    this.meta.nextTaskNumber = Math.max(this.meta.nextTaskNumber, numbers.nextTaskNumber ?? 0);
+    this.meta.nextTodoNumber = Math.max(this.meta.nextTodoNumber ?? 1, numbers.nextTodoNumber ?? 0);
+    this.writeMeta();
+  }
+
   // ---- Tasks ----------------------------------------------------------------------------
 
   get tasks(): readonly Task[] {
@@ -233,6 +255,66 @@ export class Store {
 
   taskFile(taskId: string): string {
     return path.join(this.taskDir(taskId), "task.json");
+  }
+
+  /** Names of the files in a task's folder: its timeline and document snapshots (task.json excluded). */
+  taskFiles(taskId: string): string[] {
+    try {
+      return fs
+        .readdirSync(this.taskDir(taskId), { withFileTypes: true })
+        .filter((entry) => entry.isFile() && isArtifactName(entry.name) && entry.name !== "task.json" && !entry.name.endsWith(".tmp") && !entry.name.includes(".corrupt-"))
+        .map((entry) => entry.name)
+        .sort();
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Puts tasks loaded from elsewhere (a data branch) in place of the tasks with their ids, if any: each folder gets
+   * exactly the given files. Every folder is written to a staging folder first and then swapped in, so a failed write
+   * leaves the data here as it was. Call inside `exclusive()`, so no timeline write is in flight.
+   */
+  putLoadedTasks(items: ReadonlyArray<{ task: Task; files: ReadonlyMap<string, Buffer> }>): void {
+    for (const { task } of items) {
+      if (!TASK_ID.test(task.id) || task.id === "." || task.id === "..") throw new Error(`Invalid task id: ${task.id}`);
+    }
+    const staging = path.join(this.paths.tasks, `.loading-${process.pid}-${Date.now().toString(36)}`);
+    try {
+      for (const { task, files } of items) {
+        const dir = path.join(staging, task.id);
+        fs.mkdirSync(dir, { recursive: true });
+        for (const [name, content] of files) {
+          if (!isArtifactName(name) || name === "task.json") continue;
+          fs.writeFileSync(path.join(dir, name), content);
+        }
+        fs.writeFileSync(path.join(dir, "task.json"), `${JSON.stringify(task, null, 2)}\n`, "utf8");
+      }
+      for (const { task } of items) {
+        const dir = this.taskDir(task.id);
+        const previous = path.join(staging, `${task.id}.previous`);
+        if (fs.existsSync(dir)) renameWithRetry(dir, previous);
+        try {
+          renameWithRetry(path.join(staging, task.id), dir);
+        } catch (error) {
+          if (fs.existsSync(previous)) renameWithRetry(previous, dir);
+          throw error;
+        }
+        this.dirtyTasks.delete(task.id);
+        this.recent.delete(task.id);
+        this.pendingLines.delete(task.id);
+        const index = this.taskList.findIndex((candidate) => candidate.id === task.id);
+        if (index >= 0) this.taskList[index] = task;
+        else this.taskList.push(task);
+      }
+    } finally {
+      this.taskList.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      try {
+        fs.rmSync(staging, { recursive: true, force: true, maxRetries: 3 });
+      } catch {
+        // A leftover staging folder is ignored (it holds no task.json of its own).
+      }
+    }
   }
 
   // ---- Task timeline --------------------------------------------------------------------
@@ -296,13 +378,90 @@ export class Store {
     return entries.slice(-(options.limit ?? 300));
   }
 
+  /** Adds a message from another hub's log (it keeps its time and gets the next sequence number here). */
+  appendLoadedComm(entry: Omit<CommEntry, "seq">): CommEntry {
+    const full: CommEntry = { ...entry, seq: ++this.commSeq };
+    this.comm.push(full);
+    if (this.comm.length > RECENT_COMM_LIMIT) this.comm.splice(0, this.comm.length - RECENT_COMM_LIMIT);
+    this.pendingComm.push(`${JSON.stringify(full)}\n`);
+    this.scheduleFlush();
+    return full;
+  }
+
+  /** Every message in the manager log (its rotated part included), oldest first. Call inside `exclusive()`. */
+  readCommLogSync(): CommEntry[] {
+    const entries: CommEntry[] = [];
+    const parse = (text: string) => {
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line) as CommEntry;
+          if (isObject(entry) && typeof entry.taskId === "string") entries.push(entry);
+        } catch {
+          // Ignore a torn line from an unclean shutdown.
+        }
+      }
+    };
+    for (const file of [this.paths.managerLogRotated, this.paths.managerLog]) {
+      try {
+        parse(fs.readFileSync(file, "utf8"));
+      } catch {
+        // Not there (yet).
+      }
+    }
+    parse(this.pendingComm.join(""));
+    return entries;
+  }
+
+  /** Empties the manager log (sequence numbers continue). Call inside `exclusive()`. */
+  clearCommLogSync(): void {
+    for (const file of [this.paths.managerLogRotated, this.paths.managerLog]) fs.rmSync(file, { force: true });
+    this.comm = [];
+    this.pendingComm = [];
+  }
+
+  /**
+   * Copies the to-do list, counters, manager log and every task folder to `dir` (a backup before the data is
+   * replaced). Call inside `exclusive()`.
+   */
+  copyDataSync(dir: string): void {
+    fs.mkdirSync(dir, { recursive: true });
+    for (const file of [this.paths.hub, this.paths.todos, this.paths.managerLogRotated, this.paths.managerLog]) {
+      if (fs.existsSync(file)) fs.copyFileSync(file, path.join(dir, path.basename(file)));
+    }
+    if (fs.existsSync(this.paths.tasks)) fs.cpSync(this.paths.tasks, path.join(dir, "tasks"), { recursive: true });
+  }
+
+  /**
+   * Runs `work` once the timelines and the manager log are written, with no write to them (or to document snapshots)
+   * in flight and none starting until it has finished: data can be read or swapped consistently.
+   */
+  exclusive<T>(work: () => T | Promise<T>): Promise<T> {
+    this.flushTasks();
+    void this.flushEvents();
+    const result = this.flushChain.then(work);
+    this.flushChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   // ---- Artifacts ------------------------------------------------------------------------
 
   async writeArtifact(taskId: string, name: string, content: string): Promise<void> {
     if (!ARTIFACT_NAME.test(name)) throw new Error(`Invalid artifact name: ${name}`);
     const dir = this.taskDir(taskId);
-    await fsp.mkdir(dir, { recursive: true });
-    await fsp.writeFile(path.join(dir, name), content, "utf8");
+    // On the flush chain, like the timelines: a data push never reads a half-written snapshot.
+    const written = this.flushChain.then(async () => {
+      await fsp.mkdir(dir, { recursive: true });
+      await fsp.writeFile(path.join(dir, name), content, "utf8");
+    });
+    this.flushChain = written.then(
+      () => undefined,
+      () => undefined,
+    );
+    return written;
   }
 
   async readArtifact(taskId: string, name: string): Promise<string | null> {
@@ -330,6 +489,7 @@ export class Store {
         { label: "Tasks", path: paths.tasks, description: "Per task: task.json (last state), events.jsonl (timeline), document snapshots" },
         { label: "Manager log", path: paths.managerLog, description: "Manager <-> sub-agent communication" },
         { label: "Hub", path: paths.hub, description: "Storage format version, task and to-do counters" },
+        { label: "Backups", path: paths.backups, description: "This hub's data as it was before a data branch replaced it (Data sync)" },
       ],
       repos: this.repoList.length,
       tasks: this.taskList.length,
@@ -489,7 +649,7 @@ export class Store {
     this.comm = entries.slice(-RECENT_COMM_LIMIT);
     if (size > COMM_ROTATE_BYTES) {
       try {
-        fs.renameSync(file, path.join(this.dataDir, "manager-log.1.jsonl"));
+        fs.renameSync(file, this.paths.managerLogRotated);
       } catch {
         // Keep appending to the current file.
       }
@@ -499,6 +659,28 @@ export class Store {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A file name the hub writes in a task folder: no path parts, short, and nothing Windows treats specially (device
+ * names, trailing dots).
+ */
+export function isArtifactName(name: string): boolean {
+  return ARTIFACT_NAME.test(name) && name.length <= 100 && !name.endsWith(".") && !/^(con|prn|aux|nul|com\d|lpt\d)(\..*)?$/i.test(name);
+}
+
+/** Renames, retrying briefly while another process (antivirus, indexer) still holds a freshly written file. */
+function renameWithRetry(from: string, to: string): void {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (attempt >= 6 || !["EPERM", "EACCES", "EBUSY"].includes(code ?? "")) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * attempt);
+    }
+  }
 }
 
 function taskNumber(id: string): number {

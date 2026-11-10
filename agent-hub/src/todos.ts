@@ -36,6 +36,11 @@ export class TodoService {
     return this.store.todos;
   }
 
+  /** A to-do is being sent to the manager right now (its record must not be swapped). */
+  isSending(id?: string): boolean {
+    return id === undefined ? this.sending.size > 0 : this.sending.has(id);
+  }
+
   get(id: string): Todo {
     const todo = this.store.getTodo(id);
     if (!todo) throw new HttpError(404, `To-do ${id} not found`);

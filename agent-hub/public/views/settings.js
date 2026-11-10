@@ -1,11 +1,13 @@
 import { get, post, put } from "../lib/api.js";
 import { confirmDialog, copyButton, h, setContent, spinner, toast } from "../lib/dom.js";
 import { notify, state, subscribe } from "../lib/store.js";
+import { dataSyncSection } from "./dataSync.js";
 import { loadModels, modelOptions, resetModelsCache } from "./models.js";
 
 export function settingsView(root) {
   const account = h("div", { class: "card" });
   const storage = h("div", { class: "card" }, spinner("Loading…"));
+  const sync = dataSyncSection();
   const authorSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const reviewerSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
   const resolverSelect = h("select", { class: "input" }, h("option", {}, "Loading…"));
@@ -113,6 +115,8 @@ export function settingsView(root) {
     ),
     h("h2", { class: "section-title" }, "Storage"),
     storage,
+    h("h2", { class: "section-title", id: "data-sync" }, "Data sync"),
+    sync.el,
     h("h2", { class: "section-title" }, "About"),
     h(
       "div",
@@ -248,9 +252,13 @@ export function settingsView(root) {
   renderAccount();
   renderStorage();
   fillModels(false);
-  return subscribe((kind) => {
+  const unsubscribe = subscribe((kind) => {
     if (kind === "auth") renderAccount();
     // Parallel tasks can be changed live from the Tasks and Agents pages (or another tab).
     if (kind === "settings" && document.activeElement !== concurrency && state.settings?.maxConcurrency) concurrency.value = String(state.settings.maxConcurrency);
   });
+  return () => {
+    unsubscribe();
+    sync.dispose();
+  };
 }

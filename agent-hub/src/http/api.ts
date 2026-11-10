@@ -5,6 +5,7 @@ import type { CopilotService, LoginProvider } from "../copilot/service.ts";
 import { docForViewer, escapeHtml } from "../docs.ts";
 import type { RepoService } from "../repos.ts";
 import type { Store } from "../store.ts";
+import type { DataSync } from "../datasync.ts";
 import type { TodoService } from "../todos.ts";
 import { DOC_FORMATS, ISOLATION_MODES, MAX_PARALLEL_TASKS, type DocFormat, type IsolationMode, type Settings, type TaskKind } from "../types.ts";
 import { HttpError } from "../util.ts";
@@ -29,12 +30,14 @@ export interface ApiDeps {
   runner: TaskRunner;
   repos: RepoService;
   todos: TodoService;
+  /** Pushes the data to, and loads it from, `task_data/<name>` branches. */
+  sync: DataSync;
   /** The hub's version, commit and UI fingerprint (pages compare it with the one they were loaded with). */
   build: BuildInfo;
 }
 
 export function createApiRouter(deps: ApiDeps): Router {
-  const { store, bus, copilot, runner, repos, todos, build } = deps;
+  const { store, bus, copilot, runner, repos, todos, sync, build } = deps;
   const router = new Router();
 
   router.get("/api/health", () => ({ ok: true, ...build }));
@@ -133,6 +136,13 @@ export function createApiRouter(deps: ApiDeps): Router {
     return { todo, task: summarizeTask(task) };
   });
   router.post("/api/todos/:id/reopen", ({ params }) => todos.reopen(params.id!));
+
+  // ---- Data sync: the hub's data on task_data/<name> branches of a repository's remote ------
+  router.get("/api/sync", () => sync.info());
+  router.get("/api/sync/branches", ({ url }) => sync.branches(url.searchParams.get("repoId") ?? ""));
+  router.post("/api/sync/push", ({ body }) => sync.push(body));
+  router.get("/api/sync/preview", ({ url }) => sync.preview({ repoId: url.searchParams.get("repoId") ?? "", name: url.searchParams.get("name") ?? "" }));
+  router.post("/api/sync/load", ({ body }) => sync.load(body));
 
   // ---- Tasks -----------------------------------------------------------------------------
   router.get("/api/tasks", () =>

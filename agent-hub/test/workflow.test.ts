@@ -13,6 +13,7 @@ import { createHttpServer } from "../src/http/server.ts";
 import type { PullRequestCreator, PullRequestRequest } from "../src/remote.ts";
 import type { RepoService } from "../src/repos.ts";
 import { runShellCommand, type CommandRunner } from "../src/shell.ts";
+import { DataSync } from "../src/datasync.ts";
 import { TodoService } from "../src/todos.ts";
 import { pullRequestBody } from "../src/workflow/runner.ts";
 import { summarizeTask } from "../src/workflow/summary.ts";
@@ -984,6 +985,7 @@ describe("HTML documents", () => {
         copilot: {} as CopilotService,
         repos: {} as RepoService,
         todos: new TodoService(h.store, h.bus, h.runner),
+        sync: new DataSync({ store: h.store, bus: h.bus, runner: h.runner, todos: new TodoService(h.store, h.bus, h.runner), build: { version: "test", commit: null } }),
         build: { version: "test", commit: null, ui: "test" },
       }),
     });

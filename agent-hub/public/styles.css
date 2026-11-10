@@ -3262,3 +3262,83 @@ details > summary {
 .todo-confirm-list li {
   margin: 3px 0;
 }
+/* ---- data sync (Settings) ------------------------------------------------------------------------ */
+
+.sync-card > .callout {
+  margin-bottom: 12px;
+}
+.sync-panes {
+  align-items: start;
+}
+.sync-pane {
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  min-width: 0;
+}
+.sync-pane h3 {
+  margin: 0 0 10px;
+}
+.branch-input {
+  display: flex;
+  align-items: stretch;
+}
+.branch-prefix {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-right: 0;
+  border-radius: 6px 0 0 6px;
+  background: var(--bg-elev-2);
+  color: var(--text-muted);
+}
+.branch-input .input {
+  border-radius: 0 6px 6px 0;
+}
+.sync-result {
+  margin: 12px 0 0;
+  overflow-wrap: anywhere;
+}
+.sync-branches {
+  margin-top: 10px;
+}
+.sync-branch-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-muted);
+  border-radius: 8px;
+}
+.sync-branch-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border-muted);
+}
+.sync-branch-list li:first-child {
+  border-top: 0;
+}
+.sync-branch-name {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.sync-empty {
+  padding: 6px 0;
+}
+.sync-preview {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: var(--radius);
+  background: var(--bg-elev-2);
+}
+.sync-preview-head {
+  margin-bottom: 2px;
+}
+.sync-plan {
+  margin: 10px 0 4px;
+  font-size: 13px;
+}

@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -25,24 +25,29 @@ export interface GitOptions {
   timeoutMs?: number;
   allowFailure?: boolean;
   maxBuffer?: number;
+  /** Written to git's standard input. */
+  input?: string;
+  /** Extra environment variables (e.g. GIT_INDEX_FILE). */
+  env?: Record<string, string>;
 }
 
 const HUB_IDENTITY = ["-c", "user.name=Copilot Agent Hub", "-c", "user.email=agent-hub@localhost"];
+/** A system-wide core.safecrlf=true makes `git add` fail on LF files that agents write; line endings still follow core.autocrlf. No auto gc/maintenance: repacking refs while other tasks update theirs in the same repository makes their ref updates fail. */
+const GIT_CONFIG = ["-c", "core.safecrlf=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false"];
+const gitEnv = (extra?: Record<string, string>): NodeJS.ProcessEnv => ({ ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C", ...extra });
 
 export function git(cwd: string, args: string[], options: GitOptions = {}): Promise<GitResult> {
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       "git",
-      // A system-wide core.safecrlf=true makes `git add` fail on LF files that agents write; line endings still follow core.autocrlf.
-      // No auto gc/maintenance: repacking refs while other tasks update theirs in the same repository makes their ref updates fail.
-      ["-c", "core.safecrlf=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false", ...args],
+      [...GIT_CONFIG, ...args],
       {
         cwd,
         encoding: "utf8",
         timeout: options.timeoutMs ?? 120_000,
         maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
         windowsHide: true,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0", LC_ALL: "C" },
+        env: gitEnv(options.env),
       },
       (error, stdout, stderr) => {
         if (!error) {
@@ -62,6 +67,48 @@ export function git(cwd: string, args: string[], options: GitOptions = {}): Prom
         reject(new GitError(`git ${args.join(" ")} failed: ${detail}`, stderr, code));
       },
     );
+    if (options.input !== undefined) {
+      // git may exit before reading all of its input (it fails, or needs no more); that is reported through the exit code.
+      child.stdin?.on("error", () => undefined);
+      child.stdin?.end(options.input);
+    }
+  });
+}
+
+/** Runs git and returns its raw output (for binary-safe protocols such as `cat-file --batch`). */
+export function gitBuffer(cwd: string, args: string[], options: { input?: string; maxBytes: number; timeoutMs?: number }): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", [...GIT_CONFIG, ...args], { cwd, env: gitEnv(), windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    let size = 0;
+    let failure: Error | null = null;
+    const timer = setTimeout(() => {
+      failure = new GitError(`git ${args.join(" ")} timed out`, "", null);
+      child.kill();
+    }, options.timeoutMs ?? 300_000);
+    child.stdout.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > options.maxBytes) {
+        failure ??= new GitError(`git ${args.join(" ")} returned more than ${options.maxBytes} bytes`, "", null);
+        child.kill();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    child.on("error", (error: NodeJS.ErrnoException) => {
+      failure ??= error.code === "ENOENT" ? new GitError("git executable not found on PATH", "", error.code) : error;
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const stderr = Buffer.concat(errors).toString("utf8");
+      if (failure) reject(failure);
+      else if (code !== 0) reject(new GitError(`git ${args.join(" ")} failed: ${stderr.trim() || `exit code ${code}`}`, stderr, code));
+      else resolve(Buffer.concat(chunks));
+    });
+    child.stdin.on("error", () => undefined);
+    child.stdin.end(options.input ?? "");
   });
 }
 
@@ -221,7 +268,8 @@ export async function deleteBranchesWithPrefix(repoPath: string, prefix: string)
   }
 }
 
-async function identityArgs(cwd: string): Promise<string[]> {
+/** `-c user.name/email` for the hub's identity when the repository has no committer identity configured; none otherwise. */
+export async function identityArgs(cwd: string): Promise<string[]> {
   const email = await git(cwd, ["config", "user.email"], { allowFailure: true });
   return email.stdout.trim() ? [] : HUB_IDENTITY;
 }

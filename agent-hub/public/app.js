@@ -1,5 +1,5 @@
 import { get, setUiBuild } from "./lib/api.js";
-import { clear, h, setContent, spinner } from "./lib/dom.js";
+import { clear, h, setContent, spinner, toast } from "./lib/dom.js";
 import { mergeComm, needsModels, notify, state, subscribe } from "./lib/store.js";
 import { agentsView } from "./views/agents.js";
 import { loginView } from "./views/login.js";
@@ -165,8 +165,23 @@ function connect() {
         state.manager = { ...state.manager, lastCheckAt: data.lastCheckAt };
         notify("manager");
         break;
+      case "data-loaded":
+        // Tasks, to-dos and the manager log were swapped: reload them all, and an open task page from scratch.
+        toast(`${data.text}.`, "success");
+        refreshData()
+          .then(() => {
+            if (/^#\/tasks\/(?!new$)/.test(current.key ?? "")) rerender();
+          })
+          .catch(() => undefined);
+        break;
     }
   };
+}
+
+/** Renders the current page again from scratch. */
+function rerender() {
+  current.key = null;
+  route();
 }
 
 subscribe((kind) => {

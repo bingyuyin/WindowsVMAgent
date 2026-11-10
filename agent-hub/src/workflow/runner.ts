@@ -229,6 +229,21 @@ export class TaskRunner {
     return this.deps.store.tasks.some((task) => ACTIVE_STATUSES.includes(task.status));
   }
 
+  /**
+   * The task is being worked on: queued, running, waiting for an answer, publishing its review or pushing its branch.
+   * Its record must not be swapped (Data sync).
+   */
+  isBusy(id: string): boolean {
+    const task = this.deps.store.getTask(id);
+    if (this.running.has(id) || this.publishing.has(id)) return true;
+    return Boolean(task && (ACTIVE_STATUSES.includes(task.status) || task.push?.status === "pushing"));
+  }
+
+  /** The task's record was replaced by one loaded from a data branch: it does not resume automatically after the restart. */
+  forgetResume(id: string): void {
+    this.resumeQueue.delete(id);
+  }
+
   async submit(input: SubmitTaskInput): Promise<Task> {
     const { store } = this.deps;
     const isReview = input.kind === "review";
@@ -514,6 +529,7 @@ export class TaskRunner {
       fs.rmSync(root, { recursive: true, force: true });
     }
     await runtime.deleteSessions(task.sessions.map((session) => session.sessionId));
+    this.resumeQueue.delete(id);
     store.removeTask(id);
     await store.deleteTaskData(id);
     bus.publishGlobal({ type: "task-removed", id });

@@ -5,6 +5,7 @@ import { Bus } from "./bus.ts";
 import { loadConfig } from "./config.ts";
 import { loadHubSkills } from "./context.ts";
 import { CopilotService } from "./copilot/service.ts";
+import { DataSync } from "./datasync.ts";
 import { loadDocTemplates } from "./docs.ts";
 import { createApiRouter } from "./http/api.ts";
 import { createHttpServer } from "./http/server.ts";
@@ -46,6 +47,7 @@ const runner = new TaskRunner({
 });
 const repos = new RepoService(store, bus, config.reposDir);
 const todos = new TodoService(store, bus, runner);
+const sync = new DataSync({ store, bus, runner, todos, build });
 runner.init();
 
 copilot.onChange((auth) => {
@@ -57,7 +59,7 @@ const server = createHttpServer({
   host: config.host,
   port: config.port,
   publicDir: config.publicDir,
-  router: createApiRouter({ store, bus, copilot, runner, repos, todos, build }),
+  router: createApiRouter({ store, bus, copilot, runner, repos, todos, sync, build }),
   vendor: config.vendorFiles,
   uiBuild: build.ui,
 });

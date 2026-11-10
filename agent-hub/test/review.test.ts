@@ -9,6 +9,7 @@ import { createApiRouter } from "../src/http/api.ts";
 import { createHttpServer } from "../src/http/server.ts";
 import type { RepoService } from "../src/repos.ts";
 import { LineOutsideDiffError } from "../src/review/publish.ts";
+import { DataSync } from "../src/datasync.ts";
 import { TodoService } from "../src/todos.ts";
 import { summarizeTask } from "../src/workflow/summary.ts";
 import {
@@ -697,7 +698,16 @@ describe("code review over HTTP", () => {
       host: "127.0.0.1",
       port,
       publicDir: path.join(import.meta.dirname, "..", "public"),
-      router: createApiRouter({ store: h.store, bus: h.bus, runner: h.runner, copilot, repos: {} as RepoService, todos: new TodoService(h.store, h.bus, h.runner), build }),
+      router: createApiRouter({
+        store: h.store,
+        bus: h.bus,
+        runner: h.runner,
+        copilot,
+        repos: {} as RepoService,
+        todos: new TodoService(h.store, h.bus, h.runner),
+        sync: new DataSync({ store: h.store, bus: h.bus, runner: h.runner, todos: new TodoService(h.store, h.bus, h.runner), build }),
+        build,
+      }),
       uiBuild: build.ui,
     });
     const origin = `http://127.0.0.1:${port}`;

@@ -603,6 +603,11 @@ export interface Todo {
   sentAt?: string;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Identity across hubs (Data sync): `<id>@<createdAt>` of the original to-do, set when it was loaded from a data
+   * branch under another id. Without it, the identity is this to-do's own `<id>@<createdAt>`.
+   */
+  syncId?: string;
 }
 
 export interface Task {
@@ -668,6 +673,11 @@ export interface Task {
   attemptStartedAt?: string;
   finishedAt?: string;
   lastSeq: number;
+  /**
+   * Identity across hubs (Data sync): `<id>@<createdAt>` of the original task, set when it was loaded from a data
+   * branch under another id. Without it, the identity is this task's own `<id>@<createdAt>`.
+   */
+  syncId?: string;
 }
 
 export type TaskEventType =

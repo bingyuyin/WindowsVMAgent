@@ -33,6 +33,8 @@ manager** hands a to-do (or several) to the manager agent, which plans and runs 
 **Agents** page shows the same work from the agents' side: a live hierarchy (or pipeline)
 of the manager, the tasks and their sub-agents, and the manager's conversation with them. Everything
 (settings, repositories, to-dos, each task's last state and history) is saved on local disk and survives restarts.
+**Settings → Data sync** pushes the tasks, to-dos and manager log to a `task_data/<name>` branch of a
+repository's remote and loads them on another machine (merge or replace).
 
 ## Quick start
 
@@ -545,9 +547,11 @@ data/
   repos.json                 registered repositories
   todos.json                 the to-do list (open to-dos, and sent ones with their task)
   manager-log.jsonl          manager <-> sub-agent messages (Agents view; rotated at 8 MB)
+  manager-log.1.jsonl        the log's previous part after rotation
   tasks/<id>/task.json       last known state of the task (stages, rounds, comments, agents, result, change requests, push, pull request; for code reviews the target, the discussion, the final review, your edits and what was published)
   tasks/<id>/events.jsonl    timeline (append-only)
   tasks/<id>/doc-rN.html     design/document snapshot for round N (.md for Markdown documents; doc-rN-K.* for further documents)
+  backups/<time>-before-<branch>/ the to-do list, counters, manager log and task folders as they were before a data branch replaced them
   worktrees/<id>/author/     author agents' worktree (or <id>/<role>/ with per-agent worktrees)
   worktrees/<id>/review/     reviewer (and planner) worktree, detached at the reviewed commit
   worktrees/<id>/review-peer/ code review tasks: the peer reviewer's worktree
@@ -565,6 +569,40 @@ automatically and kept as `state.v1.backup.json`.
 Deleting a task removes its worktrees, agent branches, history and agent sessions; optionally it also
 deletes the task branch.
 
+## Data sync: move tasks between machines
+
+**Settings → Data sync** keeps the hub's data on a branch of a repository's remote (choose the
+repository; its `origin`, or its only remote, holds the branch):
+
+- **Push to a branch**: enter a name (default: this machine's name); the hub pushes to `task_data/<name>`
+  every task (`task.json`, timeline and document snapshots), the to-do list, the manager log and the list
+  of repositories. Settings, sign-in data (`copilot-home/`), cloned repositories and worktrees are never
+  pushed. The branch has a history of its own (no common commit with your code) and is written with git
+  plumbing: your checkout, index and branches are not touched. Pushing again adds a commit on top (nothing
+  when the data did not change), so the branch keeps every earlier version; pushes are never forced.
+  Pushing to a branch another machine pushed asks first.
+- **Load from a branch**: **List branches** shows the `task_data/*` branches on the remote; **Load…**
+  previews one (where and when it was pushed, and what each option would do), then:
+  - **Merge** adds the branch's new tasks and to-dos and updates those that are newer on the branch.
+    Records are matched by identity (the id and creation time they got on the hub that created them), so
+    data that went back and forth is never duplicated. A new task keeps its id unless that id was ever used
+    here; otherwise it gets the next free one (`T-001` there may be `T-012` here) and its timeline says so.
+    References follow: a to-do points to its task, a task to its to-do. Tasks in progress here (queued,
+    running, publishing, pushing) are kept as they are.
+  - **Replace** backs the data up to `data/backups/`, deletes every task here (like **Delete**: worktrees
+    and agent branches go, task branches stay in the repositories) and loads the branch's tasks and to-dos
+    under their own ids. It needs every task here to be finished or cancelled.
+
+  Loaded tasks belong to the repository with the same remote here (else the same id or name); the preview
+  lists those not registered here. Tasks that were queued or running on the other machine become
+  *interrupted* here (use **Retry** to continue them; their branches must be in the local repository,
+  e.g. pushed and fetched), and the other machine's folders and agent sessions are dropped. Records with
+  commit ids or branch names git could misread (options, patterns) are left out. Open pages reload once the
+  data is loaded.
+
+Anyone who can read the repository can read the pushed data: task requests, agent conversations, diffs and
+test output. Use a private repository.
+
 ## HTTP API
 
 | Method & path | Purpose |
@@ -576,6 +614,9 @@ deletes the task branch.
 | `GET/POST /api/repos` · `DELETE /api/repos/:id` · `GET /api/repos/:id/branches` | Repository registry |
 | `GET/POST /api/todos` · `PATCH/DELETE /api/todos/:id` | To-do list (`description`, optional `title`, `repoId`, `baseRef`; `null` or `""` clears an optional field; sent to-dos can't be changed: `409`) |
 | `POST /api/todos/:id/send` · `POST /api/todos/:id/reopen` | Send a to-do to the manager (creates an Auto task; returns `{ todo, task }`) / put a sent to-do back on the list once its task is not queued or running |
+| `GET /api/sync` · `GET /api/sync/branches?repoId=` | Data sync: the branch prefix (`task_data/`) and this machine's name / the data branches on the repository's remote |
+| `POST /api/sync/push` | Push the data to `task_data/<name>` (`repoId`, `name`) |
+| `GET /api/sync/preview?repoId=&name=` · `POST /api/sync/load` | What loading a data branch would do / load it (`repoId`, `name`, `mode`: `merge` or `replace`, optional `sha` from the preview: refused with `409` when the branch changed since) |
 | `GET/POST /api/tasks` · `GET/DELETE /api/tasks/:id` | Tasks (`kind`: `auto`, `coding`, `testing`, `design`, `document`, `design-coding`, `review`; optional `managerModel` for Auto; `reviewTarget` (pull request number/URL or branch) and optional `peerReviewerModel` for Code review) |
 | `POST /api/tasks/:id/cancel` · `POST /api/tasks/:id/retry` · `POST /api/tasks/:id/input` | Control and answers |
 | `POST /api/tasks/:id/change-request` | Request further changes to a finished task (`request`, optional `stage` and `rounds`) |
@@ -599,7 +640,7 @@ answers `409` with `reload: true` (the page is out of date). Scripts that send n
 ## Development
 
 ```powershell
-npm test             # node:test – workflow engine (scripted agents + real git), planning, unit-test gate, test execution, code review (discussion, curation, publishing), documents, to-do list, concurrency and isolation between tasks, manager log, stuck-agent recovery, skills, storage, policy
+npm test             # node:test – workflow engine (scripted agents + real git), planning, unit-test gate, test execution, code review (discussion, curation, publishing), documents, to-do list, data sync, concurrency and isolation between tasks, manager log, stuck-agent recovery, skills, storage, policy
 npm run typecheck    # tsc for src and tests
 npm run dev          # restart on file changes
 ```
