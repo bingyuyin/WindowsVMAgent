@@ -192,28 +192,30 @@ export function applyChangePlan(task: Task, requests: readonly ChangeRequest[], 
         `Change request ${ids} from the user`,
         requests.map((request) => ({ id: request.id, severity: "major", body: request.text, status: "open" })),
       );
-      for (const kind of stages.slice(stages.indexOf(target) + 1)) {
-        const next = stageOf(kind);
-        if (!stageHasWork(next)) continue;
-        dropUnstartedRounds(next);
-        if (kind === "testing") {
-          // A testing stage that has a request round waiting re-runs the tests after its fixer's round anyway.
-          if (!awaitsRequest(next)) next.rerun = true;
-          next.status = "pending";
-        } else {
-          addRequestRound(
-            next,
-            task.attempt,
-            now,
-            `Bring this stage in line with change request ${ids}`,
-            requests.map((request) => ({ id: request.id, severity: "major", body: cascadeRequest(target, kind, request.id, request.text), status: "open" })),
-          );
-        }
-        applied.later.push(kind);
-      }
     } else {
       applied.fresh = target;
       stage.status = "pending";
+    }
+    // Later stages that have work bring it in line with the change - also when the change stage starts afresh: tests
+    // that ran before it no longer test the task's code.
+    for (const kind of stages.slice(stages.indexOf(target) + 1)) {
+      const next = stageOf(kind);
+      if (!stageHasWork(next)) continue;
+      dropUnstartedRounds(next);
+      if (kind === "testing") {
+        // A testing stage that has a request round waiting re-runs the tests after its fixer's round anyway.
+        if (!awaitsRequest(next)) next.rerun = true;
+        next.status = "pending";
+      } else {
+        addRequestRound(
+          next,
+          task.attempt,
+          now,
+          `Bring this stage in line with change request ${ids}`,
+          requests.map((request) => ({ id: request.id, severity: "major", body: cascadeRequest(target, kind, request.id, request.text), status: "open" })),
+        );
+      }
+      applied.later.push(kind);
     }
   }
 

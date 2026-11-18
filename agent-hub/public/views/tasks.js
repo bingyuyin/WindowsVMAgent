@@ -252,23 +252,43 @@ function resultLine(task) {
   }
   if (task.status === "completed") {
     const tests = task.tests;
-    const testsLast = (task.plan?.stages ?? task.stages.map((stage) => stage.kind)).at(-1) === "testing";
+    const testsLast = (task.outcomeStage ?? (task.plan?.stages ?? task.stages.map((stage) => stage.kind)).at(-1)) === "testing";
     const testText = tests
       ? ` · tests ${tests.status}${tests.total !== undefined ? ` (${tests.passed ?? tests.total - (tests.failed ?? 0)}/${tests.total})` : ""}`
       : "";
     const push = task.push;
+    const headline = task.notRun?.length
+      ? "Coding not approved · tests not run"
+      : task.testsUnverified
+        ? "Tests could not verify the change"
+        : testsLast
+          ? task.approved
+            ? "✓ Tests pass"
+            : "Tests failing"
+          : task.approved
+            ? "✓ Approved"
+            : "Not approved";
     return h(
       "div",
-      { class: `task-result ${task.approved ? "ok" : "warn"}` },
-      testsLast ? (task.approved ? "✓ Tests pass" : "Tests failing") : task.approved ? "✓ Approved" : "Not approved",
+      { class: `task-result ${task.approved && !task.warning ? "ok" : "warn"}` },
+      headline,
       task.shortStat ? h("span", { class: "muted" }, ` · ${task.shortStat}`) : null,
       testText ? h("span", { class: "muted" }, testText) : null,
-      !task.approved && task.openComments ? h("span", { class: "muted" }, ` · ${task.openComments} ${testsLast ? "failure" : "open comment"}(s)`) : null,
+      !task.approved && task.openComments && !task.testsUnverified
+        ? h("span", { class: "muted" }, ` · ${task.openComments} ${testsLast && !task.notRun?.length ? "failure" : "open comment"}(s)`)
+        : null,
+      task.warning ? h("span", { class: "result-badge warn", title: task.warning }, "⚠ check before merging") : null,
       push?.status === "pushed" ? h("span", { class: "result-badge ok", title: `Pushed to ${push.remote}/${push.branch}` }, "↑ pushed") : null,
       push?.status === "pushing" ? h("span", { class: "result-badge" }, "pushing…") : null,
       push?.status === "failed" ? h("span", { class: "result-badge danger", title: push.reason ?? "" }, "push failed") : null,
       task.pullRequest ? h("span", { class: "result-badge pr", title: task.pullRequest.url }, `PR ${task.pullRequest.number ? `#${task.pullRequest.number}` : "open"}${task.pullRequest.draft ? " (draft)" : ""}`) : null,
     );
   }
-  return task.error ? h("div", { class: "task-activity danger ellipsis" }, task.error) : null;
+  // A task that did not finish may have pushed (or opened a pull request with) its approved work.
+  const delivered = [
+    task.push?.status === "pushed" ? h("span", { class: "result-badge ok", title: `Pushed the approved work to ${task.push.remote}/${task.push.branch}` }, "↑ approved work pushed") : null,
+    task.pullRequest ? h("span", { class: "result-badge pr", title: task.pullRequest.url }, `PR ${task.pullRequest.number ? `#${task.pullRequest.number}` : "open"}${task.pullRequest.draft ? " (draft)" : ""}`) : null,
+  ].filter(Boolean);
+  if (task.error) return h("div", { class: "task-activity danger" }, h("span", { class: "ellipsis" }, task.error), delivered);
+  return delivered.length ? h("div", { class: "task-result" }, delivered) : null;
 }

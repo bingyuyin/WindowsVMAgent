@@ -41,8 +41,16 @@ export interface TaskSummary {
     Pick<AgentInfo, "role" | "status" | "model" | "assignment" | "lastActivity" | "branch" | "updatedAt" | "turns" | "rounds" | "usage">
   >;
   approved: boolean | null;
+  /** The stage the outcome describes (the code's stage that holds the approval back, else the last stage). */
+  outcomeStage?: StageKind;
   shortStat?: string;
   openComments?: number;
+  /** Stages that did not run (the tests wait for an approved coding stage). */
+  notRun?: StageKind[];
+  /** The tests could not verify the change (blocked, or failing only because of the environment). */
+  testsUnverified?: "blocked" | "environment";
+  /** What the user should check before merging. */
+  warning?: string;
   docPath?: string;
   /** Auto tasks: the stages the manager planned (agents are created per stage), or the change it planned to review. */
   plan?: { stages: StageKind[]; rationale: string; fallback?: boolean; direct?: boolean; review?: { target: string } };
@@ -109,8 +117,12 @@ export function summarizeTask(task: Task): TaskSummary {
       usage,
     })),
     approved: task.result ? task.result.approved : null,
+    ...(task.result?.outcomeStage ? { outcomeStage: task.result.outcomeStage } : {}),
     shortStat: task.result?.shortStat,
     openComments: task.result?.openComments,
+    ...(task.result?.notRun?.length ? { notRun: task.result.notRun } : {}),
+    ...(task.result?.testsUnverified ? { testsUnverified: task.result.testsUnverified } : {}),
+    ...(task.result?.warning ? { warning: task.result.warning } : {}),
     docPath: task.result?.docPath ?? task.stages.find((stage) => stage.docPath)?.docPath,
     plan: task.plan
       ? {

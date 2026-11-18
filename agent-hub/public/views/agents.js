@@ -146,7 +146,7 @@ function taskLine(task) {
       return review ? `${review.published ? "Review published" : "Review ready"}: keeping ${review.kept} of ${review.comments} comment(s)` : "Review ready";
     }
     const rounds = task.stages.at(-1)?.rounds.length ?? 0;
-    const testsLast = task.stages.at(-1)?.kind === "testing";
+    const testsLast = (task.outcomeStage ?? task.stages.at(-1)?.kind) === "testing";
     if (testsLast) return task.approved ? `Tests pass after ${rounds} run${rounds === 1 ? "" : "s"}` : `Tests failing (${task.openComments ?? 0} failure(s))`;
     return task.approved ? `Approved after ${rounds} round${rounds === 1 ? "" : "s"}` : `Finished without approval (${task.openComments ?? 0} open)`;
   }

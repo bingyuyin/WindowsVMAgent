@@ -283,7 +283,11 @@ export function statusInfo(task) {
         return { label: agreed === false ? "Review ready · disputed" : "Review ready", cls: agreed === false ? "warning" : "success" };
       }
       const approved = task.approved ?? task.result?.approved;
-      const testsLast = (task.plan?.stages ?? task.stages?.map((stage) => stage.kind) ?? []).at(-1) === "testing";
+      const notRun = task.notRun ?? task.result?.notRun;
+      const unverified = task.testsUnverified ?? task.result?.testsUnverified;
+      const testsLast = (task.outcomeStage ?? task.result?.outcomeStage ?? (task.plan?.stages ?? task.stages?.map((stage) => stage.kind) ?? []).at(-1)) === "testing";
+      if (notRun?.length) return { label: "Done · coding not approved", cls: "warning" };
+      if (unverified) return { label: "Done · validate the tests", cls: "warning" };
       if (testsLast) return approved ? { label: "Tests pass", cls: "success" } : { label: "Done · tests failing", cls: "warning" };
       return approved ? { label: "Approved", cls: "success" } : { label: "Done · not approved", cls: "warning" };
     }

@@ -150,12 +150,19 @@ flowchart LR
 6. **Iterate**: open code comments go to the comment resolver (design and document comments back to
    their author), whose fixes are tested again before the next review, until the reviewer approves or the
    round budget is used up. **Continue review loop** runs more rounds later in fresh sessions; **Retry**
-   resumes failed, cancelled or interrupted tasks from the last completed step.
+   resumes failed, cancelled or interrupted tasks from the last completed step. The tests run on approved
+   code only: when the coding stage ends without approval, the run stops there - the testing stage (and
+   any stage after it) waits, marked *Waits for approved code* - and **Continue review loop** finishes the
+   coding stage first; once it is approved, the tests run. A task counts as approved only when its code
+   does too - the coding stage approved and its tests passing - even if a later stage (a document) was
+   approved: continuing works on the coding stage first, then the tests, then the last stage, and tests
+   run again whenever the code changed since their last run.
 7. **Result**: the task branch, commits, diff stat, unit and test results and final summary (one section
    per stage), with ready-to-copy `git` commands to inspect and merge. Design and document tasks keep
    every document version (v1, v2, … final).
 8. **Push & pull request**: the hub pushes the task branch to the repository's remote and the task gets a
    **Create pull request** button (see [Pushing branches and pull requests](#pushing-branches-and-pull-requests)).
+   A task that failed or stopped can still open a pull request, with only its latest approved work.
 9. **Request changes**: whenever the task is not running (finished, failed, cancelled, interrupted or still
    queued) you can ask for further changes or adjustments, as often as you like; the manager re-evaluates
    the task for each request (see [Requesting changes](#requesting-changes-the-manager-re-plans-the-task)).
@@ -224,7 +231,8 @@ How the teams work on it:
 - A new stage, or one without work yet, starts afresh; its agents get the request, all your change
   requests and the manager's assignment.
 - Later stages with work are brought in line: after a design change the code is updated to match, and after
-  a code change the test executor re-runs the tests. Earlier finished stages are left as they are.
+  a code change the test executor re-runs the tests - also when the stage taking the request starts afresh
+  (e.g. coding added to a task whose tests ran before). Earlier finished stages are left as they are.
 - A failed, cancelled or interrupted task continues from where it stopped, with the change.
 - The task then completes again and its branch is pushed, so an open pull request picks up the change.
   The Result tab lists every change request with its status, the manager's decision and the agent's response.
@@ -318,20 +326,27 @@ between two agents:
    plus a suggested fix. Failures get IDs `T1`, `T2`, … Failures the requested change has nothing to do
    with (they fail without it too, or are flaky, in code the change doesn't touch) are reported separately
    as *unrelated failures*: they show in the run and the pull request description, never go to the fixer
-   and don't keep the stage from passing. When the request itself is to run and fix the tests, every
-   failure in the requested tests counts.
+   and don't keep the stage from passing; the result warns you to check them before merging. When the
+   request itself is to run and fix the tests, every failure in the requested tests counts.
 2. **Test fixer** — on its own branch, fixes each listed failure at its root cause (the product code when
    its behavior is wrong, the test only when the test itself is wrong, with a justification) without
    touching unrelated code or tests, re-runs the failing tests, and responds to every failure ID
-   (`addressed`, or `declined` with what is needed, for example a missing tool or credential).
+   (`addressed`, or `declined` with what is needed). Failures triaged as `environment` are not sent to it.
 3. **Verification** — the executor re-runs the **complete** suite at the fixer's commit and inspects the
    fixer's diff: deleted or skipped tests, weakened assertions, swallowed errors or hard-coded results are
    reported as `integrity` failures. The stage passes when everything requested ran and no failure related
    to the request remains.
 
+**Returning early for you to validate.** When a run is *blocked* (the automation cannot run at all: a
+missing tool, service or credential) or its only failures come from the environment, no fixer can help:
+the stage stops right away, without the test fixer, and the task completes - not approved, even if a
+later stage was - with a warning: *Tests could not verify the change*, and what blocked it. Its branch is
+pushed as usual; create the pull request (a draft) and validate the change yourself, or fix the
+environment and use **Run the tests again** (a fresh run by the test executor). A blocked run whose
+failures are in the code (a build broken by the change) still goes to the fixer.
+
 If the fixer declines every failure without changing anything, the stage stops instead of re-running
-unchanged code. **Continue fixing** runs more fix-and-verify rounds later (for example after you install
-a missing tool).
+unchanged code. **Continue fixing** runs more fix-and-verify rounds later.
 
 ## Agents view: the manager and its sub-agents
 
@@ -443,19 +458,37 @@ Tasks running on the same repository don't affect each other's code or unit test
 
 - **Automatic push**: when a task completes, the hub pushes its task branch (only the task branch, not
   the agents' `--coder`/`--fixer`/… branches) to the repository's remote (`origin`, or the first remote)
-  with your normal git credentials. It never force-pushes, pushes to one repository one at a time, and
-  pushes after the task has freed its slot, so queued tasks don't wait for the network. Repositories
+  with your normal git credentials. It never force-pushes (the one exception is **Rewind to approved
+  work**, under *Tasks that did not finish*), pushes to one repository one at a time, and pushes after the
+  task has freed its slot, so queued tasks don't wait for the network - always the head the task completed
+  with, even if it runs again before the push's turn. Repositories
   without a remote, and tasks that made no changes, are skipped. A failed push shows git's error and a
   **Retry push** button. Turn automatic pushes off in Settings → Workspaces → **Push**; finished tasks
   then offer **Push branch**.
 - **Create pull request** (task result card and Result tab) pushes the branch first if needed, then:
   - creates the pull request directly when the GitHub CLI is signed in to the remote's host
     (`gh auth login`): title from the task, a description built from the result (summary, request,
-    manager's plan, outcome, tests, agents), as a **draft** when the task wasn't approved or tests still
-    fail. The task then links to it (**Pull request #N ↗**);
+    manager's plan, outcome, tests, agents, and what to check before merging), as a **draft** when the
+    task wasn't approved, its tests failed or could not verify the change. The task then links to it
+    (**Pull request #N ↗**);
   - otherwise opens the host's create page with the branches filled in: GitHub (including GitHub
     Enterprise), Azure DevOps, GitLab and Bitbucket (GitHub and GitLab also get the title and
     description).
+- **Tasks that did not finish** (failed, cancelled, interrupted) are not pushed automatically, but their
+  status card and Result tab offer **Push approved work** and **Create draft pull request** with the
+  task's **latest approved work**: the last commit a reviewer approved (a design, document or code) or the
+  test executor verified - provided everything below it was approved in its own stage (a document
+  approved on top of code its reviewer rejected does not count; the work approved before that code does).
+  It goes to the task branch on the remote; later, unreviewed commits stay local. If the remote branch
+  already holds later work of this task that was not approved (pushed when an earlier attempt completed,
+  or by hand), the card says so, and pushes and pull requests stop there instead of delivering it:
+  **Rewind to approved work** (after you confirm) moves the remote branch back to the approved work with
+  git's `--force-with-lease`; that work stays on the local task branch and returns with the task's next
+  push. Commits on the remote branch that the local task branch does not have are never replaced: the
+  push fails and says so.
+  The pull request description says the task did not finish and which stage and round the work is from.
+  A task with nothing approved yet has nothing to push. When the task later completes (Retry, change
+  requests), its full branch is pushed to the same branch, so the pull request updates itself.
 - Pull requests target the branch the task started from, or the repository's default branch. When a
   task runs again (for example **Continue review loop**), its new commits are pushed to the same branch,
   so an open pull request updates itself.
@@ -645,8 +678,8 @@ test output. Use a private repository.
 | `POST /api/tasks/:id/cancel` · `POST /api/tasks/:id/retry` · `POST /api/tasks/:id/input` | Control and answers |
 | `POST /api/tasks/:id/change-request` | Request changes to a task that is not running (`request`, optional `rounds`; optional `stage` hands it to that stage directly, otherwise the manager re-plans the task for it) |
 | `GET /api/tasks/:id/diff?from=&to=` | Changes |
-| `POST /api/tasks/:id/push` | Push the task branch to the remote now (retry, or with automatic pushes off) |
-| `GET /api/tasks/:id/pull-request` · `POST /api/tasks/:id/pull-request` | What the remote supports / open the pull request (returns it, or the host's `createUrl`) |
+| `POST /api/tasks/:id/push` | Push the task's work to the remote now (retry, or with automatic pushes off): the branch head of a completed task, the latest approved work of one that did not finish. `{ "rewind": true }` lets the approved work move the remote branch back from later, unapproved work of the task |
+| `GET /api/tasks/:id/pull-request` · `POST /api/tasks/:id/pull-request` | What the remote supports and what a push would deliver (`deliverable`: the commit, and for tasks that did not finish the approved stage and round, plus `remoteAhead` when the remote branch is beyond it: later work of the task, or foreign commits) / open the pull request (returns it, or the host's `createUrl`; it never rewinds the remote branch) |
 | `GET /api/tasks/:id/doc?round=&path=` · `GET /api/tasks/:id/doc/view?round=&path=` | Design/document versions (JSON, or the sandboxed HTML page); `path` picks one of several documents |
 | `PATCH /api/tasks/:id/review/comments/:commentId` · `POST /api/tasks/:id/review/comments` | Code review: keep/drop (`decision`), edit (`body`, `severity`) or undo an edit (`revert`) of a final comment; put a dropped reviewer comment back (`from`) |
 | `PUT /api/tasks/:id/review/summary` | Code review: the review's text (`body`) and, before publishing, its kind (`event`: `COMMENT`, `REQUEST_CHANGES`, `APPROVE`) |

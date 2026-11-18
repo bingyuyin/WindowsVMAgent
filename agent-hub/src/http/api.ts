@@ -207,7 +207,7 @@ export function createApiRouter(deps: ApiDeps): Router {
     runner.diff(params.id!, url.searchParams.get("from") ?? undefined, url.searchParams.get("to") ?? undefined),
   );
 
-  router.post("/api/tasks/:id/push", ({ params }) => runner.pushNow(params.id!));
+  router.post("/api/tasks/:id/push", ({ params, body }) => runner.pushNow(params.id!, { rewind: body.rewind === true }));
   router.get("/api/tasks/:id/pull-request", ({ params }) => runner.pullRequestStatus(params.id!));
   router.post("/api/tasks/:id/pull-request", ({ params }) => runner.pullRequest(params.id!));
 

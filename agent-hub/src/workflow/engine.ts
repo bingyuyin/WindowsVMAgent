@@ -290,21 +290,43 @@ export class WorkflowEngine {
       }
     }
     const start = this.resumeIndex(kinds);
+    const startHead = await this.options.workspace.taskHead();
+    let notRun: StageKind[] = [];
     for (let index = start; index < kinds.length; index++) {
       this.throwIfAborted();
       const stage = this.stage(kinds[index]!);
-      // Later stages that are already finished have nothing new to do (the first one is being continued).
-      if (index > start && (stage.status === "approved" || stage.status === "not-approved")) continue;
+      // The tests run on approved code only: they (and the stages after them) wait until the coding stage is approved,
+      // whatever an earlier run of them found.
+      if (stage.kind === "testing" && this.codingNotApproved(kinds)) {
+        notRun = kinds.slice(index);
+        const text = `The coding stage is not approved, so the tests do not run: they wait for approved code. Continue the review loop (or request changes) to finish the coding stage; the tests then run.`;
+        this.options.hooks.emit({ type: "warning", stage: "testing", text });
+        this.options.hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", stage: "testing", text: "Not running the tests: the coding stage is not approved; they wait for approved code" });
+        break;
+      }
+      // A later stage that already ran (the first one is being continued): its tests run again when this run changed the
+      // code; a stage that is not approved continues its review loop; an approved one has nothing new to do.
+      if (index > start && (stage.status === "approved" || stage.status === "not-approved")) {
+        if (stage.kind === "testing" && (await this.options.workspace.taskHead()) !== startHead) stage.rerun = true;
+        else if (stage.status === "approved") continue;
+      }
       const previous = index > 0 ? this.stage(kinds[index - 1]!) : undefined;
       if (previous?.status === "not-approved") {
         this.options.hooks.emit({
           type: "warning",
-          text: `${STAGE_LABELS[previous.kind]} stage was not approved within its round budget; continuing with the latest version.`,
+          text: previous.unverified
+            ? `The tests could not verify the change (${previous.unverified.reason === "blocked" ? "the run was blocked" : "only the environment failed"}); continuing with the latest version.`
+            : `${STAGE_LABELS[previous.kind]} stage was not approved within its round budget; continuing with the latest version.`,
         });
       }
       await this.runStage(stage);
     }
-    await this.finalize();
+    await this.finalize(notRun);
+  }
+
+  /** The task has a coding stage, and its reviewer has not approved it (it ran out of review rounds). */
+  private codingNotApproved(kinds: readonly StageKind[]): boolean {
+    return kinds.includes("coding") && this.stage("coding").status === "not-approved";
   }
 
   /** Interrupts in-flight agent turns (used when the task is cancelled or the hub shuts down). */
@@ -899,12 +921,23 @@ export class WorkflowEngine {
     hooks.update();
   }
 
-  /** First unfinished stage; when all are finished, continue the last one if it was not approved. */
+  /**
+   * First unfinished stage; when all are finished, continue the code's stages that are not approved (coding, then its
+   * tests), else the last stage if it was not approved. A coding stage that is not approved is continued before the
+   * tests it holds back.
+   */
   private resumeIndex(kinds: StageKind[]): number {
-    const unfinished = kinds.findIndex((kind) => !["approved", "not-approved"].includes(this.stage(kind).status));
+    const isFinished = (kind: StageKind) => ["approved", "not-approved"].includes(this.stage(kind).status);
+    const notApproved = (index: number) => index >= 0 && this.stage(kinds[index]!).status === "not-approved";
+    const unfinished = kinds.findIndex((kind) => !isFinished(kind));
+    const coding = kinds.indexOf("coding");
+    const testing = kinds.indexOf("testing");
+    if (coding >= 0 && testing > coding && notApproved(coding) && (unfinished < 0 || unfinished >= testing)) return coding;
     if (unfinished >= 0) return unfinished;
+    if (notApproved(coding)) return coding;
+    if (notApproved(testing)) return testing;
     const last = kinds.length - 1;
-    return this.stage(kinds[last]!).status === "not-approved" ? last : kinds.length;
+    return notApproved(last) ? last : kinds.length;
   }
 
   private throwIfAborted(): void {
@@ -960,17 +993,27 @@ export class WorkflowEngine {
     let lastReview = reviewOnly ? undefined : last?.review;
     let open = lastReview?.verdict === "request_changes" ? lastReview.comments.filter((comment) => comment.status === "open") : [];
     if (lastReview?.by === "user") {
-      // The user's request came after review comments nobody resolved yet (the task stopped): they are resolved too.
+      // The user's request came after review comments nobody resolved yet (the task stopped): they are resolved too
+      // (except environment failures, which are for the user to sort out).
       const reviewed = [...stage.rounds].reverse().find((round) => round !== last && round.review && round.review.by !== "user");
-      const unresolved = reviewed?.review?.verdict === "request_changes" ? reviewed.review.comments.filter((comment) => comment.status === "open") : [];
+      const unresolved =
+        reviewed?.review?.verdict === "request_changes"
+          ? reviewed.review.comments.filter((comment) => comment.status === "open" && !(testing && comment.category === "environment"))
+          : [];
       open = [...unresolved, ...open];
     }
-    // An earlier stage changed for a change request: run the tests again before fixing anything (a request round
-    // waiting in this stage is handled first: its fixer's round is re-run and verified anyway).
-    if (testing && stage.rerun && !reviewOnly && lastReview?.by !== "user") {
-      lastReview = undefined;
-      open = [];
+    if (testing && !reviewOnly && lastReview && lastReview.by !== "user") {
+      // Environment failures are for the user to sort out, not the test fixer.
+      open = open.filter((comment) => comment.category !== "environment");
+      // Run the tests again before fixing anything when an earlier stage changed for a change request, when the last
+      // run could not verify the change (blocked, environment), or when nothing is left for the fixer. A request round
+      // waiting in this stage is handled first: its fixer's round is re-run and verified anyway.
+      if (stage.rerun || stage.unverified || !open.length) {
+        lastReview = undefined;
+        open = [];
+      }
     }
+    delete stage.unverified;
 
     const used = new Set<AgentRole>();
     let reviews = 0;
@@ -1046,6 +1089,31 @@ export class WorkflowEngine {
         }
         lastReview = review;
         open = review.comments.filter((comment) => comment.status === "open");
+        if (testing) {
+          // Failures the test fixer cannot fix in code end the stage early: the user validates the change.
+          const unverified = unverifiedRun(review);
+          if (unverified) {
+            stage.status = "not-approved";
+            stage.unverified = unverified;
+            hooks.emit({
+              type: "warning",
+              stage: kind,
+              round: round.n,
+              text: `${unverified.text} Stopped without the test fixer: validate the change yourself before merging, or fix the environment and run the tests again.`,
+            });
+            hooks.comm({
+              from: "manager",
+              to: "manager",
+              kind: "lifecycle",
+              stage: kind,
+              round: round.n,
+              text: `Stopped the tests early (${unverified.reason === "blocked" ? "the run was blocked" : "only environment failures"}); the user validates the change`,
+            });
+            break;
+          }
+          // Environment failures are for the user to sort out; the test fixer gets the failures the code can fix.
+          open = open.filter((comment) => comment.category !== "environment");
+        }
         if (reviews >= budget) {
           stage.status = "not-approved";
           hooks.emit({
@@ -1072,7 +1140,9 @@ export class WorkflowEngine {
       kind === "testing"
         ? stage.status === "approved"
           ? `${STAGE_LABELS[kind]}: all tests pass, verified in round ${finalRound}`
-          : `${STAGE_LABELS[kind]} finished with failing tests after round ${finalRound}`
+          : stage.unverified
+            ? `${STAGE_LABELS[kind]} stopped after round ${finalRound}: the tests could not verify the change (${stage.unverified.reason === "blocked" ? "blocked" : "environment failures"})`
+            : `${STAGE_LABELS[kind]} finished with failing tests after round ${finalRound}`
         : stage.status === "approved"
           ? `${STAGE_LABELS[kind]} approved in round ${finalRound}`
           : `${STAGE_LABELS[kind]} finished without approval after round ${finalRound}`;
@@ -2040,16 +2110,18 @@ export class WorkflowEngine {
     };
   }
 
-  private async finalize(): Promise<void> {
+  /** Records the task's result. `notRun`: stages that did not run because the coding stage is not approved. */
+  private async finalize(notRun: readonly StageKind[] = []): Promise<void> {
     const { workspace, hooks, settings } = this.options;
     const task = this.task;
-    const kinds = stageKindsOf(task);
+    const kinds = stageKindsOf(task).filter((kind) => !notRun.includes(kind));
     const lastStage = this.stage(kinds[kinds.length - 1]!);
     this.setPhase(lastStage.kind, "finalizing", task.currentRound);
     const head = await workspace.taskHead();
     const lastReview = [...lastStage.rounds].reverse().find((round) => round.review)?.review;
     const stages = kinds.map((kind) => this.stage(kind));
-    // Stages the manager dropped for a change request no longer count (their history stays on the task).
+    // Stages the manager dropped for a change request no longer count (their history stays on the task), nor do the
+    // stages that wait for approved code (a run of an earlier attempt tested other code).
     const docStage = stages.find((stage) => isDocStage(stage.kind));
     const testStage = stages.find((stage) => stage.kind === "testing");
     const codingStage = stages.find((stage) => stage.kind === "coding");
@@ -2061,8 +2133,16 @@ export class WorkflowEngine {
             .map(([stage, text]) => `**${STAGE_LABELS[stage.kind]}:** ${text}`)
             .join("\n\n")
         : stageSummary(lastStage);
+    const tests = testStage ? [...testStage.rounds].reverse().find((round) => round.review?.testRun)?.review?.testRun : undefined;
+    const unitTests = codingStage ? [...codingStage.rounds].reverse().find((round) => round.author?.unitTests)?.author?.unitTests : undefined;
+    const unverified = testStage?.unverified;
+    // The task is approved once its last stage is - and its code: the coding stage's reviewer approved it and its tests
+    // pass. The outcome describes the code's stage that holds the approval back (coding, then the tests), else the last.
+    const outcome = stages.find((stage) => (stage.kind === "coding" || stage.kind === "testing") && stage.status !== "approved") ?? lastStage;
+    const outcomeReview = outcome === lastStage ? lastReview : [...outcome.rounds].reverse().find((round) => round.review)?.review;
     task.result = {
-      approved: lastStage.status === "approved",
+      approved: outcome.status === "approved",
+      outcomeStage: outcome.kind,
       summary,
       headSha: head,
       diffStat: await workspace.diffStat(workspace.baseSha, head),
@@ -2071,16 +2151,20 @@ export class WorkflowEngine {
       designDocPath: stages.find((stage) => stage.kind === "design")?.docPath,
       docPath: docStage?.docPath,
       docFormat: docStage?.docFormat,
-      tests: testStage ? [...testStage.rounds].reverse().find((round) => round.review?.testRun)?.review?.testRun : undefined,
-      unitTests: codingStage ? [...codingStage.rounds].reverse().find((round) => round.author?.unitTests)?.author?.unitTests : undefined,
+      tests,
+      unitTests,
       // Failures of the last run stay unresolved until a run passes, whatever the fixer answered.
       openComments:
-        lastStage.kind === "testing"
-          ? lastReview?.verdict === "approve"
+        outcome.kind === "testing"
+          ? outcomeReview?.verdict === "approve"
             ? 0
-            : (lastReview?.comments.length ?? 0)
-          : (lastReview?.comments.filter((comment) => comment.status === "open").length ?? 0),
+            : (outcomeReview?.comments.length ?? 0)
+          : (outcomeReview?.comments.filter((comment) => comment.status === "open").length ?? 0),
+      ...(notRun.length ? { notRun: [...notRun] } : {}),
+      ...(unverified ? { testsUnverified: unverified.reason } : {}),
     };
+    const warning = resultWarning(unverified, tests, unitTests);
+    if (warning) task.result.warning = warning;
     if (settings.cleanupWorktrees) {
       await workspace.removeWorktrees();
       for (const info of task.agents ?? []) {
@@ -2093,14 +2177,32 @@ export class WorkflowEngine {
     task.phase = "done";
     hooks.emit({
       type: "info",
-      text: task.result.approved
-        ? lastStage.kind === "testing"
-          ? "Workflow complete: all tests pass, verified by the test executor."
-          : "Workflow complete: final version approved by the reviewer."
-        : "Workflow complete without final approval.",
+      text: notRun.length
+        ? "Workflow stopped: the coding stage is not approved, so the tests did not run."
+        : unverified
+          ? "Workflow complete: the tests could not verify the change; validate it yourself."
+          : task.result.approved
+            ? lastStage.kind === "testing"
+              ? "Workflow complete: all tests pass, verified by the test executor."
+              : "Workflow complete: final version approved by the reviewer."
+            : "Workflow complete without final approval.",
     });
+    if (warning) hooks.emit({ type: "warning", text: warning });
     hooks.update();
   }
+}
+
+/** What the user should check before merging: tests that did not verify the change, and failing tests left for their owners. */
+export function resultWarning(unverified: Stage["unverified"], tests: TestRunInfo | undefined, unitTests: UnitTestCheck | undefined): string | undefined {
+  const parts: string[] = [];
+  if (unverified) parts.push(`${unverified.text} Validate the change yourself before merging (or fix the environment and run the tests again).`);
+  const unrelated = [...new Set([...(tests?.unrelatedFailures ?? []), ...(unitTests?.unrelatedFailures ?? [])].map((failure) => failure.test))];
+  if (unrelated.length) {
+    parts.push(
+      `${plural(unrelated.length, "failing test")} ${unrelated.length === 1 ? "is" : "are"} unrelated to the change and ${unrelated.length === 1 ? "was" : "were"} left for ${unrelated.length === 1 ? "its" : "their"} owners: ${truncate(unrelated.join(", "), 300)}. Check ${unrelated.length === 1 ? "it" : "them"} yourself before merging.`,
+    );
+  }
+  return parts.length ? parts.join(" ") : undefined;
 }
 
 /** A test run that never started because its task was cancelled while it waited for another task's run. */
@@ -2181,6 +2283,39 @@ function stageSummary(stage: Stage): string {
   if (stage.kind !== "testing") return lastAuthor?.summary ?? "";
   const lastRun = [...stage.rounds].reverse().find((round) => round.review)?.review;
   return [lastRun?.summary ?? "", lastAuthor ? `Fixes: ${lastAuthor.summary}` : ""].filter(Boolean).join("\n\n");
+}
+
+/**
+ * A test run the test fixer cannot help with: the automation was blocked by something outside the code (a missing
+ * tool, service or credential), or every failure comes from the environment. Null when there is code to fix.
+ */
+export function unverifiedRun(review: ReviewSubmission): { reason: "blocked" | "environment"; text: string } | null {
+  const run = review.testRun;
+  if (!run || review.verdict === "approve" || !review.comments.length) return null;
+  const inCode = review.comments.some((comment) => comment.category === "product-bug" || comment.category === "test-bug" || comment.category === "integrity");
+  const first = review.comments[0]!;
+  if (run.status === "blocked" && !inCode) {
+    return {
+      reason: "blocked",
+      text: review.fallback
+        ? "The test executor did not report its results, so the tests did not verify the change."
+        : `The tests could not run: ${failureLine(first)}.`,
+    };
+  }
+  if (run.status === "failed" && review.comments.every((comment) => comment.category === "environment")) {
+    const names = review.comments.map((comment) => comment.test ?? comment.id);
+    return {
+      reason: "environment",
+      text: `${plural(review.comments.length, "test failure")} ${review.comments.length === 1 ? "comes" : "come"} from the environment, not the change: ${truncate(names.join(", "), 300)} (${failureLine(first)}).`,
+    };
+  }
+  return null;
+}
+
+/** "Pester tests: Invoke-Pester is not recognized" - a failure's name and the first line of its error. */
+function failureLine(comment: ReviewComment): string {
+  const error = comment.body.replace(/^```[^\n]*\n?/, "").split(/\r?\n/).find((line) => line.trim() && !line.startsWith("```")) ?? "";
+  return truncate(`${comment.test ?? comment.id}${error ? `: ${error.trim()}` : ""}`, 240);
 }
 
 /** "Passed: 12 tests" / "Failed: 2 of 12 (1 product-bug, 1 test-bug)" / "Blocked: ...". */

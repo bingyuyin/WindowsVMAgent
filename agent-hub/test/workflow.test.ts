@@ -1354,20 +1354,104 @@ describe("execute & verify", () => {
 
   test("stops instead of re-running unchanged code when the fixer can only decline", async () => {
     const h = createHarness({
-      executor: [submitTests("blocked", [{ test: "Pester tests", error: "Invoke-Pester is not recognized", category: "environment" }])],
-      fixer: [submitWork("Needs Pester", [{ comment_id: "T1", status: "declined", note: "Install the Pester module on the runner" }])],
+      executor: [submitTests("failed", [{ test: "parses dates", error: "Expected 2026-01-01, received undefined", category: "product-bug" }], { total: 3, passed: 2, failed: 1 })],
+      fixer: [submitWork("Cannot fix", [{ comment_id: "T1", status: "declined", note: "The date format is defined by an external service" }])],
     });
     try {
-      const created = await h.runner.submit({ description: "Run the Pester tests", kind: "testing", repoId: "sample" });
+      const created = await h.runner.submit({ description: "Run the date tests", kind: "testing", repoId: "sample" });
       await h.runner.idle();
       const task = h.store.getTask(created.id)!;
       assert.equal(task.status, "completed");
       assert.equal(task.result?.approved, false);
       assert.equal(task.stages[0]!.status, "not-approved");
+      assert.equal(task.stages[0]!.unverified, undefined);
       assert.equal(task.result?.openComments, 1, "declined failures still count as failing");
-      assert.equal(task.result?.tests?.status, "blocked");
+      assert.equal(task.result?.tests?.status, "failed");
       assert.equal(h.driver.prompts.executor!.length, 1, "no pointless re-run");
       assert.ok(h.store.recentComm({ taskId: task.id }).some((entry) => /could not fix the remaining 1 failure/.test(entry.text)));
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a run blocked by the environment ends early with a warning: no fixer, the user validates; it can run again later", async () => {
+    const h = createHarness({
+      executor: [
+        submitTests("blocked", [{ test: "Pester tests", error: "Invoke-Pester is not recognized as a cmdlet", category: "environment" }]),
+        steps((_spec, prompt) => {
+          assert.match(prompt, /## Run 2: run the test automation and verify the results/, "a fresh run, not a verification of fixes");
+        }, submitTests("passed", [], { total: 4 })),
+      ],
+    });
+    try {
+      const created = await h.runner.submit({ description: "Run the Pester tests", kind: "testing", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed", "the task completes, so its branch can be pushed and a pull request opened");
+      assert.equal(task.result?.approved, false);
+      assert.equal(task.result?.testsUnverified, "blocked");
+      assert.deepEqual(task.stages[0]!.unverified, { reason: "blocked", text: "The tests could not run: Pester tests: Invoke-Pester is not recognized as a cmdlet." });
+      assert.equal(
+        task.result?.warning,
+        "The tests could not run: Pester tests: Invoke-Pester is not recognized as a cmdlet. Validate the change yourself before merging (or fix the environment and run the tests again).",
+      );
+      assert.equal(h.driver.specsFor("fixer").length, 0, "the test fixer is never involved");
+      assert.equal(summarizeTask(task).testsUnverified, "blocked");
+      const comm = h.store.recentComm({ taskId: task.id }).map((entry) => entry.text);
+      assert.ok(comm.includes("Stopped the tests early (the run was blocked); the user validates the change"));
+      assert.ok(comm.some((text) => text.startsWith("Completed: the tests could not verify the change (blocked); validate it yourself")));
+
+      // Once the environment is fixed, continuing runs the tests again (the executor, not the fixer).
+      h.runner.retry(task.id);
+      await h.runner.idle();
+      assert.equal(task.result?.approved, true);
+      assert.equal(task.result?.testsUnverified, undefined);
+      assert.equal(task.result?.warning, undefined);
+      assert.equal(task.stages[0]!.unverified, undefined);
+      assert.equal(h.driver.specsFor("fixer").length, 0);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("environment failures go to the user, not the fixer; when only they remain, the stage ends with a warning", async () => {
+    const h = createHarness(
+      {
+        executor: [
+          submitTests(
+            "failed",
+            [
+              { test: "add adds two numbers", error: "Expected 3, received -1", category: "product-bug" },
+              { test: "uploads to blob storage", error: "ECONNREFUSED 127.0.0.1:10000", category: "environment" },
+            ],
+            { total: 5, passed: 3, failed: 2 },
+          ),
+          submitTests("failed", [{ test: "uploads to blob storage", error: "ECONNREFUSED 127.0.0.1:10000", category: "environment" }], { total: 5, passed: 4, failed: 1 }),
+        ],
+        fixer: [
+          steps((_spec, prompt) => {
+            assert.match(prompt, /\[T1\] \(product-bug\) add adds two numbers/);
+            assert.doesNotMatch(prompt, /uploads to blob storage/, "environment failures are not the fixer's");
+            assert.match(prompt, /covering exactly these IDs: T1 \(/);
+          }, writeFile("calc.js", FIXED), submitWork("Fixed add()", [{ comment_id: "T1", status: "addressed", note: "Use +" }])),
+        ],
+      },
+      { files: { "calc.js": BUGGY } },
+    );
+    try {
+      const created = await h.runner.submit({ description: "Run the tests and fix failures", kind: "testing", repoId: "sample" });
+      await h.runner.idle();
+      const task = h.store.getTask(created.id)!;
+      assert.equal(task.status, "completed");
+      assert.equal(task.result?.testsUnverified, "environment");
+      assert.deepEqual(task.stages[0]!.unverified, {
+        reason: "environment",
+        text: "1 test failure comes from the environment, not the change: uploads to blob storage (uploads to blob storage: ECONNREFUSED 127.0.0.1:10000).",
+      });
+      assert.match(task.result?.warning ?? "", /^1 test failure comes from the environment, not the change: uploads to blob storage .* Validate the change yourself before merging/);
+      assert.equal(h.driver.prompts.executor!.length, 2);
+      assert.equal(h.driver.prompts.fixer!.length, 1);
+      assert.equal(git(h.repoPath, "show", `${task.branch}:calc.js`), FIXED.trim());
     } finally {
       h.cleanup();
     }
@@ -1390,6 +1474,10 @@ describe("execute & verify", () => {
       assert.equal(task.result?.approved, true);
       assert.equal(h.driver.prompts.fixer, undefined, "the fixer is never involved");
       assert.deepEqual(task.result?.tests?.unrelatedFailures, unrelated);
+      assert.equal(
+        task.result?.warning,
+        "1 failing test is unrelated to the change and was left for its owners: legacy > parses v1 config. Check it yourself before merging.",
+      );
       const verdicts = h.store.recentComm({ taskId: task.id }).filter((entry) => entry.kind === "verdict").map((entry) => entry.text);
       assert.match(verdicts[0]!, /^Passed: 5 tests; 1 unrelated failure left for their owners/);
     } finally {
@@ -1627,7 +1715,13 @@ describe("push & pull requests", () => {
       const noRemote = h.store.getTask(first.id)!;
       assert.equal(noRemote.push?.status, "skipped");
       assert.match(noRemote.push?.reason ?? "", /No git remote/);
-      assert.deepEqual(await h.runner.pullRequestStatus(noRemote.id), { remote: null, direct: false, supported: false, pullRequest: undefined });
+      assert.deepEqual(await h.runner.pullRequestStatus(noRemote.id), {
+        remote: null,
+        direct: false,
+        supported: false,
+        pullRequest: undefined,
+        deliverable: { sha: branchHead(h.repoPath, noRemote.branch!) },
+      });
       await assert.rejects(h.runner.pullRequest(noRemote.id), /No git remote is configured/);
 
       const bare = addRemote(h, "C:\\shares\\sample.git");

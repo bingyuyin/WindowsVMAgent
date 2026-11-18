@@ -207,13 +207,28 @@ export async function listRemotes(repoPath: string): Promise<RemoteDetails[]> {
   return remotes;
 }
 
-/** Pushes a local branch to the remote under the same name (fast-forward only; never forced). */
-export async function pushBranch(repoPath: string, remote: string, branch: string, timeoutMs = 5 * 60_000): Promise<void> {
+/**
+ * Pushes a local branch to the remote under the same name (fast-forward only). With `sha`, pushes that commit to the
+ * branch instead of the branch's head (e.g. the approved part of a task that did not finish). With `lease`, the remote
+ * branch may move back to it, but only while it still points at the `lease` commit (git's --force-with-lease).
+ */
+export async function pushBranch(repoPath: string, remote: string, branch: string, options: { sha?: string; lease?: string; timeoutMs?: number } = {}): Promise<void> {
+  const lease = options.lease ? [`--force-with-lease=refs/heads/${branch}:${options.lease}`] : [];
   try {
-    await git(repoPath, ["push", "--porcelain", remote, `refs/heads/${branch}:refs/heads/${branch}`], { timeoutMs });
+    await git(repoPath, ["push", "--porcelain", ...lease, remote, `${options.sha ?? `refs/heads/${branch}`}:refs/heads/${branch}`], { timeoutMs: options.timeoutMs ?? 5 * 60_000 });
   } catch (error) {
     throw new Error(sanitizeRemoteUrl((error as Error).message));
   }
+}
+
+/** The commit a branch points at on the remote (where pushes go), or null when it has no such branch or cannot be reached. */
+export async function remoteBranchHead(repoPath: string, remote: string, branch: string, timeoutMs = 2 * 60_000): Promise<string | null> {
+  const pushUrl = await git(repoPath, ["remote", "get-url", "--push", remote], { allowFailure: true });
+  const target = pushUrl.code === 0 && pushUrl.stdout.trim() ? pushUrl.stdout.trim() : remote;
+  const result = await git(repoPath, ["ls-remote", "--heads", target, `refs/heads/${branch}`], { allowFailure: true, timeoutMs });
+  if (result.code !== 0) return null;
+  const line = result.stdout.split(/\r?\n/).find((candidate) => candidate.trim().endsWith(`refs/heads/${branch}`));
+  return line?.trim().split(/\s+/)[0] ?? null;
 }
 
 /** Creates GitHub pull requests with the GitHub CLI (`gh`) when it is installed and signed in to the host. */

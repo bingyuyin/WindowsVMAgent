@@ -64,13 +64,40 @@ const SEVERITY_ORDER = ["blocker", "major", "minor", "nit"];
 const stageStatus = (stage) =>
   stage.kind === "testing" && stage.status === "approved"
     ? ["Tests pass", "success"]
-    : stage.kind === "testing" && stage.status === "not-approved"
-      ? ["Tests failing", "warning"]
-      : stage.status === "skipped"
-        ? [`Dropped${stage.skippedFor ? ` for ${stage.skippedFor}` : ""}`, "neutral"]
-        : (STAGE_STATUS[stage.status] ?? [stage.status, "neutral"]);
+    : stage.kind === "testing" && stage.status === "not-approved" && stage.unverified
+      ? [stage.unverified.reason === "blocked" ? "Tests blocked" : "Not verified (environment)", "warning"]
+      : stage.kind === "testing" && stage.status === "not-approved"
+        ? ["Tests failing", "warning"]
+        : stage.status === "skipped"
+          ? [`Dropped${stage.skippedFor ? ` for ${stage.skippedFor}` : ""}`, "neutral"]
+          : (STAGE_STATUS[stage.status] ?? [stage.status, "neutral"]);
 /** Tasks that are running cannot take change requests until they stop. */
 const RUNNING = ["running", "needs-input"];
+
+/** The last stage that ran: dropped stages and stages waiting for approved code do not count. */
+function lastRanStage(task) {
+  const notRun = task.result?.notRun ?? [];
+  return task.stages.filter((stage) => stage.status !== "skipped" && !notRun.includes(stage.kind)).at(-1);
+}
+
+/** The stage the result describes: the code's stage that holds the approval back (coding, then the tests), else the last that ran. */
+function outcomeStage(task) {
+  const kind = task.result?.outcomeStage;
+  return (kind && task.stages.find((stage) => stage.kind === kind)) || lastRanStage(task);
+}
+
+/** What continuing an unapproved task does: re-run blocked tests, fix failing ones, or continue the review loop. */
+function continueLabel(task) {
+  if (task.result?.notRun?.length) return "Continue review loop";
+  if (task.result?.testsUnverified) return "Run the tests again";
+  return outcomeStage(task)?.kind === "testing" ? "Continue fixing" : "Continue review loop";
+}
+
+function continueTitle(task) {
+  if (task.result?.notRun?.length) return "Continue the coding stage's review loop; the tests run once it is approved";
+  if (task.result?.testsUnverified) return "Run the tests again (e.g. once the environment is fixed)";
+  return "Run more rounds";
+}
 
 /** What the manager decided for a change request, in words: "adds Coding; the task became Design → Coding". */
 function describeChangePlan(request) {
@@ -436,7 +463,7 @@ export function taskDetailView(root, { params }) {
     if (ACTIVE.includes(task.status)) actions.push(h("button", { class: "btn btn-danger-outline", onclick: cancelTask }, "Cancel"));
     if (["failed", "cancelled", "interrupted"].includes(task.status)) actions.push(h("button", { class: "btn btn-primary", onclick: () => retryTask(false) }, "Retry"));
     if (!review && task.status === "completed" && task.result && !task.result.approved) {
-      actions.push(h("button", { class: "btn btn-primary", onclick: () => retryTask(true) }, task.stages.at(-1)?.kind === "testing" ? "Continue fixing" : "Continue review loop"));
+      actions.push(h("button", { class: "btn btn-primary", title: continueTitle(task), onclick: () => retryTask(true) }, continueLabel(task)));
     }
     if (!review && !RUNNING.includes(task.status)) {
       actions.push(h("button", { class: "btn", title: "Ask for changes: the manager re-evaluates the task and assigns the teams to handle them", onclick: requestChanges }, "✎ Request changes"));
@@ -606,32 +633,44 @@ export function taskDetailView(root, { params }) {
     }
     if (status === "completed" && task.result) {
       const result = task.result;
-      const lastStage = task.stages.at(-1);
+      const lastStage = outcomeStage(task);
       const testsLast = lastStage?.kind === "testing";
       // The latest approval (a change request adds rounds after the first one).
       const approvedRound = lastStage?.rounds.findLast((round) => round.review?.verdict === "approve");
       const reviewer = lastStage ? ROLE_LABELS[REVIEWER_ROLE[lastStage.kind]] : "reviewer";
       const docPath = result.docPath ?? result.designDocPath;
-      const docStage = task.stages.find((stage) => isDocStage(stage.kind));
+      const docStage = task.stages.find((stage) => isDocStage(stage.kind) && stage.status !== "skipped");
       const documentCount = documentsOfTask().length;
       const tests = result.tests;
       // Later attempts (retries, change requests) report their own run time, not the time since the first run.
       const tookText =
         task.attempt > 1 && task.attemptStartedAt ? `this run took ${duration(task.attemptStartedAt, task.finishedAt)}` : `took ${duration(task.startedAt, task.finishedAt)}`;
-      const title = testsLast
-        ? result.approved
-          ? `✓ All tests pass — verified by the test executor${approvedRound ? ` in round ${approvedRound.n}` : ""}`
-          : `Tests still failing — ${result.openComments} failure(s) remain`
-        : result.approved
-          ? `✓ Approved by the ${reviewer.toLowerCase()}${approvedRound ? ` in round ${approvedRound.n}` : ""}`
-          : `Finished without approval — ${result.openComments} review comment(s) still open`;
+      const title = result.notRun?.length
+        ? `Coding not approved — ${result.openComments} review comment(s) still open; the tests wait for approved code`
+        : result.testsUnverified
+          ? `Tests could not verify the change — ${result.testsUnverified === "blocked" ? "the run was blocked" : "only the environment failed"}; validate it yourself`
+          : testsLast
+            ? result.approved
+              ? `✓ All tests pass — verified by the test executor${approvedRound ? ` in round ${approvedRound.n}` : ""}`
+              : `Tests still failing — ${result.openComments} failure(s) remain`
+            : result.approved
+              ? `✓ Approved by the ${reviewer.toLowerCase()}${approvedRound ? ` in round ${approvedRound.n}` : ""}`
+              : `Finished without approval — ${result.openComments} review comment(s) still open`;
       setContent(
         heroBox,
         h(
           "div",
-          { class: `card hero hero-result ${result.approved ? "hero-ok" : "hero-warn"}` },
+          { class: `card hero hero-result ${result.approved && !result.warning ? "hero-ok" : "hero-warn"}` },
           h("div", { class: "hero-top" }, h("span", { class: "hero-kicker" }, "RESULT"), h("span", { class: "spacer" }), h("span", { class: "muted small" }, tookText)),
           h("div", { class: "hero-title" }, title),
+          result.warning ? h("div", { class: "callout callout-warning small hero-warning" }, h("strong", {}, "⚠ Check before merging: "), result.warning) : null,
+          result.notRun?.length
+            ? h(
+                "div",
+                { class: "muted small" },
+                `Not run yet: ${result.notRun.map((kind) => `${STAGE_LABELS[kind]} stage`).join(", ")}. Continue the review loop (or request changes) to finish the coding stage; the tests then run on the approved code.`,
+              )
+            : null,
           h(
             "div",
             { class: "result-stats" },
@@ -657,7 +696,7 @@ export function taskDetailView(root, { params }) {
             h("button", { class: "btn btn-sm", onclick: () => selectTab("changes") }, "View changes"),
             h("button", { class: "btn btn-sm", onclick: () => selectTab("conversation") }, roundsTabLabel(task)),
             h("button", { class: "btn btn-sm", onclick: () => selectTab("result") }, "Merge instructions"),
-            !result.approved ? h("button", { class: "btn btn-sm btn-primary", onclick: () => retryTask(true) }, testsLast ? "Continue fixing" : "Continue review loop") : null,
+            !result.approved ? h("button", { class: "btn btn-sm btn-primary", title: continueTitle(task), onclick: () => retryTask(true) }, continueLabel(task)) : null,
             h("button", { class: "btn btn-sm", title: "Ask the agents for further changes or adjustments", onclick: requestChanges }, "✎ Request changes"),
           ),
         ),
@@ -676,14 +715,24 @@ export function taskDetailView(root, { params }) {
           h("div", { class: "muted small" }, "Retry resumes from the last completed step; the agents' branches and worktrees are kept. Or request changes: the manager re-evaluates the task for them."),
           stoppedActions(),
         ),
+        stoppedDelivery(),
       );
+      renderDelivery();
     } else if (status === "interrupted") {
-      setContent(heroBox, h("div", { class: "callout callout-warning" }, "The hub stopped while this task was running. Retry resumes from the last completed step.", stoppedActions()));
+      setContent(heroBox, h("div", { class: "callout callout-warning" }, "The hub stopped while this task was running. Retry resumes from the last completed step.", stoppedActions()), stoppedDelivery());
+      renderDelivery();
     } else if (status === "cancelled") {
-      setContent(heroBox, h("div", { class: "callout" }, "Cancelled. Work committed so far stays on the task branch; Retry resumes from the last completed step.", stoppedActions()));
+      setContent(heroBox, h("div", { class: "callout" }, "Cancelled. Work committed so far stays on the task branch; Retry resumes from the last completed step.", stoppedActions()), stoppedDelivery());
+      renderDelivery();
     } else {
       setContent(heroBox);
     }
+  }
+
+  /** A task that did not finish can still deliver its approved work: push it, or open a (draft) pull request with it. */
+  function stoppedDelivery() {
+    if (isCodeReviewTask(task) || !task.branch) return null;
+    return h("div", { class: "card delivery-card" }, h("div", { class: "label" }, "Pull request with the approved work"), deliveryHero);
   }
 
   /** Retry, or ask for changes, on a task that stopped before it finished. */
@@ -780,20 +829,21 @@ export function taskDetailView(root, { params }) {
     return documents;
   }
 
-  /** Where the task branch stands on the remote, plus the push and pull request actions (hero and Result tab). */
+  /** Where the task's work stands on the remote, plus the push and pull request actions (hero and Result tab). */
   function renderDelivery() {
-    if (!task || task.status !== "completed" || !task.result || isCodeReviewTask(task)) return;
+    if (!task || isCodeReviewTask(task) || ACTIVE.includes(task.status)) return;
+    if (task.status === "completed" && !task.result) return;
     refreshRemoteInfo();
     setContent(deliveryHero, deliveryContent());
     setContent(deliveryResult, deliveryContent());
   }
 
   function refreshRemoteInfo() {
-    const key = JSON.stringify([task.id, task.push?.status, task.push?.sha, task.pullRequest?.url]);
+    const key = JSON.stringify([task.id, task.status, task.attempt, task.result?.headSha, task.push?.status, task.push?.sha, task.push?.at, task.pullRequest?.url]);
     if (remoteInfoKey === key) return;
     remoteInfoKey = key;
     get(`/api/tasks/${encodeURIComponent(task.id)}/pull-request`)
-      .catch((error) => ({ remote: null, direct: false, supported: false, error: error.message }))
+      .catch((error) => ({ remote: null, direct: false, supported: false, deliverable: null, error: error.message }))
       .then((info) => {
         if (disposed || remoteInfoKey !== key) return;
         remoteInfo = info;
@@ -802,22 +852,48 @@ export function taskDetailView(root, { params }) {
   }
 
   function deliveryContent() {
+    const completed = task.status === "completed";
+    // A task that did not finish delivers only its latest approved work (code or documents).
+    const deliverable = remoteInfo?.deliverable;
+    if (!completed && !remoteInfo) return h("div", { class: "muted small" }, spinner("Checking the approved work…"));
+    if (!completed && !deliverable) {
+      return h("div", { class: "muted small" }, "None of this task's work was approved yet, so there is nothing to open a pull request with: retry it or request changes.");
+    }
+    const target = completed
+      ? { sha: task.result.headSha, approved: task.result.approved, changes: Boolean(task.result.commits) }
+      : { sha: deliverable.sha, approved: false, changes: deliverable.sha !== task.baseSha };
+    const approvedWork = !completed ? deliverable.approved : null;
+    // Where the remote branch really stands beyond the approved work: "later" - later, unapproved work of this task
+    // pushed earlier (the user can rewind it); "foreign" - commits the local task branch does not have (never replaced).
+    const ahead = approvedWork ? (deliverable.remoteAhead ?? null) : null;
     const push = task.push;
     const pullRequest = task.pullRequest ?? remoteInfo?.pullRequest;
     const remote = remoteInfo?.remote ?? null;
-    const noChanges = !task.result.commits;
+    const noChanges = !target.changes;
     const pushing = pushBusy || push?.status === "pushing";
-    const behind = push?.status === "pushed" && push.sha && task.result.headSha && push.sha !== task.result.headSha;
+    const behind = !ahead && push?.status === "pushed" && push.sha && target.sha && push.sha !== target.sha;
     const where = push?.remote ? `${push.remote}/${push.branch}` : push?.branch;
+    const remoteBranch = `${remote?.name ?? push?.remote ?? "origin"}/${task.branch}`;
     const link = (href, label) => h("a", { href, target: "_blank", rel: "noopener noreferrer" }, label);
 
     let status;
     if (pushing) {
       status = [spinner(), h("span", {}, `Pushing ${task.branch} to ${push?.remote ?? remote?.name ?? "the remote"}…`)];
+    } else if (ahead) {
+      status = [
+        h("span", { class: "delivery-icon delivery-bad" }, "⚠"),
+        h(
+          "span",
+          {},
+          h("span", { class: "mono" }, remoteBranch),
+          ahead.kind === "later" ? " holds later work that was not approved" : " has commits that are not on the local task branch",
+        ),
+        h("span", { class: "muted" }, `up to ${shortSha(ahead.head)}`),
+      ];
     } else if (push?.status === "pushed") {
       status = [
         h("span", { class: "delivery-icon delivery-ok" }, "✓"),
-        h("span", {}, "Pushed to ", h("span", { class: "mono" }, where)),
+        h("span", {}, push.approved ? "Pushed the approved work to " : "Pushed to ", h("span", { class: "mono" }, where)),
         h("span", { class: "muted" }, `${shortSha(push.sha)} · ${relTime(push.at)}${push.auto ? " · automatically" : ""}`),
         push.webUrl ? link(push.webUrl, "View branch ↗") : null,
         behind ? h("span", { class: "delivery-warn" }, "the branch has newer commits") : null,
@@ -827,13 +903,30 @@ export function taskDetailView(root, { params }) {
     } else if (push?.status === "skipped") {
       status = [h("span", { class: "delivery-icon" }, "–"), h("span", { class: "muted" }, `Not pushed: ${push.reason}`)];
     } else {
-      status = [h("span", { class: "delivery-icon" }, "–"), h("span", { class: "muted" }, state.settings?.pushOnComplete === false ? "Not pushed (automatic pushes are off)" : "Not pushed yet")];
+      status = [
+        h("span", { class: "delivery-icon" }, "–"),
+        h("span", { class: "muted" }, !completed ? "Not pushed" : state.settings?.pushOnComplete === false ? "Not pushed (automatic pushes are off)" : "Not pushed yet"),
+      ];
     }
 
-    const canPush = remote && !pushing && !noChanges && (push?.status !== "pushed" || behind);
-    const pushButton = canPush
-      ? h("button", { class: "btn btn-sm", onclick: pushTaskBranch }, push?.status === "failed" ? "Retry push" : behind ? "Push again" : "Push branch")
-      : null;
+    let pushButton = null;
+    if (ahead?.kind === "later" && remote && !pushing) {
+      pushButton = h(
+        "button",
+        {
+          class: "btn btn-sm",
+          title: "Moves the task branch on the remote back to the approved work; the later, unapproved work stays on the local task branch",
+          onclick: () => rewindToApprovedWork(ahead, remoteBranch, Boolean(pullRequest)),
+        },
+        "Rewind to approved work",
+      );
+    } else if (!ahead && remote && !pushing && !noChanges && (push?.status !== "pushed" || behind)) {
+      pushButton = h(
+        "button",
+        { class: "btn btn-sm", onclick: () => pushTaskBranch(), title: approvedWork ? "Pushes only the approved work to the task branch on the remote" : null },
+        push?.status === "failed" ? "Retry push" : behind ? "Push again" : approvedWork ? "Push approved work" : "Push branch",
+      );
+    }
 
     let prButton;
     if (pullRequest) {
@@ -850,17 +943,29 @@ export function taskDetailView(root, { params }) {
           : !remoteInfo.supported
             ? `Pull requests are not supported for ${remote.url}`
             : noChanges
-              ? "The task made no changes"
-              : pushing
-                ? "Wait for the push to finish"
-                : null;
-      const label = prBusy ? "Creating…" : `Create ${direct && !task.result.approved ? "draft " : ""}pull request${direct ? "" : " ↗"}`;
+              ? approvedWork
+                ? "The approved work makes no changes"
+                : "The task made no changes"
+              : ahead?.kind === "later"
+                ? "The remote branch holds later work that was not approved: rewind it to the approved work first"
+                : ahead
+                  ? "The remote branch has commits that are not on the local task branch; the hub does not replace them"
+                  : pushing
+                    ? "Wait for the push to finish"
+                    : null;
+      const label = prBusy ? "Creating…" : `Create ${direct && !target.approved ? "draft " : ""}pull request${direct ? "" : " ↗"}`;
       prButton = h(
         "button",
         {
-          class: `btn btn-sm ${task.result.approved ? "btn-primary" : ""}`,
+          class: `btn btn-sm ${target.approved || approvedWork ? "btn-primary" : ""}`,
           disabled: Boolean(disabledReason) || prBusy,
-          title: disabledReason ?? (direct ? "Pushes the branch if needed and opens the pull request" : "Pushes the branch if needed and opens the page to create the pull request"),
+          title:
+            disabledReason ??
+            (approvedWork
+              ? "Pushes the approved work and opens a pull request with it (a draft: validate it before merging)"
+              : direct
+                ? "Pushes the branch if needed and opens the pull request"
+                : "Pushes the branch if needed and opens the page to create the pull request"),
           onclick: createPullRequest,
         },
         label,
@@ -875,8 +980,22 @@ export function taskDetailView(root, { params }) {
       hint = `The pull request button opens ${host}'s create page with the branches filled in${remote.provider === "github" ? "; sign the GitHub CLI in (gh auth login) to have the hub create it directly" : ""}.`;
 
     return [
+      approvedWork
+        ? h(
+            "div",
+            { class: "delivery-approved small" },
+            h("strong", {}, "Approved work: "),
+            `the ${STAGE_LABELS[approvedWork.stage]} stage, approved in round ${approvedWork.round} (`,
+            h("span", { class: "mono" }, shortSha(approvedWork.sha)),
+            "). A push or pull request holds only this; later, unreviewed work stays local.",
+            ahead?.kind === "later"
+              ? " The remote branch holds later work of this task that was not approved (pushed earlier): rewind it to deliver only the approved work; that work stays on the local task branch."
+              : null,
+          )
+        : null,
       h("div", { class: "delivery-row" }, h("div", { class: "delivery-status" }, status), h("span", { class: "spacer" }), pushButton, prButton),
-      push?.status === "failed" && push.reason && !pushing ? h("div", { class: "delivery-error" }, push.reason) : null,
+      push?.status === "failed" && push.reason && !pushing && !ahead ? h("div", { class: "delivery-error" }, push.reason) : null,
+      push?.status === "pushed" && push.note && !pushing && !ahead ? h("div", { class: "muted small" }, `Note: ${push.note}.`) : null,
       createPageUrl && !pullRequest ? h("div", { class: "small" }, "If the page didn't open: ", link(createPageUrl, `create the pull request on ${host ?? "the remote"} ↗`)) : null,
       hint ? h("div", { class: "muted small" }, hint) : null,
     ];
@@ -1033,7 +1152,8 @@ export function taskDetailView(root, { params }) {
         "div",
         { class: "card pipeline" },
         task.stages.map((stage, index) => {
-          const [label, cls] = stageStatus(stage);
+          const [label, cls] =
+            stage.status === "pending" && (task.result?.notRun ?? []).includes(stage.kind) && !ACTIVE.includes(task.status) ? ["Waits for approved code", "neutral"] : stageStatus(stage);
           const testing = stage.kind === "testing";
           return [
             index > 0 ? h("div", { class: "stage-arrow", "aria-hidden": "true" }, "→") : null,
@@ -2372,6 +2492,9 @@ export function taskDetailView(root, { params }) {
       setContent(
         tabBody,
         h("div", { class: "empty card muted" }, ACTIVE.includes(task.status) ? "The result appears here when the workflow finishes." : "This task has no result."),
+        !ACTIVE.includes(task.status) && !isCodeReviewTask(task) && task.branch
+          ? h("div", { class: "card" }, h("h3", {}, "Remote & pull request"), deliveryResult)
+          : null,
         task.changeRequests?.length || canRequest
           ? h(
               "div",
@@ -2384,6 +2507,7 @@ export function taskDetailView(root, { params }) {
             )
           : null,
       );
+      renderDelivery();
       return;
     }
     const repo = state.repos.find((candidate) => candidate.id === task.repoId);
@@ -2393,24 +2517,39 @@ export function taskDetailView(root, { params }) {
       `git -C "${repoPath}" diff ${shortSha(task.baseSha)}...${task.branch}`,
       `git -C "${repoPath}" merge --no-ff ${task.branch}`,
     ].join("\n");
-    const testsLast = task.stages.at(-1)?.kind === "testing";
+    const testsLast = outcomeStage(task)?.kind === "testing";
     setContent(
       tabBody,
-      result.approved
+      result.notRun?.length
         ? h(
             "div",
-            { class: "callout callout-success" },
-            h("strong", {}, testsLast ? "All tests pass. " : "Approved. "),
-            testsLast ? "The test executor verified the final version." : "The reviewer approved the final version.",
-          )
-        : h(
-            "div",
             { class: "callout callout-warning" },
-            h("strong", {}, testsLast ? "Tests still failing. " : "Finished without approval. "),
-            testsLast
-              ? `${result.openComments} failure(s) remain. Use “Continue fixing” to run more fix-and-verify rounds.`
-              : `${result.openComments} review comment(s) remain open. Use “Continue review loop” to run more rounds.`,
-          ),
+            h("strong", {}, "Coding not approved. "),
+            `${result.openComments} review comment(s) remain open, so the tests did not run: they wait for approved code. Use “Continue review loop” to finish the coding stage; the tests then run.`,
+          )
+        : result.testsUnverified
+          ? h(
+              "div",
+              { class: "callout callout-warning" },
+              h("strong", {}, "The tests could not verify the change. "),
+              "Validate it yourself before merging, or fix the environment and use “Run the tests again”.",
+            )
+          : result.approved
+            ? h(
+                "div",
+                { class: "callout callout-success" },
+                h("strong", {}, testsLast ? "All tests pass. " : "Approved. "),
+                testsLast ? "The test executor verified the final version." : "The reviewer approved the final version.",
+              )
+            : h(
+                "div",
+                { class: "callout callout-warning" },
+                h("strong", {}, testsLast ? "Tests still failing. " : "Finished without approval. "),
+                testsLast
+                  ? `${result.openComments} failure(s) remain. Use “Continue fixing” to run more fix-and-verify rounds.`
+                  : `${result.openComments} review comment(s) remain open. Use “Continue review loop” to run more rounds.`,
+              ),
+      result.warning ? h("div", { class: "callout callout-warning small" }, h("strong", {}, "⚠ Check before merging: "), result.warning) : null,
       h(
         "div",
         { class: "card" },
@@ -2585,22 +2724,49 @@ export function taskDetailView(root, { params }) {
     }
   }
 
-  async function pushTaskBranch() {
+  async function pushTaskBranch(rewind = false) {
     if (pushBusy) return;
     pushBusy = true;
     renderDelivery();
     try {
-      const updated = await post(`/api/tasks/${encodeURIComponent(task.id)}/push`);
+      const updated = await post(`/api/tasks/${encodeURIComponent(task.id)}/push`, rewind ? { rewind: true } : undefined);
       const push = updated?.push;
-      if (push?.status === "pushed") toast(`Pushed ${push.branch} to ${push.remote}`, "success");
+      if (push?.status === "pushed") toast(rewind ? `Rewound ${push.remote}/${push.branch} to the approved work` : `Pushed ${push.branch} to ${push.remote}`, "success");
       else if (push?.status === "failed") toast(`Push failed: ${push.reason ?? "unknown error"}`, "error");
       else if (push?.reason) toast(push.reason);
     } catch (error) {
       toast(error.message, "error");
     } finally {
       pushBusy = false;
+      // Where the remote branch stands now (a push may also have found it holding later work).
+      remoteInfoKey = null;
       renderDelivery();
     }
+  }
+
+  /** Moves the remote branch back from later, unapproved work of this task to the approved work, once the user confirms. */
+  async function rewindToApprovedWork(ahead, remoteBranch, hasPullRequest) {
+    const approved = remoteInfo?.deliverable?.approved;
+    const ok = await confirmDialog({
+      title: "Rewind the remote branch to the approved work?",
+      body: h(
+        "div",
+        { class: "stack" },
+        h(
+          "p",
+          {},
+          h("span", { class: "mono" }, remoteBranch),
+          ` holds later work of this task that was not approved (up to ${shortSha(ahead.head)}). Rewinding force-pushes the branch back to the approved work`,
+          approved ? ` (${shortSha(approved.sha)})` : "",
+          " - only while it still holds that later work - so a push or pull request delivers only the approved work.",
+        ),
+        h("p", {}, "The later work stays on the local task branch; the task's next completed run pushes it again."),
+        hasPullRequest ? h("p", {}, "The open pull request from this branch then shows only the approved work.") : null,
+      ),
+      confirmText: "Rewind",
+      danger: true,
+    });
+    if (ok) await pushTaskBranch(true);
   }
 
   async function createPullRequest() {

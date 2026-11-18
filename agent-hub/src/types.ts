@@ -214,6 +214,12 @@ export interface Stage {
   rerun?: boolean;
   /** Status "skipped": the change request for which the manager dropped the stage (its work stays on the task branch). */
   skippedFor?: string;
+  /**
+   * Testing stage that ended early (status "not-approved") without the test fixer: the automation was blocked, or its
+   * only failures came from the environment. The tests did not verify the change: the user validates it. Running the
+   * tests again (Continue) starts with a fresh run.
+   */
+  unverified?: { reason: "blocked" | "environment"; text: string };
   startedAt?: string;
   finishedAt?: string;
 }
@@ -480,7 +486,13 @@ export interface Activity {
 }
 
 export interface TaskResult {
+  /** The task's last stage is approved, and so is its code: the coding stage's reviewer approved it and its tests pass. */
   approved: boolean;
+  /**
+   * The stage the outcome describes: the code's stage that holds the approval back (coding, then testing), otherwise
+   * the last stage. Results recorded before it existed describe the last stage.
+   */
+  outcomeStage?: StageKind;
   summary: string;
   headSha?: string;
   diffStat?: string;
@@ -495,6 +507,12 @@ export interface TaskResult {
   /** Unit tests of the last coding round. */
   unitTests?: UnitTestCheck;
   openComments: number;
+  /** Stages that did not run: the coding stage is not approved, and the tests wait for approved code. */
+  notRun?: StageKind[];
+  /** The tests could not verify the change (blocked, or failing only because of the environment): the user validates it. */
+  testsUnverified?: "blocked" | "environment";
+  /** What the user should check before merging: tests that could not verify the change, failing tests left for their owners. */
+  warning?: string;
 }
 
 export interface Usage {
@@ -600,8 +618,20 @@ export interface PushInfo {
   sha?: string;
   /** Why the push failed or was skipped. */
   reason?: string;
+  /** A task that did not finish pushes only its latest approved work: the stage and round that approved it. */
+  approved?: ApprovedWork;
+  /** Context for a successful push, e.g. that it rewound later, unapproved work pushed earlier. */
+  note?: string;
   /** True for the automatic push when the task completed. */
   auto: boolean;
+  at: string;
+}
+
+/** The latest work a reviewer (or the test executor) approved: what a task that did not finish delivers. */
+export interface ApprovedWork {
+  sha: string;
+  stage: StageKind;
+  round: number;
   at: string;
 }
 

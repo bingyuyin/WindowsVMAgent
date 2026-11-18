@@ -4,7 +4,7 @@ import type { AgentDriver, AgentObserver, UserQuestion } from "../agents/driver.
 import type { Bus } from "../bus.ts";
 import { describeContext, discoverContext, type HubSkills } from "../context.ts";
 import { formatOfPath, type DocTemplates } from "../docs.ts";
-import { branchWebUrl, primaryRemote, pullRequestPageUrl, pushBranch, sanitizeRemoteUrl, type PullRequestCreator } from "../remote.ts";
+import { branchWebUrl, primaryRemote, pullRequestPageUrl, pushBranch, remoteBranchHead, sanitizeRemoteUrl, type PullRequestCreator } from "../remote.ts";
 import { commentableLines, pendingChanges, publishReview, REVIEW_EVENTS, reviewMarkdown, type ReviewPublisher } from "../review/publish.ts";
 import { defaultBranchOf, resolveReviewTarget, type PullRequestLookup, type ResolvedReviewTarget } from "../review/target.ts";
 import type { CommandRunner } from "../shell.ts";
@@ -33,6 +33,7 @@ import {
   TASK_KINDS,
   type AgentInfo,
   type AgentRole,
+  type ApprovedWork,
   type ChangeRequest,
   type CodeReview,
   type CommEntry,
@@ -651,19 +652,24 @@ export class TaskRunner {
     return { ...base, round: target.n, content };
   }
 
-  /** Pushes the task branch now (e.g. after a failed automatic push, or with automatic pushes turned off). */
-  async pushNow(id: string): Promise<Task> {
+  /**
+   * Pushes the task's work now (e.g. after a failed automatic push, or with automatic pushes turned off). With `rewind`,
+   * the approved work of a task that did not finish may move the remote branch back from later, unapproved work of
+   * this task pushed earlier; without it, such a push fails and says so.
+   */
+  async pushNow(id: string, options: { rewind?: boolean } = {}): Promise<Task> {
     const task = this.get(id);
     if (isCodeReview(task)) throw new HttpError(409, "Code review tasks review an existing change; they have no branch of their own to push");
     if (this.running.has(id) || ACTIVE_STATUSES.includes(task.status)) throw new HttpError(409, "Wait until the task has finished before pushing its branch");
     if (task.push?.status === "pushing") throw new HttpError(409, "The branch is being pushed right now");
-    await this.pushTask(task, false);
+    await this.pushTask(task, false, { rewind: options.rewind === true });
     return task;
   }
 
   /**
-   * Opens a pull request for the task branch: pushes the latest commit first, then creates the pull request
-   * directly when a creator (the GitHub CLI) can, otherwise returns the host's prefilled create page.
+   * Opens a pull request for the task branch: pushes the task's work first (its head once completed; otherwise its
+   * latest approved work), then creates the pull request directly when a creator (the GitHub CLI) can, otherwise
+   * returns the host's prefilled create page.
    */
   async pullRequest(id: string): Promise<PullRequestOutcome> {
     const task = this.get(id);
@@ -674,17 +680,24 @@ export class TaskRunner {
     if (!repo || !task.branch || !task.baseSha) throw new HttpError(409, "This task has no branch to open a pull request for");
     const remote = await primaryRemote(repo.path);
     if (!remote) throw new HttpError(409, "No git remote is configured for this repository, so there is nowhere to open a pull request");
-    const head = await resolveCommit(repo.path, `refs/heads/${task.branch}`);
-    if (!(task.push?.status === "pushed" && task.push.sha === head)) {
-      const push = await this.pushTask(task, false, true);
+    const deliverable = await this.deliverable(task, repo);
+    if (!deliverable) throw new HttpError(409, "The task did not finish and none of its work was approved yet: retry it or request changes, then open the pull request");
+    // Approved work is checked against the remote itself (it may have been pushed there by hand since); a pull request
+    // never rewinds the remote branch - when it holds later work, the push fails and says how to rewind it.
+    const delivered = deliverable.approved
+      ? (await remoteBranchHead(repo.path, remote.name, task.branch)) === deliverable.sha
+      : task.push?.status === "pushed" && task.push.sha === deliverable.sha;
+    if (!delivered) {
+      const push = await this.pushTask(task, false, { reuseCurrent: !deliverable.approved });
       if (push.status !== "pushed") throw new HttpError(409, `The branch could not be pushed: ${push.reason ?? push.status}`);
     }
     const request = {
       head: task.branch,
       base: pullRequestBase(task, repo),
       title: task.title,
-      body: pullRequestBody(task),
-      draft: !task.result?.approved,
+      body: pullRequestBody(task, deliverable.approved),
+      // Anything short of an approved, completed task opens as a draft: the user validates it first.
+      draft: task.status !== "completed" || !task.result?.approved,
     };
     const creator = this.deps.pullRequests;
     if (creator && (await creator.canCreate(remote))) {
@@ -705,24 +718,41 @@ export class TaskRunner {
     return { createUrl, message: `Opening the ${remote.host ?? "remote"} page to create the pull request` };
   }
 
-  /** What the UI's pull request button can do for this task. */
+  /** What the UI's pull request button can do for this task, and which commit a push or pull request delivers. */
   async pullRequestStatus(id: string): Promise<{
     remote: { name: string; url: string; provider: string; host?: string } | null;
     /** True when the pull request can be created directly (GitHub CLI signed in); otherwise the host's page opens. */
     direct: boolean;
     supported: boolean;
     pullRequest?: PullRequestInfo;
+    /**
+     * The branch head of a completed task, or the latest approved work of one that did not finish; null when there is
+     * none. `remoteAhead` (approved work): the remote branch is beyond it - "later": later, unapproved work of this task
+     * pushed earlier (pushing the approved work rewinds it, when asked to); "foreign": commits the local task branch
+     * does not have (never replaced).
+     */
+    deliverable: { sha: string; approved?: ApprovedWork; remoteAhead?: RemoteAhead } | null;
   }> {
     const task = this.get(id);
     const repo = this.deps.store.getRepo(task.repoId);
+    const deliverable: { sha: string; approved?: ApprovedWork; remoteAhead?: RemoteAhead } | null =
+      repo && task.branch && !ACTIVE_STATUSES.includes(task.status) && !isCodeReview(task) && fs.existsSync(repo.path)
+        ? await this.deliverable(task, repo).catch(() => null)
+        : null;
     const remote = repo ? await primaryRemote(repo.path) : null;
-    if (!remote) return { remote: null, direct: false, supported: false, pullRequest: task.pullRequest };
+    if (!remote) return { remote: null, direct: false, supported: false, pullRequest: task.pullRequest, deliverable };
+    // Where the remote branch really stands (it may have been pushed by hand), the same check a push makes.
+    if (repo && task.branch && deliverable?.approved) {
+      const ahead = await remoteAhead(repo.path, remote.name, task.branch, deliverable.sha, 20_000).catch(() => null);
+      if (ahead) deliverable.remoteAhead = ahead;
+    }
     const direct = Boolean(this.deps.pullRequests && (await this.deps.pullRequests.canCreate(remote)));
     return {
       remote: { name: remote.name, url: remote.url, provider: remote.provider, host: remote.host },
       direct,
       supported: direct || remote.webUrl !== null,
       pullRequest: task.pullRequest,
+      deliverable,
     };
   }
 
@@ -878,19 +908,28 @@ export class TaskRunner {
   }
 
   /**
-   * Pushes the task branch to the repository's remote; never throws (the outcome is recorded on the task).
-   * With `reuseCurrent`, a push that already sent the current head (e.g. an automatic push that finished
-   * while this call waited for the lock) is returned as is.
+   * Pushes the task's work to the repository's remote; never throws (the outcome is recorded on the task). A completed
+   * task pushes its branch head; a task that did not finish pushes only its latest approved work (to the same branch).
+   * - `sha`: the head the task completed with, for automatic pushes (the task may run again before the push's turn).
+   * - `rewind`: the user asked to move the remote branch back to the approved work from later, unapproved work of this
+   *   task pushed earlier. Without it such a push fails and says so; automatic pushes never rewind.
+   * - `reuseCurrent`: a push that already sent that commit (e.g. an automatic push that finished while this call waited
+   *   for the lock) is returned as is.
    */
-  private async pushTask(task: Task, auto: boolean, reuseCurrent = false): Promise<PushInfo> {
+  private async pushTask(task: Task, auto: boolean, options: { sha?: string; rewind?: boolean; reuseCurrent?: boolean } = {}): Promise<PushInfo> {
     const repo = this.deps.store.getRepo(task.repoId);
     const branch = task.branch;
     const record = (info: PushInfo): PushInfo => {
       task.push = info;
       const where = info.remote ? `${info.remote}/${info.branch}` : info.branch;
+      const approved = info.approved ? `the approved work (${STAGE_TITLES[info.approved.stage]}, round ${info.approved.round})` : "";
       if (info.status === "pushed") {
-        this.emit(task, { type: "info", text: `Pushed ${info.branch} to ${info.remote} (${info.sha?.slice(0, 10)})`, data: { push: info } });
-        this.comm(task, { from: "manager", to: "user", kind: "lifecycle", text: `Pushed the task branch to ${where} (${info.sha?.slice(0, 10)})` });
+        this.emit(task, {
+          type: "info",
+          text: `Pushed ${approved ? `${approved} of ` : ""}${info.branch} to ${info.remote} (${info.sha?.slice(0, 10)})${info.note ? `: ${info.note}` : ""}`,
+          data: { push: info },
+        });
+        this.comm(task, { from: "manager", to: "user", kind: "lifecycle", text: `Pushed ${approved || "the task branch"} to ${where} (${info.sha?.slice(0, 10)})` });
       } else if (info.status === "failed") {
         this.emit(task, { type: "warning", text: `Could not push ${info.branch} to ${info.remote}: ${info.reason}`, data: { push: info } });
         this.comm(task, { from: "manager", to: "user", kind: "lifecycle", text: `Could not push ${where}: ${truncate(info.reason ?? "", 200)}` });
@@ -906,18 +945,74 @@ export class TaskRunner {
       try {
         const remote = await primaryRemote(repo.path);
         if (!remote) return record({ status: "skipped", branch, reason: "No git remote is configured for this repository", auto, at: nowIso() });
-        const sha = await resolveCommit(repo.path, `refs/heads/${branch}`);
-        if (reuseCurrent && task.push?.status === "pushed" && task.push.sha === sha && task.push.remote === remote.name) return task.push;
-        const target = { branch, remote: remote.name, remoteUrl: remote.url, sha, auto };
-        if (sha === task.baseSha) return record({ ...target, status: "skipped", reason: "The task made no changes, so there is nothing to push", at: nowIso() });
+        const deliverable: { sha: string; approved?: ApprovedWork } | null = options.sha ? { sha: options.sha } : await this.deliverable(task, repo);
+        if (!deliverable) {
+          return record({ status: "skipped", branch, reason: "The task did not finish and none of its work was approved yet, so there is nothing to push", auto, at: nowIso() });
+        }
+        const { sha, approved } = deliverable;
+        if (options.reuseCurrent && task.push?.status === "pushed" && task.push.sha === sha && task.push.remote === remote.name) return task.push;
+        const target = { branch, remote: remote.name, remoteUrl: remote.url, sha, auto, ...(approved ? { approved } : {}) };
+        if (sha === task.baseSha) {
+          return record({ ...target, status: "skipped", reason: approved ? "The approved work makes no changes, so there is nothing to push" : "The task made no changes, so there is nothing to push", at: nowIso() });
+        }
         task.push = { ...target, status: "pushing", at: nowIso() };
         this.publish(task);
-        await pushBranch(repo.path, remote.name, branch);
-        return record({ ...target, status: "pushed", webUrl: branchWebUrl(remote, branch) ?? undefined, at: nowIso() });
+        const webUrl = branchWebUrl(remote, branch) ?? undefined;
+        try {
+          await pushBranch(repo.path, remote.name, branch, { sha });
+        } catch (error) {
+          // The remote branch is beyond the approved work. Only this task's own later work (pushed earlier, e.g. when an
+          // attempt completed unapproved) can be moved back from, and only when the user asks: that work stays on the
+          // local task branch, and the task's next push brings it back. Others' commits are never replaced.
+          const ahead = approved ? await remoteAhead(repo.path, remote.name, branch, sha) : null;
+          if (!ahead) throw error;
+          if (ahead.kind === "foreign") {
+            throw new Error(
+              `${remote.name}/${branch} has commits that are not on the local task branch (up to ${ahead.head.slice(0, 10)}); the hub does not replace them. Push the approved work (${sha.slice(0, 10)}) yourself, or remove those commits from the remote branch first.`,
+            );
+          }
+          if (!options.rewind) {
+            throw new Error(
+              `${remote.name}/${branch} holds later work of this task that was not approved (up to ${ahead.head.slice(0, 10)}), pushed earlier. Rewind it to the approved work (${sha.slice(0, 10)}) to deliver only that; the later work stays on the local task branch.`,
+            );
+          }
+          // The lease: the remote branch moves back only while it still holds what was just read.
+          await pushBranch(repo.path, remote.name, branch, { sha, lease: ahead.head });
+          return record({
+            ...target,
+            status: "pushed",
+            webUrl,
+            note: `rewound the branch from the later, unapproved work pushed earlier (up to ${ahead.head.slice(0, 10)}); that work stays on the local task branch`,
+            at: nowIso(),
+          });
+        }
+        return record({ ...target, status: "pushed", webUrl, at: nowIso() });
       } catch (error) {
-        return record({ status: "failed", branch, remote: task.push?.remote, remoteUrl: task.push?.remoteUrl, sha: task.push?.sha, reason: truncate(errorMessage(error), 1000), auto, at: nowIso() });
+        return record({
+          status: "failed",
+          branch,
+          remote: task.push?.remote,
+          remoteUrl: task.push?.remoteUrl,
+          sha: task.push?.sha,
+          ...(task.push?.approved ? { approved: task.push.approved } : {}),
+          reason: truncate(errorMessage(error), 1000),
+          auto,
+          at: nowIso(),
+        });
       }
     });
+  }
+
+  /**
+   * What pushing the task delivers: the branch head once the task completed; otherwise only the latest work a reviewer
+   * (or the test executor) approved - code or documents - that holds no unapproved work, so unreviewed work stays local.
+   * Null when nothing was approved.
+   */
+  private async deliverable(task: Task, repo: Repo): Promise<{ sha: string; approved?: ApprovedWork } | null> {
+    if (task.status === "completed") return { sha: await resolveCommit(repo.path, `refs/heads/${task.branch}`) };
+    if (!task.baseSha || !task.branch) return null;
+    const approved = latestApprovedWork(task, await branchCommits(repo.path, task.baseSha, task.branch));
+    return approved ? { sha: approved.sha, approved } : null;
   }
 
   private async execute(task: Task, entry: RunningTask): Promise<void> {
@@ -997,7 +1092,10 @@ export class TaskRunner {
       this.heartbeatsPublished.delete(task.id);
       this.publish(task);
       this.pump();
-      if (task.status === "completed" && store.settings.pushOnComplete && !isCodeReview(task) && !this.shuttingDown) this.afterTask(this.pushTask(task, true));
+      // The head this attempt completed with: the task may run again before the push gets its turn.
+      if (task.status === "completed" && store.settings.pushOnComplete && !isCodeReview(task) && !this.shuttingDown) {
+        this.afterTask(this.pushTask(task, true, { sha: task.result?.headSha }));
+      }
     }
   }
 
@@ -1352,7 +1450,13 @@ function completionText(task: Task): string {
     const comments = result?.openComments ?? 0;
     return `Completed: code review ready with ${comments} comment(s) (${result?.approved ? "both reviewers agree" : "the reviewers did not fully agree"}); review and publish them`;
   }
-  const testsLast = stageKindsOf(task).at(-1) === "testing";
+  const testsLast = (result?.outcomeStage ?? stageKindsOf(task).at(-1)) === "testing";
+  if (result?.notRun?.length) {
+    return `Completed without approval: the coding stage is not approved (${result.openComments} open comment(s)), so the tests did not run; continue the review loop to finish it`;
+  }
+  if (result?.testsUnverified) {
+    return `Completed: the tests could not verify the change (${result.testsUnverified === "blocked" ? "blocked" : "environment failures"}); validate it yourself and open the pull request`;
+  }
   if (result?.approved) return testsLast ? "Completed: all tests pass (verified by the test executor)" : "Completed: approved by the reviewer";
   return testsLast
     ? `Completed with failing tests (${result?.openComments ?? 0} failure(s) remain)`
@@ -1363,6 +1467,67 @@ function prName(pullRequest: PullRequestInfo): string {
   return pullRequest.number ? `#${pullRequest.number}` : pullRequest.url;
 }
 
+/**
+ * The latest work a reviewer (or the test executor) approved - a design, a document, code, or code whose tests pass -
+ * among the stages the task still has, that holds approved work only: every round's commit below it was approved in its
+ * own stage (so a document approved on top of code its reviewer rejected does not count). `order` lists the task
+ * branch's commits, its base first (the branch only moves forward); work that is not on it does not count. It is what
+ * a task that did not finish delivers.
+ */
+export function latestApprovedWork(task: Pick<Task, "stages">, order: readonly string[]): ApprovedWork | null {
+  const position = new Map(order.map((sha, index) => [sha, index] as const));
+  const approvals: Array<ApprovedWork & { index: number; candidate: boolean }> = [];
+  const commits: Array<{ stage: StageKind; index: number }> = [];
+  for (const stage of task.stages) {
+    for (const round of stage.rounds) {
+      const commit = round.author?.commit ?? undefined;
+      const committed = commit === undefined ? undefined : position.get(commit);
+      if (committed !== undefined) commits.push({ stage: stage.kind, index: committed });
+      const review = round.review;
+      if (!review || review.by === "user" || review.verdict !== "approve") continue;
+      const sha = review.reviewedSha ?? commit;
+      const index = sha === undefined ? undefined : position.get(sha);
+      // A dropped stage's approvals still vouch for its own commits, but it no longer delivers anything itself.
+      if (sha !== undefined && index !== undefined) approvals.push({ sha, stage: stage.kind, round: round.n, at: review.at, index, candidate: stage.status !== "skipped" });
+    }
+  }
+  const approvedUpTo = (limit: number) =>
+    commits.every((commit) => commit.index > limit || approvals.some((approval) => approval.stage === commit.stage && approval.index >= commit.index && approval.index <= limit));
+  let latest: (typeof approvals)[number] | null = null;
+  for (const approval of approvals) {
+    if (!approval.candidate || !approvedUpTo(approval.index)) continue;
+    if (!latest || approval.index > latest.index || (approval.index === latest.index && approval.at > latest.at)) latest = approval;
+  }
+  return latest && { sha: latest.sha, stage: latest.stage, round: latest.round, at: latest.at };
+}
+
+/** The task branch's commits, base first, following first parents (the order the agents' work landed in). */
+async function branchCommits(repoPath: string, baseSha: string, branch: string): Promise<string[]> {
+  const list = await git(repoPath, ["rev-list", "--first-parent", "--reverse", `${baseSha}..refs/heads/${branch}`], { allowFailure: true });
+  if (list.code !== 0) return [];
+  return [baseSha, ...list.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)];
+}
+
+/** `ancestor` is `commit` or one of its ancestors (false when either is unknown here). */
+async function isAncestor(repoPath: string, ancestor: string, commit: string): Promise<boolean> {
+  return (await git(repoPath, ["merge-base", "--is-ancestor", ancestor, commit], { allowFailure: true })).code === 0;
+}
+
+/** The remote branch is beyond approved work: its head, and whether it is later work of this task or not. */
+type RemoteAhead = { head: string; kind: "later" | "foreign" };
+
+/**
+ * Where the remote branch stands beyond approved work `sha`: "later" - later work of this task (commits of the local
+ * task branch that build on the approved work); "foreign" - commits the local task branch does not have. Null when the
+ * remote branch is at or behind the approved work, does not exist, or cannot be reached.
+ */
+async function remoteAhead(repoPath: string, remote: string, branch: string, sha: string, timeoutMs?: number): Promise<RemoteAhead | null> {
+  const head = await remoteBranchHead(repoPath, remote, branch, timeoutMs);
+  if (!head || head === sha || (await isAncestor(repoPath, head, sha))) return null;
+  const later = (await isAncestor(repoPath, sha, head)) && (await isAncestor(repoPath, head, `refs/heads/${branch}`));
+  return { head, kind: later ? "later" : "foreign" };
+}
+
 /** The branch a pull request targets: the branch the task started from, or the repository's default branch. */
 export function pullRequestBase(task: Pick<Task, "baseRef">, repo: Pick<Repo, "defaultBranch">): string {
   const ref = (task.baseRef ?? "").trim().replace(/^refs\/heads\//, "");
@@ -1370,26 +1535,46 @@ export function pullRequestBase(task: Pick<Task, "baseRef">, repo: Pick<Repo, "d
   return repo.defaultBranch && repo.defaultBranch !== "HEAD" ? repo.defaultBranch : "main";
 }
 
-/** Pull request description: the outcome, the request, the plan, tests and the agents that worked on it. */
-export function pullRequestBody(task: Task): string {
-  const result = task.result;
+/**
+ * Pull request description: the outcome, the request, the plan, tests and the agents that worked on it. With
+ * `approved`, the task did not finish and the pull request holds only that approved work.
+ */
+export function pullRequestBody(task: Task, approved?: ApprovedWork): string {
+  const result = approved ? undefined : task.result;
   const lines: string[] = [];
   if (result?.summary.trim()) lines.push(result.summary.trim(), "");
+  if (approved) {
+    const stage = task.stages.find((candidate) => candidate.kind === approved.stage);
+    const round = stage?.rounds.find((candidate) => candidate.n === approved.round);
+    const summary = round?.author?.summary ?? [...(stage?.rounds ?? [])].reverse().find((candidate) => candidate.n <= approved.round && candidate.author)?.author?.summary;
+    if (summary?.trim()) lines.push(summary.trim(), "");
+  }
   lines.push("---", "", "**Request**", "", ...truncate(task.description.trim(), 1500).split(/\r?\n/).map((line) => `> ${line}`), "");
   if (task.plan) {
     lines.push(`**Manager's plan:** ${task.plan.stages.map((stage) => STAGE_TITLES[stage]).join(" → ")} — ${task.plan.rationale}`, "");
   }
+  if (approved) {
+    const status = task.status === "failed" ? `failed${task.error ? `: ${truncate(firstLine(task.error), 300)}` : ""}` : task.status;
+    lines.push(
+      `**Outcome:** the task did not finish (${status}). This pull request holds only the work approved so far: the ${STAGE_TITLES[approved.stage]} stage, approved in round ${approved.round} (${approved.sha.slice(0, 10)}). Validate it before merging.`,
+    );
+  }
   if (result) {
-    const testsLast = stageKindsOf(task).at(-1) === "testing";
+    const testsLast = (result.outcomeStage ?? stageKindsOf(task).at(-1)) === "testing";
     lines.push(
       `**Outcome:** ${
-        result.approved
-          ? testsLast
-            ? "all tests pass (verified by the test executor)"
-            : "approved by the reviewer"
-          : `not approved — ${result.openComments} open ${testsLast ? "failure" : "comment"}(s)`
+        result.notRun?.length
+          ? `not approved — the coding stage has ${result.openComments} open comment(s), so the tests did not run`
+          : result.testsUnverified
+            ? "the tests could not verify the change — validate it before merging"
+            : result.approved
+              ? testsLast
+                ? "all tests pass (verified by the test executor)"
+                : "approved by the reviewer"
+              : `not approved — ${result.openComments} open ${testsLast ? "failure" : "comment"}(s)`
       }${result.shortStat ? ` · ${result.shortStat}` : ""}`,
     );
+    if (result.warning) lines.push(`**⚠ Check before merging:** ${result.warning}`);
     if (result.tests) {
       const counts = result.tests.total !== undefined ? ` (${result.tests.passed ?? "?"}/${result.tests.total} passed)` : "";
       const commands = result.tests.commands.length ? ` · ${result.tests.commands.slice(0, 3).map((command) => `\`${command}\``).join(", ")}` : "";

@@ -812,7 +812,11 @@ function stageState(task: Task, stage: Stage): string {
       text = testing ? `all tests pass (run ${last})` : `approved in round ${last}`;
       break;
     case "not-approved":
-      text = testing ? `tests still failing after run ${last} (${open} failure(s))` : `finished without approval after round ${last} (${open} comment(s) open)`;
+      text = stage.unverified
+        ? `stopped after run ${last} without verifying the change (${stage.unverified.reason === "blocked" ? "the tests were blocked" : "only environment failures"}): ${stage.unverified.text}`
+        : testing
+          ? `tests still failing after run ${last} (${open} failure(s))`
+          : `finished without approval after round ${last} (${open} comment(s) open)`;
       break;
     case "skipped":
       text = `dropped for ${stage.skippedFor ?? "an earlier change request"} (its work stays on the branch)`;
