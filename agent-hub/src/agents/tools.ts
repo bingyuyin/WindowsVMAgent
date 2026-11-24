@@ -308,6 +308,10 @@ export const submitFinalReviewSchema = {
       items: {
         type: "object",
         properties: {
+          id: {
+            type: "string",
+            description: "Only when revising a finished review: the ID of the review's comment this one keeps or changes (e.g. \"R2\"). Omit it for a new comment.",
+          },
           ...reviewCommentProperties,
           sources: {
             type: "array",
@@ -320,7 +324,8 @@ export const submitFinalReviewSchema = {
     },
     dropped: {
       type: "array",
-      description: "Every reviewer comment that is in no final comment's sources, with the reason (wrong, duplicate, out of scope...). Withdrawn comments need not be listed.",
+      description:
+        "Every reviewer comment that is in no final comment's sources, with the reason (wrong, duplicate, out of scope...). Withdrawn comments need not be listed. When revising a finished review, also every comment of the review (R#) the revision leaves out.",
       items: {
         type: "object",
         properties: { comment_id: { type: "string" }, reason: { type: "string" } },
@@ -334,6 +339,19 @@ export const submitFinalReviewSchema = {
         type: "object",
         properties: { objection: { type: "string", description: "The objection, briefly." }, response: { type: "string", description: "What you changed, or why you keep your decision." } },
         required: ["objection", "response"],
+      },
+    },
+    request_responses: {
+      type: "array",
+      description: "Only when the user made change requests (U1, U2...): your answer to each one.",
+      items: {
+        type: "object",
+        properties: {
+          request_id: { type: "string", description: "The change request's ID, e.g. \"U2\"." },
+          status: { type: "string", enum: ["addressed", "declined"] },
+          note: { type: "string", description: "addressed: what the review now does for it; declined: why (e.g. the requested change would make the review wrong)." },
+        },
+        required: ["request_id", "status", "note"],
       },
     },
   },
@@ -351,7 +369,10 @@ export const submitSignoffSchema = {
       items: {
         type: "object",
         properties: {
-          comment_id: { type: "string", description: "R# of a final comment, or the ID of a reviewer comment the final review dropped; omit for the review as a whole." },
+          comment_id: {
+            type: "string",
+            description: "R# of a final comment, the ID of a reviewer comment the final review dropped, or a change request's U# it does not handle; omit for the review as a whole.",
+          },
           issue: { type: "string", description: "What is wrong and what the final review should do instead." },
         },
         required: ["issue"],

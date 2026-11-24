@@ -159,7 +159,7 @@ export const submitPositions = (input: {
 }): Step => reviewStep("submit_positions", (spec) => ({ summary: `${spec.role} positions`, responses: [], ...input }));
 
 export const submitFinal = (
-  comments: Array<ReviewCommentStep & { sources: string[] }>,
+  comments: Array<ReviewCommentStep & { sources: string[]; id?: string }>,
   dropped: Array<{ comment_id: string; reason: string }> = [],
   extra: Record<string, unknown> = {},
 ): Step =>

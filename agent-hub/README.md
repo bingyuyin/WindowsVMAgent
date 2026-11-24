@@ -166,6 +166,12 @@ flowchart LR
 9. **Request changes**: whenever the task is not running (finished, failed, cancelled, interrupted or still
    queued) you can ask for further changes or adjustments, as often as you like; the manager re-evaluates
    the task for each request (see [Requesting changes](#requesting-changes-the-manager-re-plans-the-task)).
+   A code review's requests go to its reviewers, who revise the review (see
+   [Changing a finished review](#changing-a-finished-review)).
+
+The **📝 Original request** link under the task's title (and the **Request** tab, *Requests (N)* once you
+asked for changes) shows what you asked for: the original description in full, then every change request
+in order, with its state, who handled it and their answer.
 
 Each agent keeps one Copilot session per stage, so it remembers earlier rounds; a comment resolver or test
 fixer that starts fresh gets the request, the previous summary and the diff so far. If an agent ends a turn
@@ -198,8 +204,9 @@ the top bar shows how many to-dos are waiting.
 ## Requesting changes: the manager re-plans the task
 
 Every task that is not running - finished (approved or not), failed, cancelled, interrupted or still
-queued - has a **✎ Request changes** button (title bar, status card and Result tab; code reviews excepted:
-curate their comments instead). Describe what should change, choose who handles it and the round budget:
+queued - has a **✎ Request changes** button (title bar, status card, Result and Requests tabs; for code
+reviews see [Changing a finished review](#changing-a-finished-review)). Describe what should change,
+choose who handles it and the round budget:
 
 - **The manager decides** (default). The request becomes change request **U1** (then U2, …), and before
   the agents continue, the manager's planner reads where the task stands (each stage's state, the task
@@ -235,7 +242,8 @@ How the teams work on it:
   (e.g. coding added to a task whose tests ran before). Earlier finished stages are left as they are.
 - A failed, cancelled or interrupted task continues from where it stopped, with the change.
 - The task then completes again and its branch is pushed, so an open pull request picks up the change.
-  The Result tab lists every change request with its status, the manager's decision and the agent's response.
+  The Result and Requests tabs list every change request with its status, the manager's decision and the
+  agent's response.
 
 ## Code review: two reviewers, then you publish
 
@@ -309,6 +317,38 @@ and recovered like any agent, a failed or cancelled review resumes from the last
 **Retry**, and code review tasks are never pushed. The lead reviewer uses the reviewer model, the peer
 reviewer the **Peer reviewer model** (Settings or the New task form, also for Auto tasks; default: the
 author model); pick two different models for a real second opinion.
+
+### Changing a finished review
+
+A code review takes change requests too: **✎ Request changes** (title bar, status card, Requests tab)
+with what should change - *"Also check the error handling in retry.ts"*, *"R2 is a false positive: the
+caller validates the input"*, *"Make the comments shorter"* - and the final-review rounds. It becomes **U1**
+(then U2, …) and goes to the reviewers, not the manager:
+
+1. **Revision** (lead reviewer): it gets the request, the review **as you have it** - your keep/drop
+   decisions, your edits, the comments you added and which are on the pull request - and the reviewers'
+   discussion, checks the code for what you ask and submits the complete revised review. It keeps each
+   comment's ID (`R2` stays `R2`; new comments get new IDs), leaves your decisions and edits alone unless the
+   request changes them, gives the reason for each comment it removes, and answers U1: *addressed* or
+   *declined* with the reason.
+2. **Sign-off** (peer reviewer): it sees the request, the lead's answer and exactly what changed - added,
+   changed and removed comments - and agrees or objects; the lead revises for objections as usual, up to
+   the rounds you chose.
+
+The **Review** tab then shows what the revision did (*Revised for your change request U1 · 1 added (R5) ·
+1 changed (R2) · 1 removed (R3)*) with the lead's answer, and marks the comments: *new for U1*, *changed for
+U1* (with the text before), *removed for U1* (dropped, with the reason; **Keep** puts it back, and so does a
+later revision that includes it again: *back for U2*). Comments it kept as they
+were keep your decision and edit. Nothing changes on the pull request until you publish: **Publish
+updates** then edits the changed comments in place, deletes the removed ones, adds the new ones (a comment
+moved to another line is deleted and posted again there) and updates the review's text - which follows the
+new assessment unless you wrote your own.
+
+While the reviewers revise, the review is shown as it was and is locked. A revision that fails or is
+cancelled leaves it as it was: curate and publish it as before, or **Retry** (it resumes where it stopped,
+e.g. with the peer's sign-off - unless you changed the review meanwhile: then the lead revises it again, from
+the review as you have it now) or request changes again. A request made before the review first finished
+is simply taken into account: the final review answers it.
 
 ## Execute & verify: running test automation
 
@@ -676,7 +716,7 @@ test output. Use a private repository.
 | `GET /api/sync/preview?repoId=&name=` · `POST /api/sync/load` | What loading a data branch would do / load it (`repoId`, `name`, `mode`: `merge` or `replace`, optional `sha` from the preview: refused with `409` when the branch changed since) |
 | `GET/POST /api/tasks` · `GET/DELETE /api/tasks/:id` | Tasks (`kind`: `auto`, `coding`, `testing`, `design`, `document`, `design-coding`, `review`; optional `managerModel` for Auto; `reviewTarget` (pull request number/URL or branch) and optional `peerReviewerModel` for Code review) |
 | `POST /api/tasks/:id/cancel` · `POST /api/tasks/:id/retry` · `POST /api/tasks/:id/input` | Control and answers |
-| `POST /api/tasks/:id/change-request` | Request changes to a task that is not running (`request`, optional `rounds`; optional `stage` hands it to that stage directly, otherwise the manager re-plans the task for it) |
+| `POST /api/tasks/:id/change-request` | Request changes to a task that is not running (`request`, optional `rounds`; optional `stage` hands it to that stage directly, otherwise the manager re-plans the task for it; a code review's request goes to its reviewers, `rounds` being final-review rounds) |
 | `GET /api/tasks/:id/diff?from=&to=` | Changes |
 | `POST /api/tasks/:id/push` | Push the task's work to the remote now (retry, or with automatic pushes off): the branch head of a completed task, the latest approved work of one that did not finish. `{ "rewind": true }` lets the approved work move the remote branch back from later, unapproved work of the task |
 | `GET /api/tasks/:id/pull-request` · `POST /api/tasks/:id/pull-request` | What the remote supports and what a push would deliver (`deliverable`: the commit, and for tasks that did not finish the approved stage and round, plus `remoteAhead` when the remote branch is beyond it: later work of the task, or foreign commits) / open the pull request (returns it, or the host's `createUrl`; it never rewinds the remote branch) |

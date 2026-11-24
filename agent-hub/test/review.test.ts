@@ -141,7 +141,7 @@ describe("code review tasks", () => {
       assert.ok(events.some((event) => /Code review complete: 2 comment\(s\) \(1 major, 1 minor\); both reviewers agree/.test(event.text)));
       assert.equal(task.push, undefined);
       await assert.rejects(Promise.resolve().then(() => h.runner.retry(task.id)), /This code review is finished/);
-      assert.throws(() => h.runner.requestChanges(task.id, { request: "More" }), /do not change code/);
+      assert.throws(() => h.runner.requestChanges(task.id, { request: "More", stage: "coding" }), /A code review has no stages: its reviewers revise the review/);
     } finally {
       h.cleanup();
     }
@@ -487,6 +487,267 @@ describe("code review tasks", () => {
       assert.match(first, /Pull request #7 "Add greet" by octocat \(https:\/\/github\.com\/acme\/sample\/pull\/7\)/);
       assert.match(first, /Branches: feature\/greet → main/);
       assert.match(first, /> Adds greet\(\)\./);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+describe("change requests to a code review", () => {
+  test("the lead revises a finished, published review for the request, the peer signs off, and publishing updates the pull request", async () => {
+    const host = new FakeReviewHost();
+    host.lookup.forBranch = githubPullRequest(5, { title: "Add greet" });
+    const script = agreeingReview();
+    script["lead-reviewer"].push(
+      submitFinal(
+        [
+          { id: "R1", sources: ["L1", "P1"], severity: "major", file: "greet.js", line: 2, body: "Handle a missing name: default it to 'there'." },
+          { id: "R2", sources: ["L2"], severity: "minor", file: "README.md", line: 1, body: "Add a usage example for greet() to the README." },
+          { sources: [], severity: "minor", file: "greet.js", line: 2, body: "Trim the name before greeting it." },
+        ],
+        [{ comment_id: "R3", reason: "U1: a matter of taste, as the user says" }],
+        { assessment: "One bug, a doc gap and untrimmed input.", request_responses: [{ request_id: "U1", status: "addressed", note: "Removed R3 and added R4 on trimming." }] },
+      ),
+    );
+    script["peer-reviewer"].push(submitSignoff(true));
+    const h = createHarness(script, { reviewHost: host });
+    try {
+      addRemote(h);
+      featureBranch(h, "feature/greet", { "greet.js": GREET });
+      const created = await h.runner.submit({ description: "Focus on edge cases", kind: "review", repoId: "sample", reviewTarget: "feature/greet" });
+      await h.runner.idle();
+      const id = created.id;
+      const task = h.store.getTask(id)!;
+      const review = task.review!;
+      assert.equal(task.status, "completed", String(task.error));
+
+      // The user edits R2, adds the nit the lead dropped (R3), writes their own review text and publishes.
+      h.runner.updateReviewComment(id, "R2", { body: "Add a usage example for greet() to the README." });
+      h.runner.addReviewComment(id, "P2");
+      h.runner.updateReviewSummary(id, { body: "Nice and small." });
+      assert.equal((await h.runner.publishReviewComments(id)).ok, true);
+      assert.deepEqual(
+        review.curated!.map((comment) => [comment.id, comment.published?.remoteId ?? null, comment.published?.path ?? null, comment.published?.line ?? null]),
+        [
+          ["R1", 1000, "greet.js", 2],
+          ["R2", null, null, null],
+          ["R3", 1001, "greet.js", 1],
+        ],
+      );
+
+      assert.throws(() => h.runner.requestChanges(id, { request: "x", stage: "coding" }), /A code review has no stages/);
+      h.runner.requestChanges(id, { request: "R3 is a matter of taste: remove it. Also check that greet() trims the name.", rounds: 2 });
+      assert.deepEqual([task.attempt, task.changeRequests?.[0]?.routing, task.changeRequests?.[0]?.from], [2, "reviewers", "completed"]);
+      assert.throws(() => h.runner.updateReviewComment(id, "R1", { decision: "drop" }), /The reviewers are revising the review for your change request/);
+      await h.runner.idle();
+      assert.equal(task.status, "completed", String(task.error));
+
+      // A final review for U1 (the revision) and the peer's sign-off on it.
+      assert.deepEqual(review.rounds.slice(4).map((round) => [round.n, round.phase, round.requests, round.attempt]), [
+        [5, "final", ["U1"], 2],
+        [6, "signoff", ["U1"], 2],
+      ]);
+      const leadPrompts = h.driver.prompts["lead-reviewer"]!;
+      const revisionPrompt = leadPrompts[3]!;
+      assert.match(revisionPrompt, /## The change/, "the lead's new session gets the full context");
+      assert.match(revisionPrompt, /## Round 5: revise the review for the user's change request\n/);
+      assert.match(revisionPrompt, /### Change request U1\n\n> R3 is a matter of taste: remove it\. Also check that greet\(\) trims the name\./);
+      assert.match(revisionPrompt, /- \[R2\] \(minor\) README\.md:1 \(from L2\) - Add a usage example for greet\(\) to the README\.\n {2}\[edited by the user; the reviewers had written \(minor\): "Document greet\(\) in the README\."\]/);
+      assert.match(revisionPrompt, /- \[R3\] \(nit\) greet\.js:1 \(from P2\) - Use an arrow function\.\n {2}\[added by the user from the reviewers' comment P2\]\n {2}\[on the pull request\]/);
+      assert.match(revisionPrompt, /Review text the user wrote \(published with the comments\):\n> Nice and small\./);
+      assert.match(revisionPrompt, /Account for each comment of the review the user kept, in a comment's `id` or in `dropped`: R1, R2, R3\./);
+      const signoffPrompt = h.driver.prompts["peer-reviewer"]![3]!;
+      assert.match(signoffPrompt, /## Round 6: sign off on the revised review/);
+      assert.match(signoffPrompt, /What the revision changed in the review the user had:\n- Added \[R4\] \(minor\) greet\.js:2 - Trim the name before greeting it\.\n- Changed \[R1\] \(major\) greet\.js:2 - Handle a missing name: default it to 'there'\.\n {2}before: "Handle a missing name: `'Hello ' \+ name` prints 'Hello undefined'\."\n- Removed \[R3\] \(nit\) greet\.js:1 "Use an arrow function\."/);
+      assert.match(signoffPrompt, /Answers to the user's change requests:\n- \[U1\] addressed - Removed R3 and added R4 on trimming\./);
+
+      // The working copy: R1 changed (still on the pull request), R2 kept as the user edited it, R4 new, R3 removed.
+      assert.deepEqual(
+        review.curated!.map((comment) => [comment.id, comment.decision, comment.revision?.change ?? null, comment.published?.remoteId ?? null, Boolean(comment.original)]),
+        [
+          ["R1", "keep", "revised", 1000, false],
+          ["R2", "keep", null, null, true],
+          ["R4", "keep", "added", null, false],
+          ["R3", "drop", "removed", 1001, false],
+        ],
+      );
+      assert.equal(review.curated![0]!.revision?.previous?.body, "Handle a missing name: `'Hello ' + name` prints 'Hello undefined'.");
+      assert.equal(review.curated![3]!.revision?.reason, "U1: a matter of taste, as the user says");
+      assert.equal(review.final?.assessment, "One bug, a doc gap and untrimmed input.");
+      assert.equal(review.body, "Nice and small.", "the user's own review text stays");
+      assert.deepEqual(task.changeRequests![0]!.review && { ...task.changeRequests![0]!.review, at: "" }, {
+        round: 5,
+        status: "addressed",
+        note: "Removed R3 and added R4 on trimming.",
+        changes: { added: ["R4"], revised: ["R1"], removed: ["R3"] },
+        agreed: true,
+        at: "",
+      });
+      assert.deepEqual([task.result?.approved, task.result?.openComments], [true, 3]);
+      const comm = h.store.recentComm({ taskId: id, limit: 1000 }).map((entry) => entry.text);
+      assert.ok(comm.some((text) => text.startsWith("Change request U1 for the review: R3 is a matter of taste")));
+      assert.ok(comm.some((text) => text.startsWith("Completed: revised the code review for U1 (1 added, 1 changed, 1 removed); 3 comment(s) to publish (both reviewers agree)")));
+      const events = await h.store.readEvents(id);
+      assert.ok(events.some((event) => event.text.startsWith("Revised the code review for U1: 1 added (R4), 1 changed (R1), 1 removed (R3); 3 comment(s) to publish; both reviewers agree")));
+
+      // Publishing brings the pull request up to date: R1 edited in place, R3 deleted, R4 added.
+      const status = await h.runner.reviewPublishStatus(id);
+      assert.equal(status.pending, 3);
+      const outcome = await h.runner.publishReviewComments(id);
+      assert.equal(outcome.ok, true, outcome.message);
+      assert.match(outcome.message, /Updated the review on pull request #5: 1 added, 1 edited, 1 deleted$/);
+      assert.deepEqual(host.callsOf("updateComment"), [{ commentId: 1000, body: "**Major:** Handle a missing name: default it to 'there'." }]);
+      assert.deepEqual(host.callsOf("deleteComment"), [{ commentId: 1001 }]);
+      assert.deepEqual((host.callsOf("createReview")[1] as { comments: unknown[] }).comments, [{ path: "greet.js", line: 2, body: "**Minor:** Trim the name before greeting it." }]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a revision that fails leaves the review as it was; retry resumes the sign-off without revising again", async () => {
+    const crash: Step = () => {
+      throw new Error("Session disconnected while waiting for a response");
+    };
+    const script = agreeingReview();
+    script["lead-reviewer"].push(
+      submitFinal(
+        [
+          { id: "R1", sources: ["L1", "P1"], severity: "major", file: "greet.js", line: 2, body: "Handle a missing name." },
+          { id: "R2", sources: ["L2"], severity: "minor", file: "README.md", line: 1, body: "Document greet() in the README." },
+        ],
+        [],
+        { request_responses: [{ request_id: "U1", status: "addressed", note: "Shortened R1." }] },
+      ),
+    );
+    script["peer-reviewer"].push(crash, crash, crash, crash, submitSignoff(true));
+    const h = createHarness(script);
+    try {
+      featureBranch(h, "feature/greet", { "greet.js": GREET });
+      const created = await h.runner.submit({ description: "", kind: "review", repoId: "sample", reviewTarget: "feature/greet" });
+      await h.runner.idle();
+      const id = created.id;
+      const task = h.store.getTask(id)!;
+      const before = structuredClone(task.review!.curated!);
+      const finalBefore = task.review!.final;
+
+      h.runner.requestChanges(id, { request: "Shorten R1." });
+      await h.runner.idle();
+      assert.equal(task.status, "failed");
+      // The finished review is unchanged - and still the user's to curate and publish.
+      assert.deepEqual(task.review!.curated, before);
+      assert.equal(task.review!.final, finalBefore);
+      h.runner.updateReviewComment(id, "R2", { decision: "drop" });
+      assert.match(h.runner.reviewAsMarkdown(id).markdown, /### Comments \(1\)/);
+      // Back as it was: the review is again the one the lead revised, so its revision stands.
+      h.runner.updateReviewComment(id, "R2", { decision: "keep" });
+
+      h.runner.retry(id);
+      await h.runner.idle();
+      assert.equal(task.status, "completed", String(task.error));
+      assert.equal(h.driver.prompts["lead-reviewer"]!.length, 4, "the lead's revision was not written again");
+      assert.deepEqual(task.review!.rounds.slice(4).map((round) => [round.phase, round.requests, round.entries.length]), [
+        ["final", ["U1"], 1],
+        ["signoff", ["U1"], 1],
+      ]);
+      assert.deepEqual(
+        task.review!.curated!.map((comment) => [comment.id, comment.decision, comment.revision?.change ?? null]),
+        [
+          ["R1", "keep", "revised"],
+          ["R2", "keep", null],
+        ],
+      );
+      assert.deepEqual([task.changeRequests![0]!.attempt, task.changeRequests![0]!.review?.status, task.changeRequests![0]!.review?.changes], [
+        3,
+        "addressed",
+        { added: [], revised: ["R1"], removed: [] },
+      ]);
+
+      // The hub stopped right after merging the revision, before the task was saved as completed: resuming it does not merge it again.
+      const merged = structuredClone(task.review!.curated);
+      const outcome = structuredClone(task.changeRequests![0]!.review);
+      const peerPrompts = h.driver.prompts["peer-reviewer"]!.length;
+      task.status = "running";
+      const restarted = h.newRunner();
+      restarted.init();
+      restarted.pump();
+      await restarted.idle();
+      await restarted.shutdown();
+      assert.equal(task.status, "completed", String(task.error));
+      assert.deepEqual([h.driver.prompts["lead-reviewer"]!.length, h.driver.prompts["peer-reviewer"]!.length], [4, peerPrompts]);
+      assert.deepEqual(task.review!.curated, merged);
+      assert.deepEqual(task.changeRequests![0]!.review, outcome);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  test("a revision that stopped is written again when the user changed the review meanwhile", async () => {
+    const crash: Step = () => {
+      throw new Error("Session disconnected while waiting for a response");
+    };
+    const answer = { request_responses: [{ request_id: "U1", status: "addressed", note: "Shortened R1." }] };
+    const script = agreeingReview();
+    script["lead-reviewer"].push(
+      // From the review as it was when the user asked.
+      submitFinal(
+        [
+          { id: "R1", sources: ["L1", "P1"], severity: "major", file: "greet.js", line: 2, body: "Handle a missing name." },
+          { id: "R2", sources: ["L2"], severity: "minor", file: "README.md", line: 1, body: "Document greet() in the README." },
+        ],
+        [],
+        answer,
+      ),
+      // Again, from the review as the user changed it: R2 as they edited it, and the comment they added (R3).
+      submitFinal(
+        [
+          { id: "R1", sources: ["L1", "P1"], severity: "major", file: "greet.js", line: 2, body: "Handle a missing name." },
+          { id: "R2", sources: ["L2"], severity: "minor", file: "README.md", line: 1, body: "Document greet() with an example." },
+          { id: "R3", sources: ["P2"], severity: "nit", file: "greet.js", line: 1, body: "Use an arrow function." },
+        ],
+        [],
+        answer,
+      ),
+    );
+    script["peer-reviewer"].push(crash, crash, crash, crash, submitSignoff(true));
+    const h = createHarness(script);
+    try {
+      featureBranch(h, "feature/greet", { "greet.js": GREET });
+      const created = await h.runner.submit({ description: "", kind: "review", repoId: "sample", reviewTarget: "feature/greet" });
+      await h.runner.idle();
+      const id = created.id;
+      const task = h.store.getTask(id)!;
+      h.runner.requestChanges(id, { request: "Shorten R1." });
+      await h.runner.idle();
+      assert.equal(task.status, "failed");
+
+      h.runner.updateReviewComment(id, "R2", { body: "Document greet() with an example." });
+      h.runner.addReviewComment(id, "P2");
+      h.runner.retry(id);
+      await h.runner.idle();
+      assert.equal(task.status, "completed", String(task.error));
+      const leadPrompts = h.driver.prompts["lead-reviewer"]!;
+      assert.equal(leadPrompts.length, 5, "the lead revised the review again");
+      assert.match(leadPrompts[4]!, /## Round 6: revise the review for the user's change request\n/);
+      assert.match(leadPrompts[4]!, /- \[R2\] \(minor\) README\.md:1 \(from L2\) - Document greet\(\) with an example\.\n {2}\[edited by the user/);
+      assert.match(leadPrompts[4]!, /- \[R3\] \(nit\) greet\.js:1 \(from P2\) - Use an arrow function\.\n {2}\[added by the user/);
+      assert.deepEqual(task.review!.rounds.slice(4).map((round) => [round.n, round.phase, round.requests, round.entries.length]), [
+        [5, "final", ["U1"], 1],
+        [6, "final", ["U1"], 1],
+        [7, "signoff", ["U1"], 1],
+      ]);
+      // The user's edit and comment stand; only what the request asked for changed.
+      assert.deepEqual(
+        task.review!.curated!.map((comment) => [comment.id, comment.decision, comment.revision?.change ?? null, comment.body]),
+        [
+          ["R1", "keep", "revised", "Handle a missing name."],
+          ["R2", "keep", null, "Document greet() with an example."],
+          ["R3", "keep", null, "Use an arrow function."],
+        ],
+      );
+      assert.ok(task.review!.curated![1]!.original, "R2 is still the user's edit");
+      assert.deepEqual([task.changeRequests![0]!.review?.round, task.changeRequests![0]!.review?.changes], [6, { added: [], revised: ["R1"], removed: [] }]);
+      const events = await h.store.readEvents(id);
+      assert.ok(events.some((event) => event.text.startsWith("The user changed the review since the lead reviewer revised it for U1")));
     } finally {
       h.cleanup();
     }

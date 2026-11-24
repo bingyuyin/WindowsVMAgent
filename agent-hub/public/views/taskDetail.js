@@ -112,6 +112,33 @@ function describeChangePlan(request) {
   if (plan.kind) parts.push(`the task became ${KIND_LABELS[plan.kind.to]}`);
   return parts.join("; ") || "the remaining stages continue";
 }
+
+/** "1 added (R4) · 1 changed (R1) · 1 removed (R3)": what a revision of a code review changed. */
+function describeChanges(changes) {
+  if (!changes) return "";
+  const parts = [
+    ["added", changes.added],
+    ["changed", changes.revised],
+    ["removed", changes.removed],
+  ]
+    .filter(([, ids]) => ids.length)
+    .map(([verb, ids]) => `${ids.length} ${verb} (${ids.join(", ")})`);
+  return parts.length ? parts.join(" · ") : "no comment changed";
+}
+
+/** The change requests the latest revision of a code review handled (they share its final-review round), and its outcome. */
+function latestRevision(task) {
+  const revised = (task.changeRequests ?? []).filter((request) => request.review?.changes);
+  const last = revised.at(-1);
+  if (!last) return null;
+  return { requests: revised.filter((request) => request.review.round === last.review.round), outcome: last.review };
+}
+
+/** The same change requests (IDs), in any order. */
+const sameIds = (a = [], b = []) => a.length === b.length && a.every((value) => b.includes(value));
+/** "Request", or "Requests (3)" with the change requests made after it. */
+const requestsTabLabel = (task) => (task.changeRequests?.length ? `Requests (${task.changeRequests.length + 1})` : "Request");
+const REVISION_LABELS = { added: "new", revised: "changed", removed: "removed" };
 const roundsTabLabel = (task) => (task.stages.length && task.stages.every((stage) => stage.kind === "testing") ? "Test runs" : "Rounds");
 const EVENT_ICONS = {
   status: "●",
@@ -197,7 +224,6 @@ export function taskDetailView(root, { params }) {
 
   const titleBox = h("div", { class: "detail-title-row" });
   const metaBox = h("div", { class: "meta-grid" });
-  const requestBox = h("details", { class: "request card" });
   const heroBox = h("div");
   const heroElapsed = h("span", { class: "muted small mono" });
   const inputBox = h("div");
@@ -229,7 +255,6 @@ export function taskDetailView(root, { params }) {
     agentsBox,
     pipelineBox,
     liveBox,
-    requestBox,
     tabsBar,
     tabBody,
   );
@@ -257,7 +282,6 @@ export function taskDetailView(root, { params }) {
       if (disposed) return;
       task = data.task;
       for (const event of data.events) acceptEvent(event, false);
-      setContent(requestBox, h("summary", {}, "Request"), renderMarkdown(task.description));
       renderAll();
       connect();
     } catch (error) {
@@ -465,10 +489,23 @@ export function taskDetailView(root, { params }) {
     if (!review && task.status === "completed" && task.result && !task.result.approved) {
       actions.push(h("button", { class: "btn btn-primary", title: continueTitle(task), onclick: () => retryTask(true) }, continueLabel(task)));
     }
-    if (!review && !RUNNING.includes(task.status)) {
-      actions.push(h("button", { class: "btn", title: "Ask for changes: the manager re-evaluates the task and assigns the teams to handle them", onclick: requestChanges }, "✎ Request changes"));
+    if (!RUNNING.includes(task.status)) {
+      actions.push(
+        h(
+          "button",
+          {
+            class: "btn",
+            title: review
+              ? "Ask the reviewers to change the review: the lead reviewer revises it, the peer reviewer checks the revision"
+              : "Ask for changes: the manager re-evaluates the task and assigns the teams to handle them",
+            onclick: requestChanges,
+          },
+          "✎ Request changes",
+        ),
+      );
     }
     if (!ACTIVE.includes(task.status)) actions.push(h("button", { class: "btn btn-ghost-danger", onclick: deleteTask }, "Delete"));
+    const changes = task.changeRequests?.length ?? 0;
     setContent(
       titleBox,
       h(
@@ -483,6 +520,11 @@ export function taskDetailView(root, { params }) {
           task.todoId ? h("a", { class: "chip chip-info-soft", href: "#/todos", title: "This task was sent from the to-do list" }, `from to-do ${task.todoId}`) : null,
         ),
         h("h1", { class: "detail-title" }, task.title),
+        h(
+          "button",
+          { class: "btn-link requests-link", title: "What you asked for: the original request and every change request after it", onclick: () => selectTab("requests") },
+          changes ? `📝 Original request and ${changes} change request${changes === 1 ? "" : "s"}` : "📝 Original request",
+        ),
       ),
       h("div", { class: "detail-actions" }, actions),
     );
@@ -562,7 +604,17 @@ export function taskDetailView(root, { params }) {
           "div",
           { class: "hero-request" },
           h("span", { class: "mono comment-id" }, activeRequest.id),
-          h("span", { class: "muted" }, ` Your change request (${activeRequest.stage && !activeRequest.pending ? `${STAGE_LABELS[activeRequest.stage]} stage` : "the manager decides who handles it"}): `),
+          h(
+            "span",
+            { class: "muted" },
+            ` Your change request (${
+              activeRequest.routing === "reviewers"
+                ? "the reviewers revise the review"
+                : activeRequest.stage && !activeRequest.pending
+                  ? `${STAGE_LABELS[activeRequest.stage]} stage`
+                  : "the manager decides who handles it"
+            }): `,
+          ),
           `“${excerpt(activeRequest.text, 240)}”`,
         )
       : null;
@@ -704,6 +756,7 @@ export function taskDetailView(root, { params }) {
       renderDelivery();
       return;
     }
+    const review = isCodeReviewTask(task);
     if (status === "failed") {
       setContent(
         heroBox,
@@ -712,21 +765,50 @@ export function taskDetailView(root, { params }) {
           { class: "callout callout-danger" },
           h("strong", {}, "Failed: "),
           task.error ?? "unknown error",
-          h("div", { class: "muted small" }, "Retry resumes from the last completed step; the agents' branches and worktrees are kept. Or request changes: the manager re-evaluates the task for them."),
+          h(
+            "div",
+            { class: "muted small" },
+            review ? reviewStoppedNote() : "Retry resumes from the last completed step; the agents' branches and worktrees are kept. Or request changes: the manager re-evaluates the task for them.",
+          ),
           stoppedActions(),
         ),
         stoppedDelivery(),
       );
       renderDelivery();
     } else if (status === "interrupted") {
-      setContent(heroBox, h("div", { class: "callout callout-warning" }, "The hub stopped while this task was running. Retry resumes from the last completed step.", stoppedActions()), stoppedDelivery());
+      setContent(
+        heroBox,
+        h(
+          "div",
+          { class: "callout callout-warning" },
+          review ? ["The hub stopped while the reviewers were working. ", h("div", { class: "muted small" }, reviewStoppedNote())] : "The hub stopped while this task was running. Retry resumes from the last completed step.",
+          stoppedActions(),
+        ),
+        stoppedDelivery(),
+      );
       renderDelivery();
     } else if (status === "cancelled") {
-      setContent(heroBox, h("div", { class: "callout" }, "Cancelled. Work committed so far stays on the task branch; Retry resumes from the last completed step.", stoppedActions()), stoppedDelivery());
+      setContent(
+        heroBox,
+        h(
+          "div",
+          { class: "callout" },
+          review ? ["Cancelled. ", h("div", { class: "muted small" }, reviewStoppedNote())] : "Cancelled. Work committed so far stays on the task branch; Retry resumes from the last completed step.",
+          stoppedActions(),
+        ),
+        stoppedDelivery(),
+      );
       renderDelivery();
     } else {
       setContent(heroBox);
     }
+  }
+
+  /** What a code review that stopped can do next; a review finished before stays the user's to publish. */
+  function reviewStoppedNote() {
+    return task.review?.curated
+      ? "Retry resumes the revision from its last completed step, or request changes: the reviewers revise the review for them. Until then the review stays as it was - curate and publish it in the Review tab."
+      : "Retry resumes the review from its last completed step, or request changes: the reviewers take them into account as they finish the review.";
   }
 
   /** A task that did not finish can still deliver its approved work: push it, or open a (draft) pull request with it. */
@@ -737,11 +819,21 @@ export function taskDetailView(root, { params }) {
 
   /** Retry, or ask for changes, on a task that stopped before it finished. */
   function stoppedActions() {
+    const review = isCodeReviewTask(task);
     return h(
       "div",
       { class: "row wrap hero-actions" },
       h("button", { class: "btn btn-sm btn-primary", onclick: () => retryTask(false) }, "Retry"),
-      isCodeReviewTask(task) ? null : h("button", { class: "btn btn-sm", title: "The manager re-evaluates the task and assigns the teams to handle your changes", onclick: requestChanges }, "✎ Request changes"),
+      h(
+        "button",
+        {
+          class: "btn btn-sm",
+          title: review ? "The reviewers revise the review for your request" : "The manager re-evaluates the task and assigns the teams to handle your changes",
+          onclick: requestChanges,
+        },
+        "✎ Request changes",
+      ),
+      review && task.review?.curated ? h("button", { class: "btn btn-sm", onclick: () => selectTab("review") }, "Review & publish the comments") : null,
     );
   }
 
@@ -762,6 +854,10 @@ export function taskDetailView(root, { params }) {
         : signoff
           ? chip(`The peer reviewer objects to ${signoff.objections.length} item(s)`, "warning")
           : null;
+    // The latest revision for the user's change requests, and whether the pull request shows it yet.
+    const revision = latestRevision(task);
+    const revisedIds = revision?.requests.map((request) => request.id).join(", ");
+    const unpublished = Boolean(revision && main && revision.outcome.at > (review.lastPublish?.at ?? main.updatedAt ?? main.at));
     setContent(
       heroBox,
       h(
@@ -771,7 +867,11 @@ export function taskDetailView(root, { params }) {
         h(
           "div",
           { class: "hero-title" },
-          main ? `✓ Review published on ${pr ? `pull request #${pr.number}` : "the pull request"}` : `Code review ready: ${kept.length} comment${kept.length === 1 ? "" : "s"} to publish`,
+          unpublished
+            ? `Review revised for ${revisedIds}: publish the updates to ${pr ? `pull request #${pr.number}` : "the pull request"}`
+            : main
+              ? `✓ Review published on ${pr ? `pull request #${pr.number}` : "the pull request"}`
+              : `Code review ready: ${kept.length} comment${kept.length === 1 ? "" : "s"} to publish`,
         ),
         h(
           "div",
@@ -782,6 +882,15 @@ export function taskDetailView(root, { params }) {
           review.shortStat ? h("span", {}, review.shortStat) : null,
           main?.url ? h("a", { href: main.url, target: "_blank", rel: "noopener noreferrer" }, "View on the pull request ↗") : null,
         ),
+        revision
+          ? h(
+              "div",
+              { class: "hero-request" },
+              h("span", { class: "mono comment-id" }, revisedIds),
+              h("span", { class: "muted" }, ` Revised for your change request${revision.requests.length === 1 ? "" : "s"}: `),
+              describeChanges(revision.outcome.changes),
+            )
+          : null,
         final?.changeSummary ? h("div", { class: "hero-summary" }, h("div", { class: "label" }, "What the change does"), renderMarkdown(final.changeSummary)) : null,
         h(
           "div",
@@ -789,6 +898,11 @@ export function taskDetailView(root, { params }) {
           h("button", { class: "btn btn-sm btn-primary", onclick: () => selectTab("review") }, main ? "Review & update the comments" : "Review & publish the comments"),
           h("button", { class: "btn btn-sm", onclick: () => selectTab("discussion") }, "Reviewers' discussion"),
           h("button", { class: "btn btn-sm", onclick: () => selectTab("changes") }, "View changes"),
+          h(
+            "button",
+            { class: "btn btn-sm", title: "Ask the reviewers to change the review: the lead reviewer revises it, the peer reviewer checks the revision", onclick: requestChanges },
+            "✎ Request changes",
+          ),
         ),
       ),
     );
@@ -1238,7 +1352,7 @@ export function taskDetailView(root, { params }) {
       task.status,
       task.phase,
       task.currentRound,
-      review?.rounds.map((round) => [round.phase, round.entries.map((entry) => [entry.role, entry.signoff?.agreed, entry.final?.comments.length, entry.comments?.length])]),
+      review?.rounds.map((round) => [round.phase, round.requests, round.entries.map((entry) => [entry.role, entry.signoff?.agreed, entry.final?.comments.length, entry.comments?.length])]),
       published,
       kept,
     ]);
@@ -1271,7 +1385,7 @@ export function taskDetailView(root, { params }) {
       h(
         "div",
         { class: `round-node ${running && task.currentRound === round.n ? "current" : ""}` },
-        h("div", { class: "rn-title" }, `Round ${round.n} · ${REVIEW_PHASE_TITLES[round.phase]}`),
+        h("div", { class: "rn-title" }, `Round ${round.n} · ${REVIEW_PHASE_TITLES[round.phase]}${round.requests?.length ? ` · ${round.requests.join(", ")}` : ""}`),
         h("div", { class: "rn-steps" }, rolesIn(round.phase).map((role) => step(round, role))),
       ),
     );
@@ -1349,12 +1463,14 @@ export function taskDetailView(root, { params }) {
         ? [
             ["review", "Review"],
             ["discussion", "Discussion"],
+            ["requests", requestsTabLabel(task)],
             ["changes", "Changes"],
             ["timeline", "Timeline"],
             ["context", "Context"],
           ]
         : [
             ["conversation", roundsTabLabel(task)],
+            ["requests", requestsTabLabel(task)],
             ["timeline", "Timeline"],
             docStage ? ["document", documentCount > 1 ? `Documents (${documentCount})` : docStage.kind === "document" ? "Document" : "Design doc"] : null,
             ["changes", "Changes"],
@@ -1398,11 +1514,68 @@ export function taskDetailView(root, { params }) {
       result: renderResult,
       review: renderReview,
       discussion: renderDiscussion,
+      requests: renderRequests,
     };
     renderers[activeTab]?.(force);
   }
 
   // ---- tabs ------------------------------------------------------------------------------
+
+  /** What the user asked for: the original request, then every change request after it with how it was handled. */
+  function renderRequests(force) {
+    const requests = task.changeRequests ?? [];
+    // How the stages' agents answered the requests (stage requests), kept small: tasks update often while they run.
+    const answers = task.stages.map((stage) => [
+      stage.kind,
+      stage.status,
+      stage.rounds.flatMap((round) => (round.review?.comments ?? []).filter((comment) => /^U\d+$/.test(comment.id)).map((comment) => [round.n, comment.id, comment.status, comment.response])),
+    ]);
+    const signature = JSON.stringify([task.title, task.description, task.kind, task.status, task.attempt, task.review?.target?.input, requests, answers]);
+    if (!force && signatures.requests === signature) return;
+    signatures.requests = signature;
+    const canRequest = !RUNNING.includes(task.status);
+    const target = task.review?.target;
+    const review = isCodeReviewTask(task);
+    setContent(
+      tabBody,
+      h(
+        "section",
+        { class: "card request-card" },
+        h(
+          "div",
+          { class: "comment-head" },
+          h("strong", {}, "Original request"),
+          chip(KIND_LABELS[task.kind], "outline"),
+          h("span", { class: "muted small", title: task.createdAt }, `created ${relTime(task.createdAt)}`),
+          task.todoId ? h("a", { class: "chip chip-info-soft", href: "#/todos", title: "This task was sent from the to-do list" }, `from to-do ${task.todoId}`) : null,
+          h("span", { class: "spacer" }),
+          task.description.trim() ? h("button", { class: "btn btn-xs btn-ghost", type: "button", title: "Copy the request", onclick: () => copyText(task.description) }, "Copy") : null,
+        ),
+        target ? h("div", { class: "small request-target" }, h("span", { class: "muted" }, "Asked to review: "), h("span", { class: "mono" }, target.input)) : null,
+        task.description.trim() ? renderMarkdown(task.description) : h("p", { class: "muted" }, "(no description)"),
+      ),
+      h(
+        "section",
+        { class: "card" },
+        h(
+          "div",
+          { class: "row between wrap" },
+          h("h3", {}, requests.length ? `Change requests (${requests.length})` : "Change requests"),
+          canRequest ? h("button", { class: "btn btn-sm", onclick: requestChanges }, "✎ Request changes") : null,
+        ),
+        requests.length
+          ? h("div", { class: "change-requests" }, requests.map(changeRequestRow))
+          : h(
+              "p",
+              { class: "muted small" },
+              review
+                ? "None yet. Ask the reviewers to change the review whenever it is not running: the lead reviewer revises it, the peer reviewer checks the revision."
+                : "None yet. Ask for changes whenever the task is not running: the manager re-evaluates the task and assigns the teams to handle them.",
+            ),
+        canRequest ? null : h("p", { class: "muted small" }, "You can request changes once the task stops or finishes."),
+      ),
+    );
+  }
 
   function renderContext(force) {
     const context = task.context;
@@ -1683,6 +1856,8 @@ export function taskDetailView(root, { params }) {
     const review = task.review;
     const signature = JSON.stringify([
       task.status,
+      task.attempt,
+      task.changeRequests,
       review?.final,
       review?.curated,
       review?.body,
@@ -1760,7 +1935,18 @@ export function taskDetailView(root, { params }) {
               { class: "callout callout-warning small" },
               h("strong", {}, review.signoff.fallback ? "The peer reviewer did not sign off. " : "The peer reviewer still objects: "),
               review.signoff.summary,
-              review.signoff.objections.length ? h("div", { class: "muted" }, "Its objections are shown on the comments they concern; you decide.") : null,
+              generalObjections(review).length
+                ? h(
+                    "ul",
+                    { class: "objection-list" },
+                    generalObjections(review).map((objection) =>
+                      h("li", {}, objection.commentId ? [h("span", { class: "mono comment-id" }, objection.commentId), " "] : null, objection.issue),
+                    ),
+                  )
+                : null,
+              review.signoff.objections.some((objection) => objection.commentId && !/^U\d+$/.test(objection.commentId))
+                ? h("div", { class: "muted" }, "Its objections to comments are shown on the comments they concern; you decide.")
+                : null,
             )
         : null,
     );
@@ -1776,7 +1962,66 @@ export function taskDetailView(root, { params }) {
       h("p", { class: "muted small" }, "Keep, drop or edit each comment. Publishing posts the comments as they are now; after publishing, edits and drops are applied to the pull request the next time you publish."),
       curated.length ? curated.map(curatedCard) : h("div", { class: "empty card muted" }, "The reviewers found nothing to comment on."),
     );
-    setContent(tabBody, summaryCard, commentsSection, leftOutSection(), publishCard());
+    setContent(tabBody, reviewStateNote(), revisionNote(), summaryCard, commentsSection, leftOutSection(), publishCard());
+  }
+
+  /** The peer reviewer's objections to the review as a whole or to how it handles a change request (U#). */
+  function generalObjections(review) {
+    return review.signoff && !review.signoff.agreed ? review.signoff.objections.filter((objection) => !objection.commentId || /^U\d+$/.test(objection.commentId)) : [];
+  }
+
+  /** The change requests the reviewers are working on (or that stopped before they finished). */
+  function openReviewRequests() {
+    return (task.changeRequests ?? []).filter((request) => request.attempt === task.attempt && !request.review);
+  }
+
+  /** While the reviewers revise the review, it is shown as it was and cannot be edited; a revision that stopped leaves it so. */
+  function reviewStateNote() {
+    const open = openReviewRequests().map((request) => request.id).join(", ");
+    if (ACTIVE.includes(task.status)) {
+      return h(
+        "div",
+        { class: "callout callout-info" },
+        h("strong", {}, open ? `The reviewers are revising the review for your change request ${open}. ` : "The reviewers are revising the review. "),
+        "Below is the review as it was: you can edit and publish it again once they finish. Follow them in the Discussion tab.",
+      );
+    }
+    if (["failed", "cancelled", "interrupted"].includes(task.status) && open) {
+      return h(
+        "div",
+        { class: "callout callout-warning" },
+        h("strong", {}, `The revision for ${open} did not finish (${task.status}). `),
+        "The review below is as it was before: you can still curate and publish it, or Retry the revision.",
+      );
+    }
+    return null;
+  }
+
+  /** What the latest revision for the user's change requests did to the review, and the lead reviewer's answers. */
+  function revisionNote() {
+    const revision = latestRevision(task);
+    if (!revision || ACTIVE.includes(task.status)) return null;
+    const { requests, outcome } = revision;
+    return h(
+      "div",
+      { class: `callout small revision-note ${outcome.agreed ? "callout-success" : "callout-warning"}` },
+      h(
+        "div",
+        {},
+        h("strong", {}, `Revised for your change request${requests.length === 1 ? "" : "s"} ${requests.map((request) => request.id).join(", ")}`),
+        h("span", { class: "muted" }, ` · ${relTime(outcome.at)} · ${describeChanges(outcome.changes)}`),
+      ),
+      requests.map((request) =>
+        h(
+          "div",
+          { class: "response" },
+          h("span", { class: "mono comment-id" }, request.id),
+          request.review.status ? chip(request.review.status, request.review.status === "declined" ? "warning" : "success") : null,
+          h("span", {}, request.review.note ? `${ROLE_LABELS["lead-reviewer"]}: ${request.review.note}` : `${ROLE_LABELS["lead-reviewer"]} gave no answer`),
+        ),
+      ),
+      h("div", { class: "muted" }, outcome.agreed ? "The peer reviewer agrees with the revised review." : "The peer reviewer does not agree with every part of the revised review; see below."),
+    );
   }
 
   function sourcesLabel(sources) {
@@ -1790,15 +2035,20 @@ export function taskDetailView(root, { params }) {
 
   function curatedStatus(comment) {
     if (comment.decision === "drop") return comment.published?.inline ? ["Dropped · deleted from the PR on publish", "danger"] : ["Dropped", "neutral"];
-    if (comment.published) return comment.published.body !== publishedText(comment) ? ["Edited since publishing", "warning"] : ["Published", "success"];
+    const published = comment.published;
+    if (published?.inline && published.path !== undefined && (published.path !== comment.file || published.line !== comment.line)) return ["Moved since publishing", "warning"];
+    if (published) return published.body !== publishedText(comment) ? ["Edited since publishing", "warning"] : ["Published", "success"];
     return comment.original ? ["Edited · keep", "info"] : ["Keep", "success"];
   }
 
-  /** One comment of the final review, with keep/drop and edit controls. */
+  /** One comment of the final review, with keep/drop and edit controls (locked while the reviewers revise the review). */
   function curatedCard(comment) {
     const draft = commentDrafts.get(comment.id);
     const dropped = comment.decision === "drop";
+    const locked = ACTIVE.includes(task.status);
     const location = comment.file ? (comment.line ? `${comment.file}:${comment.line}` : comment.file) : null;
+    const revision = comment.revision;
+    const requestIds = revision?.requests.join(", ");
     const head = h(
       "div",
       { class: "comment-head" },
@@ -1807,6 +2057,13 @@ export function taskDetailView(root, { params }) {
       location ? h("span", { class: "mono small break" }, location) : h("span", { class: "muted small" }, "general"),
       chip(sourcesLabel(comment.sources), "outline", comment.sources.length ? `Reviewer comments: ${comment.sources.join(", ")}` : undefined),
       comment.addedByUser ? chip("added by you", "info") : null,
+      revision
+        ? chip(
+            `${revision.restored ? "back" : REVISION_LABELS[revision.change]} for ${requestIds}`,
+            revision.change === "removed" ? "neutral" : "info",
+            revision.restored ? "An earlier revision had removed this comment; the latest one brought it back" : "What the latest revision for your change request did to this comment",
+          )
+        : null,
       h("span", { class: "spacer" }),
       chip(...curatedStatus(comment)),
     );
@@ -1836,18 +2093,31 @@ export function taskDetailView(root, { params }) {
         "button",
         {
           class: `seg-item ${comment.decision === value ? "active" : ""}`,
-          disabled: reviewBusy,
+          disabled: reviewBusy || locked,
           "aria-pressed": String(comment.decision === value),
           onclick: () => comment.decision !== value && reviewRequest(() => patch(commentUrl(comment.id), { decision: value })),
         },
         label,
       );
+    const previous = revision?.change === "revised" ? revision.previous : undefined;
+    const previousLocation = previous?.file ? (previous.line ? `${previous.file}:${previous.line}` : previous.file) : null;
     return h(
       "div",
       { class: `comment review-comment sev-${comment.severity} ${dropped ? "is-dropped" : ""}` },
       head,
       renderMarkdown(comment.body),
       comment.objection ? h("div", { class: "callout callout-warning small" }, h("strong", {}, "Peer reviewer objects: "), comment.objection) : null,
+      previous
+        ? h(
+            "details",
+            { class: "sub-block" },
+            h("summary", { class: "label" }, `Before ${requestIds} (${previous.severity}${previousLocation !== location ? ` · ${previousLocation ?? "general"}` : ""})`),
+            renderMarkdown(previous.body),
+          )
+        : null,
+      revision?.change === "removed"
+        ? h("div", { class: "muted small" }, `The revision for ${requestIds} removed it${revision.reason ? ` (${revision.reason})` : ""}. Keep it to put it back.`)
+        : null,
       comment.original
         ? h("details", { class: "sub-block" }, h("summary", { class: "label" }, `The reviewers' version (${comment.original.severity})`), renderMarkdown(comment.original.body))
         : null,
@@ -1855,8 +2125,10 @@ export function taskDetailView(root, { params }) {
         "div",
         { class: "row wrap comment-actions" },
         h("div", { class: "seg seg-sm", role: "group", "aria-label": `Keep or drop ${comment.id}` }, decision("keep", "Keep"), decision("drop", "Drop")),
-        h("button", { class: "btn btn-sm", disabled: reviewBusy, onclick: () => startEdit(comment) }, "✎ Update"),
-        comment.original ? h("button", { class: "btn btn-sm btn-ghost", disabled: reviewBusy, onclick: () => reviewRequest(() => patch(commentUrl(comment.id), { revert: true })) }, "Undo edit") : null,
+        h("button", { class: "btn btn-sm", disabled: reviewBusy || locked, onclick: () => startEdit(comment) }, "✎ Update"),
+        comment.original
+          ? h("button", { class: "btn btn-sm btn-ghost", disabled: reviewBusy || locked, onclick: () => reviewRequest(() => patch(commentUrl(comment.id), { revert: true })) }, "Undo edit")
+          : null,
         h("span", { class: "spacer" }),
         comment.published
           ? comment.published.inline
@@ -1931,9 +2203,15 @@ export function taskDetailView(root, { params }) {
       h("summary", {}, `Left out of the final review (${leftOut.length})${disputed ? ` · the peer reviewer wants ${disputed} back` : ""}`),
       h("p", { class: "muted small" }, "Comments a reviewer raised that the final review does not include. Add one back if you think it belongs in the review."),
       leftOut.map((comment) => {
+        // Why it is out: the latest final review (or revision) that dropped it says.
+        const droppedReason = [...review.rounds]
+          .reverse()
+          .flatMap((round) => (round.phase === "final" ? round.entries : []))
+          .map((entry) => entry.final?.dropped.find((item) => item.commentId === comment.id)?.reason)
+          .find(Boolean);
         const reason = comment.withdrawn
           ? `Withdrawn by the ${comment.id.startsWith("L") ? "lead" : "peer"} reviewer: ${comment.withdrawn.note}`
-          : (review.final?.dropped.find((entry) => entry.commentId === comment.id)?.reason ?? "Not included in the final review.");
+          : (droppedReason ?? "Not included in the final review.");
         const objection = objections.filter((entry) => entry.commentId === comment.id).map((entry) => entry.issue).join(" ");
         return h(
           "div",
@@ -1948,7 +2226,11 @@ export function taskDetailView(root, { params }) {
             h("span", { class: "spacer" }),
             h(
               "button",
-              { class: "btn btn-xs", disabled: reviewBusy, onclick: () => reviewRequest(() => post(`/api/tasks/${encodeURIComponent(task.id)}/review/comments`, { from: comment.id })) },
+              {
+                class: "btn btn-xs",
+                disabled: reviewBusy || ACTIVE.includes(task.status),
+                onclick: () => reviewRequest(() => post(`/api/tasks/${encodeURIComponent(task.id)}/review/comments`, { from: comment.id })),
+              },
               "+ Add to review",
             ),
           ),
@@ -1962,7 +2244,7 @@ export function taskDetailView(root, { params }) {
 
   function refreshPublishInfo() {
     const review = task.review;
-    const key = JSON.stringify([task.id, review?.curated, review?.body, review?.publications]);
+    const key = JSON.stringify([task.id, ACTIVE.includes(task.status), review?.curated, review?.body, review?.publications]);
     if (publishInfoKey === key) return;
     publishInfoKey = key;
     get(`/api/tasks/${encodeURIComponent(task.id)}/review/publish`)
@@ -1982,19 +2264,22 @@ export function taskDetailView(root, { params }) {
     const info = publishInfo;
     const prName = pr ? `${pr.provider === "gitlab" ? "merge request !" : "pull request #"}${pr.number}` : "the pull request";
     const publishButton = h("button", { class: "btn btn-primary", onclick: publishComments });
+    const locked = ACTIVE.includes(task.status);
     // Typing in the review text must not re-render (and lose focus), so the controls it affects update in place.
     const updatePublishButton = () => {
       const pending = info?.pending ?? null;
       const upToDate = Boolean(main) && pending === 0 && bodyDraft === null;
-      const blocked = !info
-        ? "Checking where the review can be published…"
-        : !info.available
-          ? info.reason
-          : commentDrafts.size
-            ? "Save or cancel the comment you are editing first"
-            : upToDate
-              ? "Nothing new to publish"
-              : null;
+      const blocked = locked
+        ? "The reviewers are revising the review; publish once they finish"
+        : !info
+          ? "Checking where the review can be published…"
+          : !info.available
+            ? info.reason
+            : commentDrafts.size
+              ? "Save or cancel the comment you are editing first"
+              : upToDate
+                ? "Nothing new to publish"
+                : null;
       publishButton.disabled = Boolean(blocked) || reviewBusy;
       publishButton.title = blocked ?? "";
       publishButton.textContent = reviewBusy
@@ -2015,6 +2300,7 @@ export function taskDetailView(root, { params }) {
       class: "input",
       rows: "6",
       value: bodyDraft ?? review.body ?? "",
+      disabled: locked,
       oninput: () => {
         bodyDraft = text.value;
         saveRow.hidden = false;
@@ -2025,7 +2311,7 @@ export function taskDetailView(root, { params }) {
       "select",
       {
         class: "input input-inline",
-        disabled: Boolean(main) || reviewBusy,
+        disabled: Boolean(main) || reviewBusy || locked,
         title: main ? "The review was published; its kind cannot change any more" : "How the review is submitted on the pull request",
         onchange: () => reviewRequest(() => put(`/api/tasks/${encodeURIComponent(task.id)}/review/summary`, { event: event.value })),
       },
@@ -2116,7 +2402,7 @@ export function taskDetailView(root, { params }) {
   /** The reviewers' discussion, round by round: independent findings, positions, final review and sign-off. */
   function renderDiscussion(force) {
     const review = task.review;
-    const signature = JSON.stringify([task.status, task.phase, task.currentRound, review?.rounds, review?.comments]);
+    const signature = JSON.stringify([task.status, task.phase, task.currentRound, review?.rounds, review?.comments, task.changeRequests?.map((request) => [request.id, request.text])]);
     if (!force && signatures.discussion === signature) return;
     signatures.discussion = signature;
     const rounds = review?.rounds ?? [];
@@ -2181,6 +2467,20 @@ export function taskDetailView(root, { params }) {
         if (final.objectionResponses?.length) {
           parts.push(h("div", { class: "label sub-block" }, "Answers to the peer reviewer's objections"), final.objectionResponses.map((answer) => h("div", { class: "response" }, h("span", { class: "muted" }, answer.objection), h("span", {}, `→ ${answer.response}`))));
         }
+        if (final.requestResponses?.length) {
+          parts.push(
+            h("div", { class: "label sub-block" }, "Answers to your change requests"),
+            final.requestResponses.map((answer) =>
+              h(
+                "div",
+                { class: "response" },
+                h("span", { class: "mono comment-id" }, answer.requestId),
+                chip(answer.status, answer.status === "declined" ? "warning" : "success"),
+                h("span", {}, answer.note),
+              ),
+            ),
+          );
+        }
         parts.push(
           final.comments.map((comment) =>
             h(
@@ -2222,21 +2522,36 @@ export function taskDetailView(root, { params }) {
         parts,
       );
     };
+    // The user's change request opens the round in which the lead first handles it.
+    const requestBlock = (requestId) => {
+      const request = (task.changeRequests ?? []).find((candidate) => candidate.id === requestId);
+      if (!request) return null;
+      return h(
+        "div",
+        { class: "conv-block user-request" },
+        h("div", { class: "conv-block-head" }, h("span", { class: "role-tag role-user" }, "You"), h("span", { class: "mono comment-id" }, request.id), h("span", { class: "muted small" }, `change request · ${clock(request.requestedAt)}`)),
+        renderMarkdown(request.text),
+      );
+    };
     setContent(
       tabBody,
       rounds.map((round) => {
         const expected = round.phase === "findings" || round.phase === "positions" ? ["lead-reviewer", "peer-reviewer"] : round.phase === "final" ? ["lead-reviewer"] : ["peer-reviewer"];
         const waiting = expected.filter((role) => !round.entries.some((entry) => entry.role === role));
+        const opensRequests =
+          round.phase === "final" && round.requests?.length && !rounds.some((other) => other.n < round.n && other.phase === "final" && sameIds(other.requests, round.requests));
         return h(
           "div",
-          { class: `card round-card ${running && task.currentRound === round.n ? "current" : ""}` },
+          { class: `card round-card ${running && task.currentRound === round.n ? "current" : ""} ${opensRequests ? "round-user" : ""}` },
           h(
             "div",
             { class: "round-head" },
             h("strong", {}, `Round ${round.n} · ${REVIEW_PHASE_TITLES[round.phase]}`),
+            round.requests?.length ? chip(`for ${round.requests.join(", ")}`, "attention", "Your change requests this round handles") : null,
             round.attempt > 1 ? chip(`attempt ${round.attempt}`, "outline") : null,
             h("span", { class: "muted small" }, clock(round.startedAt)),
           ),
+          opensRequests ? round.requests.map(requestBlock) : null,
           round.entries.map((entry) => entryBlock(round, entry)),
           running && task.currentRound === round.n
             ? waiting.map((role) => h("div", { class: "conv-block" }, spinner(`${ROLE_LABELS[role]} is working…`)))
@@ -2590,6 +2905,7 @@ export function taskDetailView(root, { params }) {
 
   /** One change request: what the user asked for, who handles it (the manager's decision), its state and the agent's response. */
   function changeRequestRow(request) {
+    if (request.routing === "reviewers" || request.review) return reviewRequestRow(request);
     const stage = request.stage ? task.stages.find((candidate) => candidate.kind === request.stage) : undefined;
     const comment = request.round ? stage?.rounds.find((round) => round.n === request.round)?.review?.comments.find((candidate) => candidate.id === request.id) : undefined;
     const active = ACTIVE.includes(task.status);
@@ -2637,6 +2953,53 @@ export function taskDetailView(root, { params }) {
     );
   }
 
+  /** A change request to a code review: its state, the lead reviewer's answer and what the revision changed in the review. */
+  function reviewRequestRow(request) {
+    const outcome = request.review;
+    const working = ACTIVE.includes(task.status) && task.attempt === request.attempt;
+    const [label, cls] = outcome
+      ? outcome.status === "declined"
+        ? ["Declined", "warning"]
+        : outcome.status === "addressed"
+          ? ["Done", "success"]
+          : ["Handled", "neutral"]
+      : working
+        ? [task.status === "queued" ? "Waiting to start" : "Reviewers at work", "running"]
+        : ["Open", "neutral"];
+    const peer = outcome ? (outcome.agreed ? "the peer reviewer agrees" : "the peer reviewer objects to part of it") : "";
+    return h(
+      "div",
+      { class: "comment comment-user" },
+      h(
+        "div",
+        { class: "comment-head" },
+        h("span", { class: "mono comment-id" }, request.id),
+        chip("the reviewers", "outline", "The lead reviewer revises the review for it, the peer reviewer checks the revision"),
+        h(
+          "span",
+          { class: "muted small", title: request.requestedAt },
+          `requested ${relTime(request.requestedAt)}${request.from && request.from !== "completed" ? ` (the review was ${request.from === "queued" ? "waiting to start" : request.from})` : ""}`,
+        ),
+        h("span", { class: "spacer" }),
+        chip(label, cls),
+      ),
+      renderMarkdown(request.text),
+      outcome
+        ? h(
+            "div",
+            { class: "comment-response" },
+            h("span", { class: "muted" }, `↳ ${ROLE_LABELS["lead-reviewer"]}: `),
+            outcome.note ?? h("span", { class: "muted" }, "no answer"),
+            h(
+              "div",
+              { class: "muted small" },
+              outcome.changes ? `Revision in round ${outcome.round}: ${describeChanges(outcome.changes)} · ${peer}` : `Handled in the final review (round ${outcome.round}) · ${peer}`,
+            ),
+          )
+        : null,
+    );
+  }
+
   // ---- actions ---------------------------------------------------------------------------
 
   /**
@@ -2644,7 +3007,11 @@ export function taskDetailView(root, { params }) {
    * and decides which teams handle it (and so the task type); the user may also hand it to one stage directly.
    */
   async function requestChanges() {
-    if (!task || RUNNING.includes(task.status) || isCodeReviewTask(task)) return;
+    if (!task || RUNNING.includes(task.status)) return;
+    if (isCodeReviewTask(task)) {
+      await requestReviewChanges();
+      return;
+    }
     const kinds = task.plan?.stages ?? task.stages.filter((stage) => stage.status !== "skipped").map((stage) => stage.kind);
     // A stage chosen directly would bypass the manager's re-plan an earlier request is waiting for.
     const waiting = (task.changeRequests ?? []).filter((request) => request.pending).map((request) => request.id);
@@ -2719,6 +3086,60 @@ export function taskDetailView(root, { params }) {
       requestDraft = "";
       toast(handler.value ? `Change request ${nextId} queued for the ${STAGE_LABELS[handler.value]} stage` : `Change request ${nextId} sent to the manager`, "success");
       selectTab("conversation", false);
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
+  /**
+   * Asks a code review's reviewers to change the review: the lead reviewer revises it for the request (or, before the
+   * review is finished, takes it into account) and the peer reviewer checks the revision.
+   */
+  async function requestReviewChanges() {
+    const nextId = `U${(task.changeRequests?.length ?? 0) + 1}`;
+    const finished = Boolean(task.review?.curated);
+    const published = Boolean(task.review?.publications?.some((publication) => publication.main));
+    const text = h("textarea", {
+      class: "input",
+      rows: "7",
+      value: requestDraft,
+      placeholder:
+        "Describe how the review should change, e.g. “Also check the error handling in retry.ts”, “R2 is a false positive: the caller validates the input”, “Make the comments shorter” or “Focus on security issues only”.",
+    });
+    const rounds = h("input", { class: "input", type: "number", min: "1", max: "10", value: String(task.maxRounds) });
+    const pending = confirmDialog({
+      title: `Request changes to the review · ${task.id}`,
+      body: h(
+        "div",
+        { class: "stack" },
+        h(
+          "p",
+          { class: "muted small" },
+          `This becomes change request ${nextId}. `,
+          finished
+            ? "The lead reviewer revises the review for it - checking the code, adding, changing or removing comments - and answers it; the peer reviewer checks the revision and signs off or objects. Your keep, drop and edit decisions stay unless the request changes those comments."
+            : "The reviewers take it into account as they finish the review, and the lead reviewer answers it in the final review.",
+          published ? " The pull request is not touched until you publish again: then changed comments are updated, removed ones deleted and new ones added." : "",
+        ),
+        h("label", { class: "field" }, h("span", { class: "field-label" }, "What should change in the review?"), text),
+        h("label", { class: "field" }, h("span", { class: "field-label" }, "Final-review rounds (revision and sign-off)"), rounds),
+      ),
+      confirmText: "Request changes",
+      wide: true,
+    });
+    text.focus();
+    const ok = await pending;
+    requestDraft = text.value;
+    if (!ok) return;
+    if (!text.value.trim()) {
+      toast("Describe the changes you want first", "error");
+      return;
+    }
+    try {
+      await post(`/api/tasks/${encodeURIComponent(task.id)}/change-request`, { request: text.value, rounds: Number(rounds.value) || undefined });
+      requestDraft = "";
+      toast(`Change request ${nextId} sent to the reviewers`, "success");
+      selectTab("discussion", false);
     } catch (error) {
       toast(error.message, "error");
     }

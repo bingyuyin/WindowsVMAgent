@@ -316,11 +316,21 @@ export interface FinalReview {
   assessment: string;
   verdict: Verdict;
   comments: FinalComment[];
-  /** Reviewer comments left out of the final review, and why. */
+  /** Reviewer comments left out of the final review, and why (in a revision, also comments of the review it removes). */
   dropped: Array<{ commentId: string; reason: string }>;
   /** After the peer reviewer objected: the lead's answer to each objection. */
   objectionResponses?: Array<{ objection: string; response: string }>;
+  /** The lead's answer to each of the user's change requests the review was written or revised for. */
+  requestResponses?: RequestResponse[];
   fallback?: boolean;
+}
+
+/** The lead reviewer's answer to one of the user's change requests to a code review. */
+export interface RequestResponse {
+  /** e.g. "U2" */
+  requestId: string;
+  status: "addressed" | "declined";
+  note: string;
 }
 
 export interface SignOff {
@@ -357,6 +367,13 @@ export interface ReviewRound {
   attempt: number;
   startedAt: string;
   entries: ReviewerEntry[];
+  /** The user's change requests the round's final review (or its sign-off) handles, e.g. ["U2"]. */
+  requests?: string[];
+  /**
+   * Revising a finished review: a fingerprint of the user's working copy the round's final review was written from.
+   * A later run continues the revision only while the working copy is still the same.
+   */
+  basis?: string;
 }
 
 export type ReviewEvent = "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
@@ -369,7 +386,23 @@ export interface PublishedComment {
   inline: boolean;
   /** The text as published (to detect later edits). */
   body: string;
+  /** Inline comments: the file and line they were posted on (a revision may move a comment). */
+  path?: string;
+  line?: number;
   at: string;
+}
+
+/** How the latest revision for the user's change requests changed a comment of the review. */
+export interface CommentRevision {
+  /** The change requests the revision was for, e.g. ["U2"]. */
+  requests: string[];
+  change: "added" | "revised" | "removed";
+  /** added: an earlier revision had removed the comment, and this one brings it back. */
+  restored?: boolean;
+  /** revised: the comment as the user had it before the revision. */
+  previous?: { body: string; severity: Severity; file?: string; line?: number };
+  /** removed: why the lead reviewer left it out. */
+  reason?: string;
 }
 
 /** A comment of the final review as the user curates it: keep, drop or edit it before publishing. */
@@ -388,6 +421,8 @@ export interface CuratedComment {
   /** Added by the user from a comment the reviewers dropped or disputed. */
   addedByUser?: boolean;
   published?: PublishedComment;
+  /** What the latest revision for the user's change requests did to it (added, changed or removed). */
+  revision?: CommentRevision;
 }
 
 /** A review posted on the pull request. The first one holds the review text; later ones add comments created after it. */
@@ -430,18 +465,21 @@ export interface ChangeRequest {
   text: string;
   /**
    * Stage whose agents make the change; later stages then bring their work in line with it. Absent while the manager
-   * is re-planning the task for the request.
+   * is re-planning the task for the request, and for code reviews (the reviewers revise the review).
    */
   stage?: StageKind;
   /** Round of that stage that holds the request; absent when the stage starts (again) from scratch with it. */
   round?: number;
   /** Task attempt that works on the request. */
   attempt: number;
-  /** Review rounds (or test runs) allowed per stage. */
+  /** Review rounds (or test runs) allowed per stage; for code reviews, final-review rounds. */
   rounds: number;
   requestedAt: string;
-  /** "manager": the manager re-evaluated the task for it; "user": the user chose the stage (also requests from before re-planning). */
-  routing?: "manager" | "user";
+  /**
+   * "manager": the manager re-evaluated the task for it; "user": the user chose the stage (also requests from before
+   * re-planning); "reviewers": a code review's reviewers revise the review for it.
+   */
+  routing?: "manager" | "user" | "reviewers";
   /** The manager re-plans the task for it when the task next runs. */
   pending?: boolean;
   /** Status of the task when the request was made. */
@@ -450,6 +488,22 @@ export interface ChangeRequest {
   failure?: string;
   /** What the manager decided: the teams (stages) before and after, the task type, and why. */
   plan?: ChangePlan;
+  /** Code review tasks: how the reviewers revised the review for it (once the revision finished). */
+  review?: ReviewRevision;
+}
+
+/** Code review tasks: how the reviewers handled a change request. */
+export interface ReviewRevision {
+  /** Discussion round of the final review that handles it. */
+  round: number;
+  /** The lead reviewer's answer; absent when it gave none. */
+  status?: "addressed" | "declined";
+  note?: string;
+  /** It revised the finished review: the comments it added, changed or removed (IDs). Absent when the request came before the review was first finished. */
+  changes?: { added: string[]; revised: string[]; removed: string[] };
+  /** The peer reviewer signed off on the review. */
+  agreed: boolean;
+  at: string;
 }
 
 /** How the manager re-planned a task for a change request. */

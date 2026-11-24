@@ -5,6 +5,7 @@ import type { Bus } from "../bus.ts";
 import { describeContext, discoverContext, type HubSkills } from "../context.ts";
 import { formatOfPath, type DocTemplates } from "../docs.ts";
 import { branchWebUrl, primaryRemote, pullRequestPageUrl, pushBranch, remoteBranchHead, sanitizeRemoteUrl, type PullRequestCreator } from "../remote.ts";
+import { nextFinalNumber } from "../review/discussion.ts";
 import { commentableLines, pendingChanges, publishReview, REVIEW_EVENTS, reviewMarkdown, type ReviewPublisher } from "../review/publish.ts";
 import { defaultBranchOf, resolveReviewTarget, type PullRequestLookup, type ResolvedReviewTarget } from "../review/target.ts";
 import type { CommandRunner } from "../shell.ts";
@@ -391,7 +392,7 @@ export class TaskRunner {
     const task = this.get(id);
     const unapproved = task.status === "completed" && task.result?.approved === false;
     if (isCodeReview(task) && task.status === "completed") {
-      throw new HttpError(409, "This code review is finished: keep, drop or edit its comments and publish them, or start a new review");
+      throw new HttpError(409, "This code review is finished: keep, drop or edit its comments and publish them, request changes to it, or start a new review");
     }
     if (!["failed", "cancelled", "interrupted"].includes(task.status) && !unapproved) {
       throw new HttpError(409, "Only failed, cancelled, interrupted or unapproved tasks can be retried");
@@ -412,19 +413,23 @@ export class TaskRunner {
    * task next runs: which teams handle it - the stage that revises its work, new stages (e.g. coding for a finished
    * design), stages the request makes unnecessary - and the task type follows. With `stage`, the user hands it to that
    * stage directly: its author (the comment resolver for code, the test fixer for tests) makes the change and its
-   * reviewer (or the test executor) verifies it, round by round; later stages then bring their work in line.
+   * reviewer (or the test executor) verifies it, round by round; later stages then bring their work in line. A code
+   * review's request goes to its reviewers: the lead reviewer revises the review for it, the peer reviewer checks the
+   * revision (`rounds`: final-review rounds).
    */
   requestChanges(id: string, input: { request: string; stage?: string; rounds?: number }): Task {
     const task = this.get(id);
-    if (isCodeReview(task)) throw new HttpError(409, "Code review tasks do not change code: edit, keep or drop the review's comments instead");
     if (this.running.has(id) || task.status === "running" || task.status === "needs-input") {
       throw new HttpError(409, "The task is running: cancel it or let it finish, then request the changes");
     }
     const text = (input.request ?? "").trim();
     if (!text) throw new HttpError(400, "Describe the changes you want");
     if (text.length > 20_000) throw new HttpError(400, "The change request is too long (max 20,000 characters)");
+    const review = isCodeReview(task);
+    if (review && input.stage) throw new HttpError(400, "A code review has no stages: its reviewers revise the review for the request");
+    if (review && this.publishing.has(id)) throw new HttpError(409, "The review is being published; request the changes once publishing has finished");
     const kinds = stageKindsOf(task);
-    const target = (input.stage || undefined) as StageKind | undefined;
+    const target = (review ? undefined : input.stage || undefined) as StageKind | undefined;
     if (target && !kinds.includes(target)) {
       throw new HttpError(400, kinds.length ? `Stage must be one of: ${kinds.join(", ")}` : "This task has no stages yet: leave the request to the manager");
     }
@@ -450,12 +455,29 @@ export class TaskRunner {
       attempt: task.attempt,
       rounds: task.roundsBudget ?? rounds,
       requestedAt: now,
-      routing: target ? "user" : "manager",
+      routing: review ? "reviewers" : target ? "user" : "manager",
       from,
       ...(failure ? { failure } : {}),
     };
     (task.changeRequests ??= []).push(request);
-    if (target) {
+    if (review) {
+      const finished = Boolean(task.review?.curated);
+      this.emit(task, {
+        type: "info",
+        text: `Change request ${requestId} from the user: ${truncate(text, 2000)}. ${
+          finished
+            ? "The lead reviewer revises the review for it and the peer reviewer checks the revision; your decisions on the comments stay unless the request changes them."
+            : "The reviewers take it into account as they finish the review."
+        }`,
+        data: { changeRequest: requestId },
+      });
+      this.comm(task, {
+        from: "user",
+        to: "manager",
+        kind: "lifecycle",
+        text: `Change request ${requestId} for the review: ${truncate(firstLine(text), 160)} - ${finished ? "the reviewers revise the review for it" : "the reviewers take it into account"}`,
+      });
+    } else if (target) {
       const applied = applyChangePlan(task, [request], { stages: kinds, changeStage: target, instructions: {}, rationale: "", routing: "user" }, now);
       this.emit(task, {
         type: "info",
@@ -491,8 +513,8 @@ export class TaskRunner {
 
   private requeue(task: Task, rounds: number, verb: string): void {
     // Change requests the stopped (or unapproved) attempt was working on are still what the next attempt works on;
-    // those of an attempt that finished are done.
-    const unfinished = task.status !== "completed" || task.result?.approved === false;
+    // those of an attempt that finished are done (a finished code review handled its requests, agreed or not).
+    const unfinished = task.status !== "completed" || (task.result?.approved === false && !isCodeReview(task));
     const previous = task.attempt;
     task.attempt += 1;
     if (unfinished) {
@@ -758,10 +780,17 @@ export class TaskRunner {
 
   // ---- Code review tasks: curating and publishing the final review ---------------------------------
 
+  /**
+   * A review the reviewers finished: the user's to curate and publish - also when a change request to it failed or was
+   * cancelled (the review stays as it was), but not while the reviewers revise it.
+   */
   private finishedReview(id: string): { task: Task; review: CodeReview; curated: CuratedComment[] } {
     const task = this.get(id);
     if (!task.review) throw new HttpError(404, "This task is not a code review");
-    if (task.status !== "completed" || !task.review.curated) throw new HttpError(409, "The reviewers have not finished the review yet");
+    if (!task.review.curated) throw new HttpError(409, "The reviewers have not finished the review yet");
+    if (this.running.has(id) || ACTIVE_STATUSES.includes(task.status)) {
+      throw new HttpError(409, "The reviewers are revising the review for your change request; edit and publish it once they have finished");
+    }
     return { task, review: task.review, curated: task.review.curated };
   }
 
@@ -810,8 +839,9 @@ export class TaskRunner {
     if (curated.some((comment) => comment.sources.includes(source.id) && comment.decision === "keep")) {
       throw new HttpError(409, `${source.id} is already part of a kept comment`);
     }
-    const next = Math.max(0, ...curated.map((comment) => Number(comment.id.slice(1)) || 0)) + 1;
-    curated.push({ id: `R${next}`, severity: source.severity, file: source.file, line: source.line, body: source.body, sources: [source.id], decision: "keep", addedByUser: true });
+    // A new ID: none the review had (including comments a revision removed, still shown in the discussion).
+    const used = [...curated.map((comment) => comment.id), ...review.rounds.flatMap((round) => round.entries.flatMap((entry) => entry.final?.comments.map((comment) => comment.id) ?? []))];
+    curated.push({ id: `R${nextFinalNumber(used)}`, severity: source.severity, file: source.file, line: source.line, body: source.body, sources: [source.id], decision: "keep", addedByUser: true });
     this.publish(task);
     return task;
   }
@@ -1448,7 +1478,15 @@ function completionText(task: Task): string {
   const result = task.result;
   if (isCodeReview(task)) {
     const comments = result?.openComments ?? 0;
-    return `Completed: code review ready with ${comments} comment(s) (${result?.approved ? "both reviewers agree" : "the reviewers did not fully agree"}); review and publish them`;
+    const agreement = result?.approved ? "both reviewers agree" : "the reviewers did not fully agree";
+    // The change requests this run revised the finished review for.
+    const revised = (task.changeRequests ?? []).filter((request) => request.attempt === task.attempt && request.review?.changes);
+    if (revised.length) {
+      const changes = revised[0]!.review!.changes!;
+      const counts = [`${changes.added.length} added`, `${changes.revised.length} changed`, `${changes.removed.length} removed`].join(", ");
+      return `Completed: revised the code review for ${revised.map((request) => request.id).join(", ")} (${counts}); ${comments} comment(s) to publish (${agreement})`;
+    }
+    return `Completed: code review ready with ${comments} comment(s) (${agreement}); review and publish them`;
   }
   const testsLast = (result?.outcomeStage ?? stageKindsOf(task).at(-1)) === "testing";
   if (result?.notRun?.length) {

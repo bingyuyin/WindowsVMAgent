@@ -1456,12 +1456,19 @@ details > summary {
 .meta-value {
   min-width: 0;
 }
-.request summary {
-  margin: 0;
-  color: var(--text);
+.requests-link {
+  margin-top: 6px;
+  font-size: 13px;
 }
-.request[open] summary {
-  margin-bottom: 10px;
+.request-card .request-target {
+  margin: 2px 0 8px;
+}
+.revision-note .response {
+  padding: 2px 0;
+}
+.objection-list {
+  margin: 6px 0 2px;
+  padding-left: 18px;
 }
 
 .input-card {

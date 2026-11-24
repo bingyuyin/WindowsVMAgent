@@ -43,16 +43,23 @@ import {
   defaultReviewBody,
   fallbackFinal,
   fallbackFindings,
+  fallbackRevision,
   fallbackSignoff,
+  finalAsInput,
   nextCommentNumber,
   normalizeFinal,
   normalizeFindings,
   normalizePositions,
   normalizeSignoff,
+  reviseCurated,
+  revisionChanges,
   toFinalReview,
+  workingCopyBasis,
+  type CarriedComment,
   type FinalInput,
   type FindingsInput,
   type PositionsInput,
+  type RevisionChanges,
   type SignoffInput,
 } from "../review/discussion.ts";
 import {
@@ -71,7 +78,9 @@ import {
   type AgentRole,
   type AgentStatus,
   type AuthorSubmission,
+  type ChangeRequest,
   type CodeReview,
+  type CuratedComment,
   type DocumentSnapshot,
   type NewCommEntry,
   type NewTaskEvent,
@@ -630,6 +639,8 @@ export class WorkflowEngine {
     hooks.update();
 
     const budget = Math.max(1, task.roundsBudget ?? task.maxRounds);
+    // The user's change requests this run handles: the final review answers them, and a finished review is revised for them.
+    const requests = (task.changeRequests ?? []).filter((request) => request.attempt === task.attempt && !request.review).map((request) => request.id);
     let status: AgentStatus = "done";
     try {
       for (const phase of ["findings", "positions"] as const) {
@@ -643,31 +654,46 @@ export class WorkflowEngine {
         if (failure) throw failure.reason;
       }
       let finals = review.rounds.filter((round) => round.phase === "final" && round.attempt === task.attempt && round.entries.length).length;
+      // The lead writes a final review for the requests first, unless an earlier run did before it stopped - from the
+      // review as the user still has it: a revision written before the user changed the review is written again.
+      const basis = requests.length && review.curated ? workingCopyBasis(review.curated) : undefined;
+      const written = review.rounds.findLast((round) => round.phase === "final" && round.entries.length && sameIds(round.requests, requests));
+      let revise = requests.length > 0 && (!written || written.basis !== basis);
+      if (revise && written) {
+        const text = `The user changed the review since the lead reviewer revised it for ${requests.join(", ")}: the lead reviewer revises it again, from the review as the user has it now.`;
+        hooks.emit({ type: "info", text });
+        hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", text });
+      }
       for (;;) {
         this.throwIfAborted();
         const last = review.rounds.at(-1)!;
-        if (last.phase === "final" && last.entries.length) {
-          const round = this.openReviewRound(review, "signoff");
-          this.setPhase(undefined, REVIEW_PHASES.signoff, round.n);
-          await this.codeReviewTurn("peer-reviewer", round, change);
-          continue;
-        }
-        if (last.phase === "signoff" && last.entries.length) {
-          const signoff = last.entries[0]!.signoff!;
-          if (signoff.agreed || !signoff.objections.length) break;
-          if (finals >= budget) {
-            const text = `The peer reviewer still objects after ${finals} final review round(s); its objections are shown with the comments for you to decide.`;
-            hooks.emit({ type: "warning", round: last.n, text });
-            hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", round: last.n, text });
-            break;
+        if (!revise) {
+          if (last.phase === "final" && last.entries.length) {
+            const round = this.openReviewRound(review, "signoff", last.requests);
+            this.setPhase(undefined, REVIEW_PHASES.signoff, round.n);
+            await this.codeReviewTurn("peer-reviewer", round, change);
+            continue;
+          }
+          if (last.phase === "signoff" && last.entries.length) {
+            const signoff = last.entries[0]!.signoff!;
+            if (signoff.agreed || !signoff.objections.length) break;
+            if (finals >= budget) {
+              const text = `The peer reviewer still objects after ${finals} final review round(s); its objections are shown with the comments for you to decide.`;
+              hooks.emit({ type: "warning", round: last.n, text });
+              hooks.comm({ from: "manager", to: "manager", kind: "lifecycle", round: last.n, text });
+              break;
+            }
           }
         }
-        const unfinishedSignoff = last.phase === "signoff" && !last.entries.length;
-        const round = unfinishedSignoff ? last : this.openReviewRound(review, "final");
+        const unfinishedSignoff = !revise && last.phase === "signoff" && !last.entries.length;
+        const round = unfinishedSignoff ? last : this.openReviewRound(review, "final", requests, basis);
         const role: AgentRole = unfinishedSignoff ? "peer-reviewer" : "lead-reviewer";
         this.setPhase(undefined, REVIEW_PHASES[round.phase], round.n);
         await this.codeReviewTurn(role, round, change);
-        if (!unfinishedSignoff) finals++;
+        if (!unfinishedSignoff) {
+          finals++;
+          revise = false;
+        }
       }
     } catch (error) {
       status = hooks.signal.aborted || error instanceof CancelledError ? "cancelled" : "failed";
@@ -679,11 +705,32 @@ export class WorkflowEngine {
     await this.finalizeCodeReview();
   }
 
-  /** The round a step runs in: the last round when it is that step and unfinished, otherwise a new one. */
-  private openReviewRound(review: CodeReview, phase: ReviewPhase): ReviewRound {
+  /**
+   * The round a step runs in: the last round when none of its reviewers submitted yet (an unstarted step, also of
+   * another kind), otherwise a new one. `requests`: the user's change requests the step handles; `basis`: the working
+   * copy a revision is written from.
+   */
+  private openReviewRound(review: CodeReview, phase: ReviewPhase, requests: readonly string[] = [], basis?: string): ReviewRound {
     const last = review.rounds.at(-1);
-    if (last?.phase === phase && !last.entries.length) return last;
-    const round: ReviewRound = { n: review.rounds.length + 1, phase, attempt: this.task.attempt, startedAt: nowIso(), entries: [] };
+    if (last && !last.entries.length) {
+      last.phase = phase;
+      last.attempt = this.task.attempt;
+      last.startedAt = nowIso();
+      if (requests.length) last.requests = [...requests];
+      else delete last.requests;
+      if (basis) last.basis = basis;
+      else delete last.basis;
+      return last;
+    }
+    const round: ReviewRound = {
+      n: review.rounds.length + 1,
+      phase,
+      attempt: this.task.attempt,
+      startedAt: nowIso(),
+      entries: [],
+      ...(requests.length ? { requests: [...requests] } : {}),
+      ...(basis ? { basis } : {}),
+    };
     review.rounds.push(round);
     return round;
   }
@@ -705,9 +752,23 @@ export class WorkflowEngine {
     // What the reviewer is shown, fixed for the turn: the other reviewer may change its comments meanwhile.
     const own = review.comments.filter((comment) => comment.id.startsWith(prefix) && !comment.withdrawn);
     const theirs = review.comments.filter((comment) => comment.id.startsWith(otherPrefix) && !comment.withdrawn);
-    const previousFinal = [...review.rounds].reverse().find((candidate) => candidate.n < round.n && candidate.phase === "final" && candidate.entries.length)?.entries[0]?.final;
+    const previousFinalRound = [...review.rounds].reverse().find((candidate) => candidate.n < round.n && candidate.phase === "final" && candidate.entries.length);
+    const previousFinal = previousFinalRound?.entries[0]?.final;
     const lastSignoff = [...review.rounds].reverse().find((candidate) => candidate.n < round.n && candidate.phase === "signoff" && candidate.entries.length)?.entries[0]?.signoff;
-    const objecting = phase === "final" && previousFinal && lastSignoff && !lastSignoff.agreed ? lastSignoff : undefined;
+    // The user's change requests this round handles. A finished review is revised for them, starting from the review
+    // as the user has it (their working copy); the earlier versions of this revision are those of the same requests,
+    // written from the same working copy.
+    const requests = (round.requests ?? []).map((requestId) => task.changeRequests?.find((request) => request.id === requestId)).filter((request): request is ChangeRequest => Boolean(request));
+    const requestIds = requests.map((request) => request.id);
+    const workingCopy = requests.length ? review.curated : undefined;
+    const sameRequests = Boolean(previousFinalRound && requests.length && sameIds(previousFinalRound.requests, round.requests) && previousFinalRound.basis === round.basis);
+    const revising = phase === "final" && Boolean(workingCopy) && !sameRequests;
+    const objecting = phase === "final" && !revising && previousFinal && lastSignoff && !lastSignoff.agreed ? lastSignoff : undefined;
+    const accountable = workingCopy
+      ? workingCopy.filter((comment) => comment.decision === "keep").map((comment) => comment.id)
+      : review.comments.filter((comment) => !comment.withdrawn).map((comment) => comment.id);
+    const carried = workingCopy && phase === "final" ? carriedComments(workingCopy, review, round) : undefined;
+    const requestList = requestIds.join(", ");
 
     const assignment =
       phase === "findings"
@@ -715,10 +776,14 @@ export class WorkflowEngine {
         : phase === "positions"
           ? `Discussing the ${ROLE_LABELS[otherRole].toLowerCase()}'s ${theirs.length} comment(s) (round ${round.n})`
           : phase === "final"
-            ? objecting
-              ? `Revising the final review for ${objecting.objections.length} objection(s) (round ${round.n})`
-              : `Writing the final review (round ${round.n})`
-            : `Checking the final review (round ${round.n})`;
+            ? revising
+              ? `Revising the review for change request ${requestList} (round ${round.n})`
+              : objecting
+                ? `Revising the final review for ${objecting.objections.length} objection(s) (round ${round.n})`
+                : `Writing the final review (round ${round.n})`
+            : workingCopy
+              ? `Checking the revised review (round ${round.n})`
+              : `Checking the final review (round ${round.n})`;
     hooks.agent(role, (info) => {
       info.status = "working";
       info.workspace = ws.path;
@@ -738,10 +803,12 @@ export class WorkflowEngine {
           : phase === "positions"
             ? `Respond to the ${ROLE_LABELS[otherRole].toLowerCase()}'s comments${theirs.length ? ` ${theirs.map((comment) => comment.id).join(", ")}` : " (none)"} and re-check your own`
             : phase === "final"
-              ? objecting
-                ? `The ${ROLE_LABELS[otherRole].toLowerCase()} objects (${objecting.objections.length}); revise the final review`
-                : `Write the final review from ${review.comments.length} comment(s) and the discussion`
-              : `Sign off on the final review (${previousFinal?.comments.length ?? 0} comment(s)) or object`,
+              ? revising
+                ? `The user asks for changes to the review (${requestList}); revise it and answer the request${requests.length === 1 ? "" : "s"}`
+                : objecting
+                  ? `The ${ROLE_LABELS[otherRole].toLowerCase()} objects (${objecting.objections.length}); revise the final review`
+                  : `Write the final review from ${review.comments.length} comment(s) and the discussion${requests.length ? `; answer ${requestList}` : ""}`
+              : `Sign off on the ${workingCopy ? "revised" : "final"} review (${previousFinal?.comments.length ?? 0} comment(s)) or object`,
     });
 
     const known = review.comments.map((comment) => comment.id);
@@ -751,8 +818,14 @@ export class WorkflowEngine {
         : phase === "positions"
           ? (input) => normalizePositions(input, theirs.map((comment) => comment.id), own.map((comment) => comment.id))
           : phase === "final"
-            ? (input) => normalizeFinal(input, review.comments.filter((comment) => !comment.withdrawn).map((comment) => comment.id), known)
-            : (input) => normalizeSignoff(input, [...(previousFinal?.comments.map((comment) => comment.id) ?? []), ...known]);
+            ? (input) => normalizeFinal(input, accountable, known, { carried, requests: requestIds, answered: sameRequests ? previousFinal?.requestResponses : undefined })
+            : (input) =>
+                normalizeSignoff(input, [
+                  ...(previousFinal?.comments.map((comment) => comment.id) ?? []),
+                  ...known,
+                  ...(workingCopy?.map((comment) => comment.id) ?? []),
+                  ...requestIds,
+                ]);
     const base = (includeContext: boolean): ReviewTurnBase => ({
       task,
       role,
@@ -771,9 +844,16 @@ export class WorkflowEngine {
           return positionsPrompt({ ...base(includeContext), own, theirs, theirEntry });
         }
         case "final":
-          return finalPrompt({ ...base(includeContext), review, previous: objecting ? previousFinal : undefined, signoff: objecting });
+          return finalPrompt({
+            ...base(includeContext),
+            review,
+            previous: objecting ? previousFinal : undefined,
+            signoff: objecting,
+            requests,
+            revision: workingCopy ? { workingCopy, finalized: review.final, accountable } : undefined,
+          });
         case "signoff":
-          return signoffPrompt({ ...base(includeContext), review, final: previousFinal! });
+          return signoffPrompt({ ...base(includeContext), review, final: previousFinal!, requests, changes: workingCopy ? revisionChanges(workingCopy, previousFinal!) : undefined });
       }
     };
 
@@ -838,16 +918,20 @@ export class WorkflowEngine {
       }
       case "final": {
         const leadSummary = review.rounds.find((candidate) => candidate.phase === "findings")?.entries.find((candidate) => candidate.role === "lead-reviewer")?.changeSummary;
-        const input = (submitted as FinalInput | undefined) ?? fallbackFinal(review, leadSummary);
-        const final = toFinalReview(input, fallback);
-        review.final = final;
+        // Without a submission a revision keeps its last version (or the review as the user had it).
+        const input =
+          (submitted as FinalInput | undefined) ??
+          (workingCopy ? (sameRequests && previousFinal ? finalAsInput(previousFinal) : fallbackRevision(workingCopy, review.final)) : fallbackFinal(review, leadSummary));
+        const final = toFinalReview(input, fallback, workingCopy ? usedFinalIds(review) : undefined);
         entry = { role, summary: final.assessment, final, at };
-        summary = `Final review: ${final.comments.length} comment(s)${describeSeverities(final.comments)}, ${final.dropped.length} dropped, verdict ${final.verdict.replace("_", " ")}`;
+        const answers = final.requestResponses?.length ? `; ${final.requestResponses.map((answer) => `${answer.requestId} ${answer.status}`).join(", ")}` : "";
+        summary = workingCopy
+          ? `Revised review for ${requestList}: ${final.comments.length} comment(s)${describeSeverities(final.comments)} - ${describeRevision(revisionChanges(workingCopy, final))}${answers}`
+          : `Final review: ${final.comments.length} comment(s)${describeSeverities(final.comments)}, ${final.dropped.length} dropped, verdict ${final.verdict.replace("_", " ")}${answers}`;
         break;
       }
       case "signoff": {
         const signoff = (submitted as SignoffInput | undefined) ? { ...(submitted as SignoffInput) } : fallbackSignoff();
-        review.signoff = signoff;
         entry = { role, summary: signoff.summary, signoff, at };
         summary = signoff.agreed
           ? `${label} signed off on the final review`
@@ -877,31 +961,24 @@ export class WorkflowEngine {
     });
   }
 
-  /** Turns the agreed final review into the user's working copy and the task's result. */
+  /**
+   * Turns the agreed final review into the user's working copy and the task's result. A revision for the user's change
+   * requests is merged into the working copy they had (keeping their decisions, edits and what is on the pull request),
+   * and each request records how the reviewers handled it.
+   */
   private async finalizeCodeReview(): Promise<void> {
     const { workspace, hooks, settings } = this.options;
     const task = this.task;
     const review = task.review!;
     this.setPhase(undefined, "finalizing", task.currentRound);
     const finalIndex = review.rounds.findLastIndex((round) => round.phase === "final" && round.entries.length);
-    const final = review.rounds[finalIndex]?.entries[0]?.final;
-    if (!final) throw new Error("The reviewers produced no final review.");
+    const finalRound = review.rounds[finalIndex];
+    const final = finalRound?.entries[0]?.final;
+    if (!finalRound || !final) throw new Error("The reviewers produced no final review.");
     const signoff = review.rounds.slice(finalIndex + 1).findLast((round) => round.phase === "signoff" && round.entries.length)?.entries[0]?.signoff;
-    review.final = final;
-    review.signoff = signoff;
-    review.curated = curate(final, signoff);
-    review.body = defaultReviewBody(final);
-    review.event ??= "COMMENT";
     const head = review.target.headSha;
-    task.result = {
-      approved: signoff?.agreed === true,
-      summary: final.changeSummary || final.assessment,
-      headSha: head,
-      diffStat: await workspace.diffStat(workspace.baseSha, head),
-      shortStat: review.shortStat,
-      commits: review.commits,
-      openComments: review.curated.length,
-    };
+    // What can fail comes first: a retry must not merge the same revision into the working copy twice.
+    const diffStat = await workspace.diffStat(workspace.baseSha, head);
     if (settings.cleanupWorktrees) {
       await workspace.removeWorktrees();
       for (const info of task.agents ?? []) {
@@ -910,13 +987,57 @@ export class WorkflowEngine {
         });
       }
     }
+    const requests = finalRound.requests ?? [];
+    // Finalizing the same revision again (e.g. the hub stopped right after it) keeps the working copy as it was merged.
+    const merged = requests.length > 0 && requests.every((requestId) => task.changeRequests?.find((candidate) => candidate.id === requestId)?.review?.round === finalRound.n);
+    const workingCopy = requests.length && !merged ? review.curated : undefined;
+    // The text published with the comments follows the assessment, unless the user wrote their own.
+    const ownText = (merged && review.body !== undefined) || (Boolean(workingCopy && review.body) && !review.rounds.some((round) => round.entries.some((entry) => entry.final && defaultReviewBody(entry.final) === review.body)));
+    let changes: RevisionChanges | undefined;
+    if (workingCopy) {
+      const revised = reviseCurated(workingCopy, final, signoff, requests);
+      review.curated = revised.curated;
+      changes = revised.changes;
+    } else if (!merged || !review.curated) {
+      review.curated = curate(final, signoff);
+    }
+    review.final = final;
+    review.signoff = signoff;
+    if (!ownText) review.body = defaultReviewBody(final);
+    review.event ??= "COMMENT";
+    const now = nowIso();
+    for (const requestId of merged ? [] : requests) {
+      const request = task.changeRequests?.find((candidate) => candidate.id === requestId);
+      if (!request) continue;
+      const answer = final.requestResponses?.find((response) => response.requestId === requestId);
+      request.review = {
+        round: finalRound.n,
+        ...(answer ? { status: answer.status, note: answer.note } : {}),
+        ...(changes
+          ? { changes: { added: changes.added.map((comment) => comment.id), revised: changes.revised.map(({ comment }) => comment.id), removed: changes.removed.map((comment) => comment.id) } }
+          : {}),
+        agreed: signoff?.agreed === true,
+        at: now,
+      };
+    }
+    const kept = review.curated.filter((comment) => comment.decision === "keep").length;
+    task.result = {
+      approved: signoff?.agreed === true,
+      summary: final.changeSummary || final.assessment,
+      headSha: head,
+      diffStat,
+      shortStat: review.shortStat,
+      commits: review.commits,
+      openComments: kept,
+    };
     task.phase = "done";
     const objections = signoff && !signoff.agreed ? signoff.objections.length : 0;
+    const agreement = signoff?.agreed ? "both reviewers agree on the final review" : objections ? `the peer reviewer still objects to ${objections} item(s)` : "the peer reviewer did not sign off";
     hooks.emit({
       type: "info",
-      text: `Code review complete: ${final.comments.length} comment(s)${describeSeverities(final.comments)}; ${
-        signoff?.agreed ? "both reviewers agree on the final review" : objections ? `the peer reviewer still objects to ${objections} item(s)` : "the peer reviewer did not sign off"
-      }. Review the comments, then publish them.`,
+      text: workingCopy
+        ? `Revised the code review for ${requests.join(", ")}: ${describeRevision(changes)}; ${kept} comment(s) to publish; ${agreement}. Review the comments, then publish them.`
+        : `Code review complete: ${final.comments.length} comment(s)${describeSeverities(final.comments)}; ${agreement}. Review the comments, then publish them.`,
     });
     hooks.update();
   }
@@ -2351,4 +2472,41 @@ function describeSeverities(comments: ReadonlyArray<{ severity: string }>): stri
   const order = ["blocker", "major", "minor", "nit"];
   const parts = order.map((severity) => [severity, comments.filter((comment) => comment.severity === severity).length] as const).filter(([, count]) => count);
   return parts.length ? ` (${parts.map(([severity, count]) => `${count} ${severity}`).join(", ")})` : "";
+}
+
+/** "1 added (R5), 1 changed (R2), 1 removed (R3)", or "no comment changed". */
+export function describeRevision(changes: RevisionChanges | undefined): string {
+  const parts = [
+    [changes?.added.map((comment) => comment.id) ?? [], "added"],
+    [changes?.revised.map(({ comment }) => comment.id) ?? [], "changed"],
+    [changes?.removed.map((comment) => comment.id) ?? [], "removed"],
+  ] as const;
+  const text = parts.filter(([list]) => list.length).map(([list, verb]) => `${list.length} ${verb} (${list.join(", ")})`);
+  return text.length ? text.join(", ") : "no comment changed";
+}
+
+/** The same change requests (IDs), in any order. */
+function sameIds(a: readonly string[] = [], b: readonly string[] = []): boolean {
+  return a.length === b.length && a.every((value) => b.includes(value));
+}
+
+/** Every final-review comment ID the review has had (the user's working copy and each final review), never reused. */
+function usedFinalIds(review: CodeReview): string[] {
+  return [
+    ...(review.curated ?? []).map((comment) => comment.id),
+    ...review.rounds.flatMap((round) => (round.phase === "final" ? (round.entries[0]?.final?.comments.map((comment) => comment.id) ?? []) : [])),
+  ];
+}
+
+/**
+ * The comments a revision of a finished review may keep by their ID: the user's working copy, and the versions of the
+ * revision written before this round from the same working copy (a later version of a comment wins).
+ */
+function carriedComments(workingCopy: readonly CuratedComment[], review: CodeReview, round: ReviewRound): CarriedComment[] {
+  const carried = new Map<string, CarriedComment>(workingCopy.map((comment) => [comment.id, { id: comment.id, file: comment.file, body: comment.body, sources: comment.sources }]));
+  for (const candidate of review.rounds) {
+    if (candidate.n >= round.n || candidate.phase !== "final" || !sameIds(candidate.requests, round.requests) || candidate.basis !== round.basis) continue;
+    for (const comment of candidate.entries[0]?.final?.comments ?? []) carried.set(comment.id, { id: comment.id, file: comment.file, body: comment.body, sources: comment.sources });
+  }
+  return [...carried.values()];
 }

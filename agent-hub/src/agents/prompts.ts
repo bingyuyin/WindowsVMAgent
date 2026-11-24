@@ -326,6 +326,9 @@ function codeReviewSystemPrompt(role: AgentRole, env: AgentEnvironment, skills: 
     lead
       ? "- When you write the final review: merge duplicates into one comment, apply agreed refinements, keep the comments you both agree on, decide disputed ones on their merits, and drop wrong, duplicate or out-of-scope ones with the reason. When the peer reviewer objects to the final review, address each objection: change the review where it is right, or keep your decision and explain why."
       : "- When you sign off: accept the final review when it keeps every valid issue with a fair severity and location, drops only wrong or duplicate ones, and reads well for the change's author. Object only to substantive problems (a valid issue dropped, a wrong comment kept, a misleading severity or location), not to wording preferences.",
+    lead
+      ? "- When the user asks for changes to the review (change requests U1, U2...): check the code for what they ask, revise the review for it - keeping the user's own decisions and edits unless they say otherwise - and answer each request: addressed, or declined with the reason."
+      : "- When the user asked for changes to the review (change requests U1, U2...): check that the revised review handles each one - addressed, or declined for a good reason - and that its new and changed comments are right in the code.",
     "- Every turn asks for one submit tool (submit_findings, submit_positions or " + (lead ? "submit_final_review" : "submit_signoff") + "). Finish the turn by calling exactly that tool once. Never end your turn without calling it.",
   ].join("\n");
 }

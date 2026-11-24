@@ -1,7 +1,9 @@
 import {
   ROLE_LABELS,
   type AgentRole,
+  type ChangeRequest,
   type CodeReview,
+  type CuratedComment,
   type FinalReview,
   type RepoContext,
   type ReviewerComment,
@@ -9,6 +11,7 @@ import {
   type SignOff,
   type Task,
 } from "../types.ts";
+import type { RevisionChanges } from "../review/discussion.ts";
 import { truncate } from "../util.ts";
 import { briefingBlock, contextBlock } from "./prompts.ts";
 
@@ -201,14 +204,17 @@ function finalReviewText(final: FinalReview, review: CodeReview): string {
     lines.push(`- [${comment.id}] (${comment.severity})${location(comment)}${comment.sources.length ? ` (from ${comment.sources.join(", ")})` : " (new)"} - ${indent(comment.body)}`);
   }
   if (final.dropped.length) {
-    lines.push("", "Dropped reviewer comments:");
+    lines.push("", "Dropped comments:");
     for (const entry of final.dropped) {
-      const source = review.comments.find((comment) => comment.id === entry.commentId);
+      const source = review.comments.find((comment) => comment.id === entry.commentId) ?? review.curated?.find((comment) => comment.id === entry.commentId);
       lines.push(`- [${entry.commentId}]${source ? ` (${source.severity})${location(source)} "${truncate(source.body.replace(/\s+/g, " "), 300)}"` : ""} - ${entry.reason}`);
     }
   }
   const withdrawn = review.comments.filter((comment) => comment.withdrawn);
   if (withdrawn.length) lines.push("", `Withdrawn by their reviewers during the discussion: ${withdrawn.map((comment) => comment.id).join(", ")}`);
+  if (final.requestResponses?.length) {
+    lines.push("", "Answers to the user's change requests:", ...final.requestResponses.map((answer) => `- [${answer.requestId}] ${answer.status} - ${indent(answer.note)}`));
+  }
   return lines.join("\n");
 }
 
@@ -216,12 +222,103 @@ function objectionsText(signoff: SignOff): string {
   return signoff.objections.map((objection, index) => `${index + 1}. ${objection.commentId ? `[${objection.commentId}] ` : "(whole review) "}${indent(objection.issue)}`).join("\n");
 }
 
-export function finalPrompt(input: ReviewTurnBase & { review: CodeReview; previous?: FinalReview; signoff?: SignOff }): string {
+/** The user's change requests a final review (or its revision) must answer, in full. */
+function requestsBlock(requests: readonly ChangeRequest[], revision: boolean): string {
+  const lines = [
+    revision ? "The user read the finished review and asks for changes to it:" : "The user added change requests; the final review must handle them:",
+    "",
+  ];
+  for (const request of requests) lines.push(`### Change request ${request.id}`, "", quote(truncate(request.text, 20_000)), "");
+  return lines.join("\n");
+}
+
+/** The review as the user has it: the comments with the user's decisions and edits, and what is on the pull request. */
+function workingCopyText(workingCopy: readonly CuratedComment[], review: CodeReview, finalized: FinalReview | undefined): string {
+  const lines: string[] = [];
+  if (finalized) {
+    lines.push("Summary of the change:", finalized.changeSummary.trim() || "(none)", "", `Assessment (verdict: ${verdictText(finalized.verdict)}):`, finalized.assessment.trim() || "(none)", "");
+  }
+  const body = review.body?.trim();
+  if (body && body !== finalized?.assessment.trim()) lines.push("Review text the user wrote (published with the comments):", quote(truncate(body, 6000)), "");
+  lines.push("Comments, as the user has them (they keep, drop or edit each one before publishing it on the pull request):");
+  if (!workingCopy.length) lines.push("(none)");
+  for (const comment of workingCopy) {
+    lines.push(`- [${comment.id}] (${comment.severity})${location(comment)}${comment.sources.length ? ` (from ${comment.sources.join(", ")})` : ""} - ${indent(comment.body)}`);
+    if (comment.decision === "drop") {
+      lines.push(comment.revision?.change === "removed" ? `  [left out: removed in the revision for ${comment.revision.requests.join(", ")}]` : "  [dropped by the user]");
+    }
+    if (comment.original) lines.push(`  [edited by the user; the reviewers had written (${comment.original.severity}): "${truncate(comment.original.body.replace(/\s+/g, " "), 600)}"]`);
+    if (comment.addedByUser) lines.push(`  [added by the user from the reviewers' comment ${comment.sources.join(", ")}]`);
+    if (comment.published) lines.push(`  [on the pull request${comment.published.inline ? "" : ", in the review's text"}]`);
+    if (comment.objection) lines.push(`  [the peer reviewer objected: ${truncate(comment.objection.replace(/\s+/g, " "), 600)}]`);
+  }
+  return lines.join("\n");
+}
+
+function accountLine(accountable: readonly string[], revision: boolean): string {
+  if (!accountable.length) return revision ? "No comment of the review needs accounting for." : "No reviewer comments remain to account for.";
+  return revision
+    ? `Account for each comment of the review the user kept, in a comment's \`id\` or in \`dropped\`: ${accountable.join(", ")}.`
+    : `Account for each of these comment IDs, in a comment's sources or in dropped: ${accountable.join(", ")}.`;
+}
+
+function requestAnswersLine(requests: readonly ChangeRequest[]): string {
+  return `\`request_responses\`: one answer per change request (${requests.map((request) => request.id).join(", ")}) - "addressed" with what the review now does for it, or "declined" with the reason (for example when the requested change would make the review wrong).`;
+}
+
+/** Revising a finished review: the request(s), the review as the user has it, and the reviewers' comments. */
+function revisionPrompt(
+  input: ReviewTurnBase & { review: CodeReview; requests: readonly ChangeRequest[]; workingCopy: readonly CuratedComment[]; finalized?: FinalReview; accountable: readonly string[] },
+): string {
   const review = input.review;
-  const accountable = review.comments
-    .filter((comment) => !comment.withdrawn)
-    .sort(byCommentId)
-    .map((comment) => comment.id);
+  return [
+    ...preamble(input),
+    `## Round ${input.round}: revise the review for the user's change request${input.requests.length === 1 ? "" : "s"}`,
+    "",
+    "The review is finished: the user read it, curates its comments (keep, drop or edit each one) before publishing them on the pull request, and asks for changes.",
+    "",
+    requestsBlock(input.requests, true),
+    "## The review as the user has it",
+    "",
+    workingCopyText(input.workingCopy, review, input.finalized),
+    "",
+    "Reviewer comments from the discussion (yours are L1, L2...; the peer reviewer's P1, P2...):",
+    review.comments.length ? discussionDigest(review, input.role) : "(none)",
+    "",
+    "Revise the review for the request, then call `submit_final_review` with the complete revised review - every comment you keep, not only the changes:",
+    "- Check the code for what the request asks (your worktree is pinned to the change's head). Add a comment for each real issue it leads you to, change or remove the comments it shows to be wrong, and leave the rest as it is.",
+    "- Keep the user's curation unless the request says otherwise: comments they dropped stay out, and text they edited stays as they wrote it. A comment an earlier revision left out comes back if you include it (with its ID).",
+    "- `id`: give the comment's ID (R1, R2...) for every comment you keep or change, so the user's decisions and the comments already on the pull request stay attached to it; omit `id` only for a new comment.",
+    "- `dropped`: each comment the user kept (R#) that the revision leaves out, with the reason.",
+    `- ${requestAnswersLine(input.requests)}`,
+    "- `change_summary`, `assessment` and `verdict` for the revised review.",
+    accountLine(input.accountable, true),
+  ].join("\n");
+}
+
+export function finalPrompt(
+  input: ReviewTurnBase & {
+    review: CodeReview;
+    previous?: FinalReview;
+    signoff?: SignOff;
+    /** The user's change requests the final review handles. */
+    requests?: readonly ChangeRequest[];
+    /** Revising a finished review: the user's working copy, the review it was made from, and the comments to account for. */
+    revision?: { workingCopy: readonly CuratedComment[]; finalized?: FinalReview; accountable: readonly string[] };
+  },
+): string {
+  const review = input.review;
+  const requests = input.requests ?? [];
+  const revision = input.revision;
+  if (revision && !(input.previous && input.signoff)) {
+    return revisionPrompt({ ...input, requests, workingCopy: revision.workingCopy, finalized: revision.finalized, accountable: revision.accountable });
+  }
+  const accountable = revision
+    ? revision.accountable
+    : review.comments
+        .filter((comment) => !comment.withdrawn)
+        .sort(byCommentId)
+        .map((comment) => comment.id);
   const parts = [...preamble(input)];
   if (input.previous && input.signoff) {
     parts.push(
@@ -235,12 +332,19 @@ export function finalPrompt(input: ReviewTurnBase & { review: CodeReview; previo
       "Your final review so far:",
       finalReviewText(input.previous, review),
       "",
+    );
+    if (revision && input.includeContext) parts.push("The review as the user had it before the change request:", workingCopyText(revision.workingCopy, review, revision.finalized), "");
+    if (requests.length) parts.push(requestsBlock(requests, Boolean(revision)));
+    parts.push(
       "Reviewer comments it draws on (after the discussion):",
       discussionDigest(review, input.role),
       "",
       "Address each objection: change the review where the peer reviewer is right, or keep your decision and explain why in `objection_responses`.",
-      "Then call `submit_final_review` with the complete revised review - every comment and every dropped item, not only the changes.",
+      revision
+        ? "Then call `submit_final_review` with the complete revised review - every comment (with its `id`; omit it only for a new comment) and every dropped item, not only the changes."
+        : "Then call `submit_final_review` with the complete revised review - every comment and every dropped item, not only the changes.",
     );
+    if (requests.length) parts.push(`Keep the review handling the user's change requests; update ${requestAnswersLine(requests)}`);
   } else {
     const leadEntry = review.rounds.find((round) => round.phase === "findings")?.entries.find((entry) => entry.role === "lead-reviewer");
     const peerEntry = review.rounds.find((round) => round.phase === "findings")?.entries.find((entry) => entry.role === "peer-reviewer");
@@ -254,32 +358,69 @@ export function finalPrompt(input: ReviewTurnBase & { review: CodeReview; previo
       `- Yours: ${indent(leadEntry?.changeSummary || "(none)")}`,
       `- Peer reviewer's: ${indent(peerEntry?.changeSummary || "(none)")}`,
       "",
+    );
+    if (requests.length) parts.push(requestsBlock(requests, false));
+    parts.push(
       "Write the final review the change's author will read, then call `submit_final_review`:",
       "- `comments`: one per distinct issue. Merge duplicates and list every merged ID in `sources`; apply agreed refinements; keep the comments you both agree on; decide disputed ones on their merits. Each comment must stand on its own for the change's author.",
       "- `dropped`: every comment ID that is in no `sources`, with the reason. Withdrawn comments are dropped already.",
       "- `change_summary`, `assessment` and `verdict`.",
     );
+    if (requests.length) parts.push(`- ${requestAnswersLine(requests)}`);
   }
-  parts.push(accountable.length ? `Account for each of these comment IDs, in a comment's sources or in dropped: ${accountable.join(", ")}.` : "No reviewer comments remain to account for.");
+  parts.push(accountLine(accountable, Boolean(revision)));
   return parts.join("\n");
 }
 
-export function signoffPrompt(input: ReviewTurnBase & { review: CodeReview; final: FinalReview }): string {
+/** What a revision changed in the review the user had, for the peer reviewer's sign-off. */
+function changesText(changes: RevisionChanges): string {
+  const lines: string[] = [];
+  for (const comment of changes.added) lines.push(`- Added [${comment.id}] (${comment.severity})${location(comment)} - ${indent(comment.body)}`);
+  for (const { comment, before } of changes.revised) {
+    const severity = before.severity === comment.severity ? comment.severity : `${before.severity} → ${comment.severity}`;
+    const moved = location(before) === location(comment) ? location(comment) : `${location(before) || " (general)"} →${location(comment) || " (general)"}`;
+    lines.push(`- Changed [${comment.id}] (${severity})${moved} - ${indent(comment.body)}`, `  before: "${truncate(before.body.replace(/\s+/g, " "), 600)}"`);
+  }
+  for (const comment of changes.removed) lines.push(`- Removed [${comment.id}] (${comment.severity})${location(comment)} "${truncate(comment.body.replace(/\s+/g, " "), 300)}"`);
+  return lines.length ? lines.join("\n") : "(no comment changed)";
+}
+
+export function signoffPrompt(
+  input: ReviewTurnBase & {
+    review: CodeReview;
+    final: FinalReview;
+    /** The user's change requests the final review handles. */
+    requests?: readonly ChangeRequest[];
+    /** Revising a finished review: what the revision changed in the review the user had. */
+    changes?: RevisionChanges;
+  },
+): string {
+  const requests = input.requests ?? [];
+  const revising = Boolean(input.changes);
   const parts = [
     ...preamble(input),
-    `## Round ${input.round}: sign off on the final review`,
+    `## Round ${input.round}: sign off on the ${revising ? "revised" : "final"} review`,
     "",
-    "The lead reviewer wrote the final review from both your findings and the discussion:",
+  ];
+  if (requests.length) parts.push(requestsBlock(requests, revising));
+  if (input.changes) parts.push("What the revision changed in the review the user had:", changesText(input.changes), "");
+  parts.push(
+    revising ? "The lead reviewer's revised review:" : "The lead reviewer wrote the final review from both your findings and the discussion:",
     "",
     finalReviewText(input.final, input.review),
-  ];
+  );
   if (input.final.objectionResponses?.length) {
     parts.push("", "The lead reviewer's answers to your objections:", ...input.final.objectionResponses.map((entry) => `- ${entry.objection}: ${indent(entry.response)}`));
   }
   parts.push(
     "",
-    "Check it: does it keep every valid issue with a fair severity and location, drop only wrong or duplicate ones, and read well for the change's author?",
-    "Call `submit_signoff` with agree=true when you accept it as a whole; otherwise agree=false and one objection per substantive problem (reference R# or the dropped comment's ID). Do not object to wording preferences or nits.",
+    revising
+      ? "Check it: does it handle each change request - addressed, or declined for a good reason -, are the added and changed comments real and right in the code, and does the rest stay as the user had it unless a request changed it?"
+      : "Check it: does it keep every valid issue with a fair severity and location, drop only wrong or duplicate ones, and read well for the change's author?",
+  );
+  if (requests.length && !revising) parts.push("It must also handle each of the user's change requests: addressed, or declined for a good reason.");
+  parts.push(
+    `Call \`submit_signoff\` with agree=true when you accept it as a whole; otherwise agree=false and one objection per substantive problem (reference R#, the dropped comment's ID${requests.length ? " or the change request's U#" : ""}). Do not object to wording preferences or nits.`,
   );
   return parts.join("\n");
 }

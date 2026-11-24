@@ -136,11 +136,11 @@ export function reviewMarkdown(title: string, review: CodeReview): string {
 }
 
 export interface PublishPlan {
-  /** Kept comments with a diff line that are not on the pull request yet. */
+  /** Kept comments with a diff line that are not on the pull request yet (or must be posted again on another line). */
   create: CuratedComment[];
   /** Published inline comments whose text or severity changed. */
   update: CuratedComment[];
-  /** Published inline comments the user dropped since. */
+  /** Published inline comments the user dropped since, and those a revision moved to another line (posted again there). */
   remove: CuratedComment[];
   /** Kept comments without a diff line: they live in the main review's text. */
   bodyComments: CuratedComment[];
@@ -154,14 +154,21 @@ export function planPublication(review: CodeReview, anchors: Map<string, Set<num
   const curated = review.curated ?? [];
   const main = review.publications?.find((publication) => publication.main);
   const kept = curated.filter((comment) => comment.decision === "keep");
+  // An inline comment cannot move to another line on the pull request: one a revision moved is deleted and posted again.
+  const moved = new Set(
+    kept.filter((comment) => {
+      const published = comment.published;
+      return published?.inline && published.remoteId !== undefined && published.path !== undefined && (published.path !== comment.file || published.line !== comment.line);
+    }),
+  );
   // A comment published inline stays inline; others go inline when they have a diff line.
-  const inline = (comment: CuratedComment) => (comment.published ? comment.published.inline : isInline(comment, anchors));
+  const inline = (comment: CuratedComment) => (comment.published && !moved.has(comment) ? comment.published.inline : isInline(comment, anchors));
   const bodyComments = kept.filter((comment) => !inline(comment));
   const mainBody = mainReviewBody(review, bodyComments);
   return {
-    create: kept.filter((comment) => inline(comment) && !comment.published),
-    update: kept.filter((comment) => comment.published?.inline && comment.published.body !== formatComment(comment)),
-    remove: curated.filter((comment) => comment.decision === "drop" && comment.published?.inline),
+    create: kept.filter((comment) => inline(comment) && (!comment.published || moved.has(comment))),
+    update: kept.filter((comment) => !moved.has(comment) && comment.published?.inline && comment.published.body !== formatComment(comment)),
+    remove: [...curated.filter((comment) => comment.decision === "drop" && comment.published?.inline), ...moved],
     bodyComments,
     mainBody,
     mainChanged: !main || main.body !== mainBody,
@@ -172,7 +179,7 @@ export function planPublication(review: CodeReview, anchors: Map<string, Set<num
 export function pendingChanges(review: CodeReview, anchors: Map<string, Set<number>>): number | null {
   if (!review.publications?.some((publication) => publication.main)) return null;
   const plan = planPublication(review, anchors);
-  return plan.create.length + plan.update.length + plan.remove.length + (plan.mainChanged ? 1 : 0);
+  return new Set([...plan.create, ...plan.update, ...plan.remove]).size + (plan.mainChanged ? 1 : 0);
 }
 
 export interface PublishOutcome {
@@ -214,7 +221,7 @@ export async function publishReview(
       const body = formatComment(comment);
       const index = remaining.findIndex((candidate) => candidate.path === comment.file && normalize(candidate.body) === normalize(body));
       const match = index >= 0 ? remaining.splice(index, 1)[0] : undefined;
-      comment.published = { inline: true, remoteId: match?.id, url: match?.url, body, at };
+      comment.published = { inline: true, remoteId: match?.id, url: match?.url, body, path: comment.file, line: comment.line, at };
     }
   };
   const name = `pull request #${pr.number}`;
@@ -262,7 +269,10 @@ export async function publishReview(
       outcome.errors.push(`${comment.id}: could not edit the comment (${errorMessage(error)})`);
     }
   }
+  // A moved comment is posted again only once its old comment is gone, so the pull request never shows both.
+  const stuck = new Set<CuratedComment>();
   for (const comment of plan.remove) {
+    const movedComment = comment.decision === "keep";
     if (comment.published?.remoteId === undefined) {
       outcome.errors.push(`${comment.id}: the hub does not know its comment on the pull request, so delete it there`);
       continue;
@@ -270,24 +280,26 @@ export async function publishReview(
     try {
       await publisher.deleteComment(pr, comment.published.remoteId);
       comment.published = undefined;
-      outcome.deleted++;
+      if (!movedComment) outcome.deleted++;
     } catch (error) {
-      outcome.errors.push(`${comment.id}: could not delete the comment (${errorMessage(error)})`);
+      if (movedComment) stuck.add(comment);
+      outcome.errors.push(`${comment.id}: could not ${movedComment ? "move" : "delete"} the comment (${errorMessage(error)})`);
     }
   }
-  let bodyComments = plan.bodyComments;
-  if (plan.create.length) {
+  let bodyComments = plan.bodyComments.filter((comment) => !stuck.has(comment));
+  const create = plan.create.filter((comment) => !stuck.has(comment));
+  if (create.length) {
     try {
-      const created = await publisher.createReview(pr, { commitId, body: FOLLOW_UP_BODY, event: "COMMENT", comments: toInline(plan.create) });
-      markInline(plan.create, created);
+      const created = await publisher.createReview(pr, { commitId, body: FOLLOW_UP_BODY, event: "COMMENT", comments: toInline(create) });
+      markInline(create, created);
       publications.push({ number: pr.number, reviewId: created.reviewId, url: created.url, event: "COMMENT", main: false, body: FOLLOW_UP_BODY, at });
-      outcome.created = plan.create.length;
+      outcome.created = create.length;
     } catch (error) {
       if (error instanceof LineOutsideDiffError) {
-        bodyComments = [...bodyComments, ...plan.create];
+        bodyComments = [...bodyComments, ...create];
         outcome.errors.push(`the pull request rejected the new inline comments (${errorMessage(error)}), so they went into the review's text`);
       } else {
-        outcome.errors.push(`could not add ${plural(plan.create.length, "new comment")} (${errorMessage(error)})`);
+        outcome.errors.push(`could not add ${plural(create.length, "new comment")} (${errorMessage(error)})`);
       }
     }
   }

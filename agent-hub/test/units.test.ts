@@ -14,11 +14,11 @@ import { docForPrompt, docForViewer, documentProblem, formatOfPath, isDocumentPa
 import { numstatBetween } from "../src/git.ts";
 import { parseSettingsPatch } from "../src/http/api.ts";
 import { branchWebUrl, parseRemote, pullRequestPageUrl, remoteLocation, sanitizeRemoteUrl } from "../src/remote.ts";
-import { curate, defaultReviewBody, normalizeFinal, normalizeFindings, normalizePositions, normalizeSignoff, toFinalReview } from "../src/review/discussion.ts";
-import { commentableLines, formatComment, mainReviewBody, planPublication, reviewMarkdown } from "../src/review/publish.ts";
+import { curate, defaultReviewBody, normalizeFinal, normalizeFindings, normalizePositions, normalizeSignoff, reviseCurated, toFinalReview } from "../src/review/discussion.ts";
+import { commentableLines, formatComment, mainReviewBody, pendingChanges, planPublication, reviewMarkdown } from "../src/review/publish.ts";
 import { parseReviewTarget, pullRequestRef, remoteMatches } from "../src/review/target.ts";
 import { runShellCommand } from "../src/shell.ts";
-import { rolesFor, rolesForStages, stageKindsOf, worksDetached, type CodeReview } from "../src/types.ts";
+import { rolesFor, rolesForStages, stageKindsOf, worksDetached, type CodeReview, type CuratedComment } from "../src/types.ts";
 import { describeTestRun, testRunEnv } from "../src/workflow/engine.ts";
 import { KeyedMutex } from "../src/util.ts";
 import { pullRequestBase } from "../src/workflow/runner.ts";
@@ -980,6 +980,115 @@ describe("code review", () => {
     assert.match(mainReviewBody(review, [curated[1]!]), /#### Comments outside the changed lines\n\n\*\*Minor\*\* · `README\.md:1`\n\nDocument greet\(\)\./);
     const markdown = reviewMarkdown("Review #5", review);
     assert.match(markdown, /^## Review #5\n\nPlease fix\.\n\n### Comments \(2\)\n\n\*\*Major\*\* · `greet\.js:2`/);
+  });
+
+  test("revising a finished review: kept comments keep their IDs, every request is answered, the user's curation carries over", () => {
+    const carried = [
+      { id: "R1", file: "greet.js", body: "Handle a missing name.", sources: ["L1", "P1"] },
+      { id: "R2", file: "README.md", body: "Document greet().", sources: ["L2"] },
+      { id: "R3", file: "greet.js", body: "Use an arrow function.", sources: ["P2"] },
+    ];
+    const known = ["L1", "L2", "P1", "P2"];
+    const revise = (input: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+      normalizeFinal({ change_summary: "c", assessment: "a", verdict: "approve", dropped: [], ...input }, ["R1", "R2"], known, { carried, requests: ["U1"], ...extra });
+    const answer = { request_responses: [{ request_id: "u1", status: "done", note: "Shortened R1" }] };
+    const input = revise({
+      comments: [
+        { id: "[r1]", sources: [], severity: "minor", file: "greet.js", line: 2, body: "Default the name." },
+        // Repeated as it was, without its ID: it keeps R2.
+        { sources: [], severity: "minor", file: "README.md", line: 1, body: "Document   greet()." },
+        { sources: [], severity: "nit", file: "greet.js", line: 3, body: "New finding." },
+      ],
+      ...answer,
+    });
+    assert.deepEqual(input.comments.map((comment) => [comment.id ?? null, comment.sources]), [
+      ["R1", ["L1", "P1"]],
+      ["R2", ["L2"]],
+      [null, []],
+    ]);
+    assert.deepEqual(input.requestResponses, [{ requestId: "U1", status: "addressed", note: "Shortened R1" }]);
+    const final = toFinalReview(input, false, ["R1", "R2", "R3", "R5"]);
+    assert.deepEqual(final.comments.map((comment) => comment.id), ["R1", "R2", "R6"], "a new comment never reuses an ID");
+
+    assert.throws(() => revise({ comments: [{ id: "R9", sources: [], severity: "nit", body: "x" }], ...answer }), /comments\[0\]\.id: 'R9' is not a comment of the review \(R1, R2, R3\)/);
+    assert.throws(() => revise({ comments: [{ id: "R1", sources: [], severity: "nit", body: "x" }, { id: "R1", sources: [], severity: "nit", body: "y" }], ...answer }), /R1 appears twice/);
+    assert.throws(() => revise({ comments: [{ sources: ["R2"], severity: "nit", body: "x" }], ...answer }), /R2 is a comment of the review - give it in `id`/);
+    assert.throws(() => revise({ comments: [{ id: "R1", sources: [], severity: "nit", body: "x" }], ...answer }), /Account for every comment: R2 is in no comment of the revised review and not in `dropped`/);
+    assert.throws(() => revise({ comments: [{ id: "R1", sources: [], severity: "nit", body: "x" }], dropped: [{ comment_id: "R2", reason: "U1" }] }), /Answer every change request of the user in `request_responses`: U1 has no answer/);
+    assert.throws(() => revise({ comments: [], dropped: [{ comment_id: "R1", reason: "r" }, { comment_id: "R2", reason: "r" }], request_responses: [{ request_id: "U7", status: "addressed", note: "n" }] }), /'U7' is not one of the user's change requests \(U1\)/);
+    assert.throws(() => revise({ comments: [], dropped: [{ comment_id: "R1", reason: "r" }, { comment_id: "R2", reason: "r" }], request_responses: [{ request_id: "U1", status: "maybe", note: "n" }] }), /status must be "addressed" or "declined"/);
+    // A later version may leave the answers out: the earlier ones carry over.
+    const later = revise({ comments: [], dropped: [{ comment_id: "R1", reason: "r" }, { comment_id: "R2", reason: "r" }] }, { answered: [{ requestId: "U1", status: "declined", note: "Kept as is" }] });
+    assert.deepEqual(later.requestResponses, [{ requestId: "U1", status: "declined", note: "Kept as is" }]);
+    // Outside a revision, IDs are ignored and the comments are numbered in order.
+    const first = normalizeFinal({ change_summary: "c", assessment: "a", verdict: "approve", comments: [{ id: "R7", sources: ["L1"], severity: "nit", body: "b" }], dropped: [] }, ["L1"], known);
+    assert.deepEqual(toFinalReview(first).comments.map((comment) => comment.id), ["R1"]);
+
+    // Merging the revision into the user's working copy.
+    const published = { inline: true, remoteId: 1000, body: "**Major:** Handle a missing name.", path: "greet.js", line: 2, at: "t" };
+    const workingCopy: CuratedComment[] = [
+      { id: "R1", severity: "major", file: "greet.js", line: 2, body: "Handle a missing name.", sources: ["L1", "P1"], decision: "keep", published },
+      { id: "R2", severity: "minor", file: "README.md", line: 1, body: "Document greet().", sources: ["L2"], decision: "drop", original: { body: "Docs.", severity: "nit" } },
+      { id: "R3", severity: "nit", file: "greet.js", line: 1, body: "Use an arrow function.", sources: ["P2"], decision: "keep", addedByUser: true },
+      { id: "R4", severity: "nit", file: "greet.js", line: 3, body: "Old nit.", sources: [], decision: "drop", published: { ...published, remoteId: 1001, line: 3 } },
+      { id: "R5", severity: "nit", body: "Dropped and never published.", sources: [], decision: "drop" },
+    ];
+    const revised = toFinalReview(
+      {
+        changeSummary: "c",
+        assessment: "a",
+        verdict: "request_changes",
+        comments: [
+          { id: "R1", sources: ["L1", "P1"], severity: "major", file: "greet.js", line: 3, body: "Handle a missing name." },
+          { id: "R2", sources: ["L2"], severity: "minor", file: "README.md", line: 1, body: "Document greet()." },
+          { sources: [], severity: "minor", file: "greet.js", line: 1, body: "Trim the name." },
+        ],
+        dropped: [{ commentId: "R3", reason: "U1: a matter of taste" }],
+        objectionResponses: [],
+      },
+      false,
+      workingCopy.map((comment) => comment.id),
+    );
+    const { curated, changes } = reviseCurated(workingCopy, revised, { agreed: false, summary: "No", objections: [{ commentId: "R6", issue: "Not needed" }] }, ["U1"]);
+    assert.deepEqual(
+      curated.map((comment) => [comment.id, comment.decision, comment.revision?.change ?? null, comment.published?.remoteId ?? null, Boolean(comment.original), comment.objection ?? null]),
+      [
+        ["R1", "keep", "revised", 1000, false, null],
+        ["R2", "drop", null, null, true, null],
+        ["R6", "keep", "added", null, false, "Not needed"],
+        ["R3", "drop", "removed", null, false, null],
+        ["R4", "drop", null, 1001, false, null],
+      ],
+    );
+    assert.equal(curated[3]!.revision?.reason, "U1: a matter of taste");
+    assert.ok(curated[3]!.addedByUser);
+    assert.deepEqual([changes.added.map((comment) => comment.id), changes.revised.map(({ comment }) => comment.id), changes.removed.map((comment) => comment.id)], [["R6"], ["R1"], ["R3"]]);
+
+    // R1 moved to another line: its comment on the pull request is deleted and posted again there.
+    const review = { target: { kind: "ref", input: "f", headRef: "f", headSha: "h", baseRef: "main", baseTipSha: "b" }, rounds: [], comments: [], curated, publications: [{ number: 5, reviewId: 100, event: "COMMENT", main: true, body: "Review comments below.", at: "t" }] } as unknown as CodeReview;
+    const plan = planPublication(review, new Map([["greet.js", new Set([1, 2, 3])]]));
+    assert.deepEqual([plan.create.map((comment) => comment.id), plan.update.map((comment) => comment.id), plan.remove.map((comment) => comment.id)], [["R1", "R6"], [], ["R4", "R1"]]);
+    assert.equal(pendingChanges(review, new Map([["greet.js", new Set([1, 2, 3])]])), 3);
+
+    // A later revision that includes the comment the one for U1 removed (R3) brings it back; the user's own drops stay.
+    const again = toFinalReview(
+      { changeSummary: "c", assessment: "a", verdict: "request_changes", comments: [...revised.comments, { id: "R3", sources: ["P2"], severity: "nit", file: "greet.js", line: 1, body: "Use an arrow function." }], dropped: [], objectionResponses: [] },
+      false,
+      curated.map((comment) => comment.id),
+    );
+    const restored = reviseCurated(curated, again, undefined, ["U2"]);
+    assert.deepEqual(
+      restored.curated.map((comment) => [comment.id, comment.decision, comment.revision?.change ?? null, comment.revision?.restored ?? false]),
+      [
+        ["R1", "keep", null, false],
+        ["R2", "drop", null, false],
+        ["R6", "keep", null, false],
+        ["R3", "keep", "added", true],
+        ["R4", "drop", null, false],
+      ],
+    );
+    assert.ok(restored.curated[3]!.addedByUser);
+    assert.deepEqual([restored.changes.added.map((comment) => comment.id), restored.changes.revised, restored.changes.removed], [["R3"], [], []]);
   });
 
   test("the reviewers get one submit tool per step, their own prompts and the code review skills", () => {
